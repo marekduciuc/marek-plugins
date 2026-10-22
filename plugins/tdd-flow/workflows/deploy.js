@@ -1,0 +1,167 @@
+export const meta = {
+  name: 'deploy',
+  description: 'Ship a tdd-flow feature through CI/CD: multi-lens verified review, PR, CI watch with fix loop; merge/release only with explicit approval',
+  whenToUse: 'mode "pr" (default): review + open PR + get CI green, then stop for approval. mode "merge" with approved:true: merge, optional release, watch post-merge pipeline',
+  phases: [
+    { title: 'Preflight', detail: 'tasks, CLI auth, CI present' },
+    { title: 'Review', detail: '3 review lenses, adversarially verified' },
+    { title: 'PR', detail: 'commit hygiene, push, open PR' },
+    { title: 'CI', detail: 'watch checks, fix and re-push (max 2 rounds)' },
+    { title: 'Merge', detail: 'approved merge/release, post-merge pipeline' },
+  ],
+}
+
+const opt = typeof args === 'string' ? { feature: args } : (args || {})
+const mode = opt.mode || 'pr'
+const A = (type) => 'tdd-flow:' + type
+const str = { type: 'string' }
+const strs = { type: 'array', items: { type: 'string' } }
+// Model policy. Override per run with args {models: {worker, strong, light}}.
+const M = Object.assign({ worker: 'sonnet', strong: 'opus', light: 'haiku' }, (typeof args === 'object' && args && args.models) || {})
+const MAX_CI_ROUNDS = 2
+
+const PRE = {
+  type: 'object',
+  required: ['slug', 'base', 'branch', 'cliReady', 'hasCi', 'openTasks'],
+  properties: {
+    slug: str, base: str, branch: str, issueId: str, cliReady: { type: 'boolean' }, cliFix: str,
+    hasCi: { type: 'boolean' }, openTasks: strs, existingPr: str, testSingle: str, testAll: str,
+  },
+}
+const FIND = {
+  type: 'object', required: ['findings'],
+  properties: { findings: { type: 'array', items: { type: 'object', required: ['severity', 'where', 'issue'], properties: {
+    severity: { type: 'string', enum: ['blocker', 'major', 'minor'] }, where: str, issue: str, fix: str } } } },
+}
+const VERDICT = { type: 'object', required: ['refuted', 'why'], properties: { refuted: { type: 'boolean' }, why: str } }
+const PR = { type: 'object', required: ['prUrl'], properties: { prUrl: str, branch: str, notes: str } }
+const CI = {
+  type: 'object', required: ['status'],
+  properties: {
+    status: { type: 'string', enum: ['passed', 'failed', 'none', 'timeout'] }, runUrl: str, failingJob: str, rootCause: str,
+    category: { type: 'string', enum: ['code', 'test', 'infra', 'flaky', 'unknown'] }, onMerge: str,
+  },
+}
+const MERGE = { type: 'object', required: ['merged'], properties: { merged: { type: 'boolean' }, mergeCommit: str, releaseUrl: str, notes: str } }
+
+// ---------- Preflight ----------
+phase('Preflight')
+const pre = await agent(
+  'Preflight for shipping a tdd-flow feature. Do not change anything.\n' +
+  `Feature: ${opt.feature ? '"' + opt.feature + '"' : '"feature" in .tdd-flow/state.json'}. Read .tdd-flow/stack.md and .tdd-flow/features/<slug>/tasks.md and spec.md (issue id from its Source).\n` +
+  'Report: base (default) branch, current branch, unticked tasks, whether a CI pipeline exists (.github/workflows, azure-pipelines.yml, .gitlab-ci.yml, Jenkinsfile), whether a PR already exists for this branch, ' +
+  'and whether the tracker CLI is installed and authenticated (`gh auth status` / `az account show` / `glab auth status`). If not, put the exact command the user must run in cliFix.',
+  { agentType: A('release-engineer'), model: M.light, schema: PRE, label: 'preflight', effort: 'low' })
+if (!pre) throw new Error('tdd-flow: preflight failed.')
+if (!pre.cliReady) throw new Error(`tdd-flow: tracker CLI not ready. Run: ${pre.cliFix || 'gh auth login / az login'}`)
+if (pre.branch === pre.base) throw new Error(`tdd-flow: you are on ${pre.base}. Deploy works from a feature branch.`)
+
+// ======================= MERGE MODE =======================
+if (mode === 'merge') {
+  if (opt.approved !== true) throw new Error('tdd-flow: merge requires {mode: "merge", approved: true}. Only pass approved:true after the user explicitly approved the merge in this conversation.')
+  phase('Merge')
+  const merged = await agent(
+    `Action: merge${opt.release ? ' then release' : ''}. approved: true. Feature ${pre.slug}, branch ${pre.branch} into ${pre.base}${pre.existingPr ? ', PR ' + pre.existingPr : ''}.\n` +
+    'Merge using the repo\'s merge strategy (squash if unspecified) and delete the branch. Never bypass branch protection or failing required checks - if blocked, report why and stop.' +
+    (opt.release ? ' Then create a release/tag following the repo\'s existing versioning (semver), with notes from the CHANGELOG Unreleased section.' : ''),
+    { agentType: A('release-engineer'), schema: MERGE, label: 'merge' })
+  if (!merged || !merged.merged) return { status: 'merge_blocked', details: merged ? merged.notes : 'agent failed' }
+  const post = await agent(
+    `Action: watch-ci for the post-merge pipeline on ${pre.base} (merge commit ${merged.mergeCommit || 'HEAD of ' + pre.base}). Poll until it finishes or 30 minutes pass. Report status, run URL, and any deployment URL/environment the pipeline reports.`,
+    { agentType: A('release-engineer'), schema: CI, label: 'post-merge CI', stallMs: 2400000 })
+  await agent(
+    `Close out tdd-flow feature ${pre.slug}: set "Status: done" in .tdd-flow/features/${pre.slug}/spec.md and set .tdd-flow/state.json to {"feature": null, "phase": "IDLE", "task": null}. Switch back to ${pre.base} and pull.`,
+    { label: 'close-out', model: M.light, effort: 'low' })
+  return {
+    status: post && post.status === 'passed' ? 'deployed' : 'merged_pipeline_' + (post ? post.status : 'unknown'),
+    mergeCommit: merged.mergeCommit, releaseUrl: merged.releaseUrl, pipeline: post,
+    next: pre.issueId ? `Check whether issue ${pre.issueId} closed automatically; offer to close it with a link to the PR.` : 'Done.',
+  }
+}
+
+// ======================= PR MODE =======================
+if (pre.openTasks.length && !opt.force) throw new Error(`tdd-flow: unticked tasks: ${pre.openTasks.join(', ')}. Finish /tdd-flow:tdd-implement or pass {force: true}.`)
+
+// ---------- Review: 3 lenses -> dedupe (barrier) -> adversarial verify ----------
+phase('Review')
+const LENSES = [
+  { key: 'spec', ask: 'SPEC COVERAGE & CORRECTNESS: every AC in the spec has a test that would fail if the behaviour broke; logic errors; unhandled edge cases listed in the spec.' },
+  { key: 'security', ask: 'SECURITY: injection, unsafe deserialisation, secrets in code or config, path traversal, missing authorisation, unsafe defaults.' },
+  { key: 'quality', ask: 'TEST QUALITY & MAINTAINABILITY: non-deterministic tests, tests asserting implementation details, dead code, duplication, convention violations.' },
+]
+const lensResults = await parallel(LENSES.map(l => () => agent(
+  `Final pre-merge review of branch ${pre.branch} vs ${pre.base} (\`git diff ${pre.base}...HEAD\`) for feature ${pre.slug} (spec: .tdd-flow/features/${pre.slug}/spec.md).\nLens: ${l.ask}\nReport only findings within this lens. Do not edit files.`,
+  { agentType: A('code-reviewer'), model: M.strong, schema: FIND, label: `review:${l.key}`, phase: 'Review' })))
+const seen = new Set()
+const candidates = lensResults.filter(Boolean).flatMap(r => r.findings)
+  .filter(f => f.severity !== 'minor')
+  .filter(f => { const k = (f.where + '|' + f.issue).toLowerCase().slice(0, 160); if (seen.has(k)) return false; seen.add(k); return true })
+log(`${candidates.length} blocker/major candidate finding(s) to verify`)
+
+const verified = await pipeline(candidates, f => parallel([1, 2].map(n => () => agent(
+  `Skeptic #${n}: try to REFUTE this code-review finding on branch ${pre.branch} (diff vs ${pre.base}). Read the code; if possible write a quick throwaway check (do not commit it). Default to refuted=true if the finding is speculative.\nFinding: ${JSON.stringify(f)}`,
+  { schema: VERDICT, model: M.worker, label: `verify:${f.where}`.slice(0, 60), phase: 'Review', effort: 'medium' })))
+  .then(votes => ({ ...f, refutedBy: votes.filter(Boolean).filter(v => v.refuted).length })))
+const confirmed = verified.filter(Boolean).filter(f => f.refutedBy < 2)
+if (confirmed.length) {
+  return {
+    status: 'changes_requested',
+    findings: confirmed,
+    next: 'Show the findings to the user. To fix them test-first, run /tdd-flow:tdd-implement with {findings: <these findings>}, then /tdd-flow:deploy again.',
+  }
+}
+
+// ---------- PR ----------
+phase('PR')
+const pr = await agent(
+  `Action: prepare-pr. Feature ${pre.slug}, base ${pre.base}, issue ${pre.issueId || 'none'}.${pre.existingPr ? ' A PR already exists (' + pre.existingPr + '): push and update it instead of opening a new one.' : ''}\n` +
+  `PR body: summary from .tdd-flow/features/${pre.slug}/spec.md, linked issue (use "Closes #id" / "AB#id" as the tracker expects), ACs covered, test evidence from tdd-log.md, docs changed, risks. Final review found no blocker/major issues.`,
+  { agentType: A('release-engineer'), schema: PR, label: 'open PR', phase: 'PR' })
+if (!pr) throw new Error('tdd-flow: opening the PR failed.')
+log(`PR: ${pr.prUrl}`)
+if (!pre.hasCi) return { status: 'pr_open_no_ci', prUrl: pr.prUrl, next: 'This repo has no CI pipeline, so deployment cannot be automated. Merge manually or add a pipeline.' }
+
+// ---------- CI watch + fix loop ----------
+phase('CI')
+let ci = null
+let rerunUsed = false
+for (let round = 0; round <= MAX_CI_ROUNDS; round++) {
+  ci = await agent(
+    `Action: watch-ci for PR ${pr.prUrl}. Poll until all checks finish or 30 minutes pass. On failure fetch the failing job log, classify the root cause (code | test | infra | flaky | unknown) and summarise it in 3-5 lines. Also read the pipeline definition and describe in one line what merging into ${pre.base} will trigger (onMerge).`,
+    { agentType: A('release-engineer'), schema: CI, label: `watch CI ${round + 1}`, phase: 'CI', stallMs: 2400000 })
+  if (!ci) throw new Error('tdd-flow: CI watch agent failed.')
+  if (ci.status !== 'failed') break
+  if (round === MAX_CI_ROUNDS) break
+  if ((ci.category === 'infra' || ci.category === 'flaky') && !rerunUsed) {
+    rerunUsed = true
+    log(`CI failed (${ci.category}): re-running once`)
+    await agent(`Re-run the failed jobs for PR ${pr.prUrl} (e.g. \`gh run rerun --failed\` / \`az pipelines run\`). Do not change code.`,
+      { agentType: A('release-engineer'), label: 'rerun CI', phase: 'CI', effort: 'low' })
+    continue
+  }
+  if (ci.category !== 'code' && ci.category !== 'test') break
+  log(`CI failed (${ci.category}) - fixing test-first, round ${round + 1}`)
+  const red = await agent(
+    `RED step. CI failed on PR ${pr.prUrl}: job ${ci.failingJob}. Root cause: ${ci.rootCause}\nWrite (or adjust setup for) a local test that reproduces this failure, and confirm it fails locally. If it cannot be reproduced locally, return result ERROR with why.`,
+    { agentType: A('test-writer'), schema: { type: 'object', required: ['result', 'reason'], properties: { result: { type: 'string', enum: ['FAIL', 'PASS', 'ERROR'] }, reason: str, testFile: str, testName: str } }, label: `CI repro ${round + 1}`, phase: 'CI' })
+  if (!red || red.result !== 'FAIL') break
+  const green = await agent(
+    `GREEN step. Make the reproducing test ${red.testFile} :: ${red.testName} pass with a minimal production fix (never weaken tests), run the full suite, then commit "fix(${pre.slug}): ${ci.failingJob || 'CI failure'}" and push the branch.`,
+    { agentType: A('implementer'), schema: { type: 'object', required: ['suitePass', 'summary'], properties: { suitePass: { type: 'boolean' }, summary: str } }, label: `CI fix ${round + 1}`, phase: 'CI', model: round === 0 ? M.worker : M.strong })
+  if (!green || !green.suitePass) break
+}
+
+if (!ci || ci.status !== 'passed') {
+  return {
+    status: 'ci_not_green', prUrl: pr.prUrl, ci,
+    next: 'Show the CI root cause to the user and decide together (fix via /tdd-flow:tdd-implement with findings, re-run, or investigate).',
+  }
+}
+return {
+  status: 'ready_to_merge',
+  prUrl: pr.prUrl,
+  ciRun: ci.runUrl,
+  onMerge: ci.onMerge,
+  reviewCandidatesRefuted: candidates.length,
+  next: 'GATE: show PR URL, green CI and what merging triggers. Only after the user explicitly approves, run /tdd-flow:deploy with {mode: "merge", approved: true' + (opt.release ? ', release: true' : '') + '}.',
+}
