@@ -19,8 +19,8 @@ Look at which paths the change touches:
 
 | Change touches | Branch name |
 |---|---|
-| Only `plugins/<plugin>/` | `<plugin>/feature/<feature-name>` |
-| Anything else (`.claude-plugin/`, root files, `.claude/`) | `marketplace/feature/<feature-name>` |
+| Only `plugins/<plugin>/`, optionally plus that plugin's own entry in `.claude-plugin/marketplace.json` (e.g. its version bump) | `<plugin>/feature/<feature-name>` |
+| Anything else (other `.claude-plugin/` changes, root files, `.claude/`) | `marketplace/feature/<feature-name>` |
 
 `<feature-name>` is short, descriptive, kebab-case, e.g. `tdd-flow/feature/coverage-gate`, `marketplace/feature/github-install-docs`.
 
