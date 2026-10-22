@@ -22,6 +22,8 @@ Input: $ARGUMENTS
 
 Start each workflow with the Workflow tool by name, passing args as a JSON value (not a string). Wait for the completion notification and read the returned object before deciding the next step. Each result has `status` and `next` fields.
 
+Any workflow can return `agent_limit` (its per-run agent cap was reached). Tell the user what finished and what `next` says. For tdd-implement, rerun step 2 to continue. For the others, ask before rerunning with a higher `maxAgents`.
+
 ## Sequence
 
 1. **Analyze.** Run step 1.
