@@ -17,8 +17,12 @@ Personal Claude Code plugin: an end-to-end dev pipeline built on **dynamic workf
 | `/tdd-flow:tdd-implement {feature}` | Plan + baseline → per task, sequentially: per behaviour RED (test-writer, retry once) → GREEN (implementer, retry once) → REFACTOR → review with up to 2 fix rounds (behavioural findings become new RED cycles) → commit | ~2 per behaviour + 3 per task |
 | `/tdd-flow:document {feature}` | Survey diff → pipeline per target: write → adversarial fact-check → fix → commit | ~6-14 |
 | `/tdd-flow:deploy {feature}` | Preflight → 3 review lenses (spec, security, quality) → dedupe → 2 skeptics per finding → PR → CI watch with test-first fix loop (max 2) → stops at `ready_to_merge` | ~8-12 |
-| `/tdd-flow:deploy {feature, mode:"merge", approved:true}` | Merge (+ optional release) → watch post-merge pipeline → close out | ~3 |
+| `/tdd-flow:deploy {feature, mode:"merge", approved:true}` | PR review status check → merge (+ optional release) → watch post-merge pipeline → close out | ~3 |
 | `/tdd-flow:ship-feature <input>` (skill) | Runs everything above with Gate 1 (spec approval) and Gate 2 (merge approval) | - |
+
+Merge mode stops with `review_changes_requested` when a reviewer requested changes on the PR. Pass `requireReview: true` to also require an approving review (`review_required` otherwise). This is off by default because GitHub does not let you approve your own PR.
+
+All git actions (branch, commits, push, PR, merge) go through the `release-engineer` agent. The feature branch is `feature/<slug>`.
 
 Each workflow returns `{status, ..., next}`. If a coding step still fails after escalating to Opus, it stops cleanly with `status: "blocked"` and resets the TDD phase, rather than guessing.
 
@@ -45,7 +49,7 @@ Override per run with `args.models`, e.g. `{feature: "x", models: {worker: "opus
 | implementer | sonnet | GREEN minimal code + REFACTOR |
 | code-reviewer | sonnet (opus for final review) | Read-only review and fact-checking |
 | doc-writer | sonnet | Docs from the actual diff |
-| release-engineer | sonnet | PR, CI watch, merge/release (only with approval) |
+| release-engineer | sonnet (haiku for branch/commits) | All git: feature branch, commits, PR, CI watch, review status, merge/release (only with approval) |
 
 ## Files it creates in your repo
 

@@ -14,6 +14,7 @@ const opt = typeof args === 'string' ? { feature: args } : (args || {})
 const A = (type) => 'tdd-flow:' + type
 const str = { type: 'string' }
 const strs = { type: 'array', items: { type: 'string' } }
+const COMMIT = { type: 'object', required: ['committed'], properties: { committed: { type: 'boolean' }, nothingToCommit: { type: 'boolean' }, sha: str, reason: str, unexpected: strs } }
 // Model policy. Override per run with args {models: {worker, strong, light}}.
 const M = Object.assign({ worker: 'sonnet', strong: 'opus', light: 'haiku' }, (typeof args === 'object' && args && args.models) || {})
 
@@ -80,14 +81,17 @@ phase('Commit')
 const files = [...new Set(ok.flatMap(r => [...r.wrote.files, ...((r.fixed && r.fixed.files) || [])]))]
 const touchedSource = targets.some(t => t.kind === 'api')
 const commit = await agent(
-  `${touchedSource ? 'Doc comments were added to source files: run the full test suite first; if it fails, report that and do NOT commit. ' : ''}` +
-  `Stage these documentation files and commit with message "docs(${survey.slug}): update documentation" (no --no-verify, no push):\n${files.join('\n')}\nReturn the short sha, or the failure.`,
-  { label: 'commit', model: M.light, effort: 'low' })
+  `Action: commit. Message: "docs(${survey.slug}): update documentation". Do not push.` +
+  `${touchedSource ? ' Doc comments were added to source files: run the full test suite first; if it fails, do not commit.' : ''}\nFiles:\n${files.join('\n')}`,
+  { agentType: A('release-engineer'), model: M.light, schema: COMMIT, label: 'commit', effort: 'low' })
+if (!commit || (!commit.committed && !commit.nothingToCommit)) {
+  return { status: 'commit_failed', slug: survey.slug, reason: commit ? commit.reason : 'agent failed', next: 'Show the reason to the user, resolve it, then rerun /tdd-flow:document.' }
+}
 
 return {
   status: 'documented',
   slug: survey.slug,
   targets: ok.map(r => ({ files: r.wrote.files, summary: (r.fixed || r.wrote).summary, factCheckIssuesFixed: r.check ? r.check.problems.length : 0 })),
-  commit,
+  commit: commit.sha || '',
   next: 'Run /tdd-flow:deploy to open the PR and run CI.',
 }

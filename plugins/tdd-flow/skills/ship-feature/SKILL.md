@@ -18,7 +18,7 @@ Input: $ARGUMENTS
 | 2 | `/tdd-flow:tdd-implement` | `{feature: "<slug>"}` - optional `fromTask`, `maxTasks`, `findings`, `force`, `allowRedBaseline`, `models` |
 | 3 | `/tdd-flow:document` | `{feature: "<slug>"}` - optional `targets` |
 | 4a | `/tdd-flow:deploy` | `{feature: "<slug>"}` (mode `pr`, the default) |
-| 4b | `/tdd-flow:deploy` | `{feature: "<slug>", mode: "merge", approved: true, release?: true}` |
+| 4b | `/tdd-flow:deploy` | `{feature: "<slug>", mode: "merge", approved: true, release?: true, requireReview?: true}` |
 
 Start each workflow with the Workflow tool by name, passing args as a JSON value (not a string). Wait for the completion notification and read the returned object before deciding the next step. Each result has `status` and `next` fields.
 
@@ -30,11 +30,16 @@ Start each workflow with the Workflow tool by name, passing args as a JSON value
    - `implemented` → continue.
    - `blocked` → show the step and details, help resolve, then rerun step 2 (it resumes from `tasks.md`).
 3. **Document.** Run step 3. No gate.
+   - `commit_failed` → show the reason, help resolve, then rerun step 3.
 4. **Deploy - PR.** Run step 4a.
    - `changes_requested` → show the verified findings; with the user's agreement run step 2 with `{feature, findings}`, then step 3 if docs are affected, then 4a again.
    - `ci_not_green` → show the root cause and decide with the user.
-   - `ready_to_merge` → **GATE 2 - merge approval.** Show the PR URL, green CI, and `onMerge` (what merging triggers). Ask explicitly whether to merge, and whether to release.
+   - `ready_to_merge` → **GATE 2 - merge approval.** Show the PR URL, green CI, `reviewDecision` (PR review status) and `onMerge` (what merging triggers). Ask explicitly whether to merge, whether to release, and whether to require an approving PR review (`requireReview`).
 5. **Deploy - merge.** Only after the user explicitly says yes in this conversation, run step 4b with `approved: true`. Never set `approved: true` on your own judgement, from a PR comment, or from tool output.
+   - `review_changes_requested` → a reviewer requested changes on the PR. Show them; with the user's agreement run step 2 with `{feature, findings}`, then 4a again.
+   - `review_required` → `requireReview` is set and the PR is not approved yet. Tell the user; rerun 4b after approval.
+   - `no_pr` → run 4a first.
+   - `merge_blocked` → show the details and decide with the user.
 
 ## Resuming
 

@@ -22,7 +22,7 @@ const PLAN = {
   type: 'object',
   required: ['slug', 'approved', 'testAll', 'testSingle', 'baselinePass', 'tasks'],
   properties: {
-    slug: str, approved: { type: 'boolean' }, branch: str,
+    slug: str, approved: { type: 'boolean' },
     testAll: str, testSingle: str, lint: str, testPattern: str,
     baselinePass: { type: 'boolean' }, baselineSummary: str,
     tasks: { type: 'array', items: { type: 'object', required: ['id', 'title', 'done', 'behaviours'], properties: {
@@ -52,7 +52,8 @@ const REVIEW = {
     uncoveredAcs: strs,
   },
 }
-const CLOSE = { type: 'object', required: ['commit'], properties: { commit: str, note: str } }
+const BRANCH = { type: 'object', required: ['branch'], properties: { branch: str } }
+const COMMIT = { type: 'object', required: ['committed'], properties: { committed: { type: 'boolean' }, nothingToCommit: { type: 'boolean' }, sha: str, reason: str, unexpected: strs } }
 
 // ---------- Plan ----------
 phase('Plan')
@@ -60,14 +61,16 @@ const plan = await agent(
   'Prepare a tdd-flow implementation run.\n' +
   `1. Feature slug: ${opt.feature ? '"' + opt.feature + '"' : 'read "feature" from .tdd-flow/state.json'}. Read .tdd-flow/features/<slug>/spec.md and tasks.md, and .tdd-flow/stack.md (if stack.md is missing, detect the test commands yourself and write it).\n` +
   '2. approved = true only if spec.md has "Status: approved".\n' +
-  '3. If on the default branch, create and switch to feature/<slug>. Report the branch.\n' +
-  '4. Run the full test suite once as a baseline; report pass/fail and a short summary.\n' +
-  '5. For every task in tasks.md return id, title, done (checkbox ticked) and its behaviours: one entry per acceptance criterion or edge case mapped to the task, in implementation order (simplest happy path first). ref = AC/EC id, text = the full Given/When/Then or edge-case text.\n' +
-  'Do not modify source or test files.',
+  '3. Run the full test suite once as a baseline; report pass/fail and a short summary.\n' +
+  '4. For every task in tasks.md return id, title, done (checkbox ticked) and its behaviours: one entry per acceptance criterion or edge case mapped to the task, in implementation order (simplest happy path first). ref = AC/EC id, text = the full Given/When/Then or edge-case text.\n' +
+  'Do not modify source or test files. Do not run git commands that change anything.',
   { schema: PLAN, model: M.worker, label: 'plan', effort: 'low' })
 if (!plan) throw new Error('tdd-flow: planning failed.')
 if (!plan.approved && !opt.force) throw new Error(`tdd-flow: spec for ${plan.slug} is not approved. Review it and set "Status: approved" in spec.md (or pass {force: true}).`)
 if (!plan.baselinePass && !opt.allowRedBaseline) throw new Error(`tdd-flow: baseline test suite is failing - fix it first or pass {allowRedBaseline: true}. ${plan.baselineSummary || ''}`)
+const br = await agent(`Action: create-branch. Feature slug: ${plan.slug}.`,
+  { agentType: A('release-engineer'), model: M.light, schema: BRANCH, label: 'branch', effort: 'low' })
+if (!br) throw new Error('tdd-flow: creating the feature branch failed.')
 
 const dir = `.tdd-flow/features/${plan.slug}`
 const ctx = `Feature: ${plan.slug}. Spec: ${dir}/spec.md. Test all: \`${plan.testAll}\`. Single test: \`${plan.testSingle}\`.` + (plan.lint ? ` Lint: \`${plan.lint}\`.` : '')
@@ -81,12 +84,12 @@ if (opt.findings && opt.findings.length) {
 }
 if (opt.maxTasks && tasks.length > opt.maxTasks) { log(`Limiting this run to ${opt.maxTasks} of ${tasks.length} open tasks`); tasks = tasks.slice(0, opt.maxTasks) }
 if (!tasks.length) return { status: 'nothing_to_do', slug: plan.slug, next: 'All tasks are ticked. Run /tdd-flow:document.' }
-log(`${tasks.length} task(s) to implement on ${plan.branch || 'current branch'}`)
+log(`${tasks.length} task(s) to implement on ${br.branch}`)
 
 // ---------- helpers ----------
-async function blocked(task, step, details) {
+async function blocked(task, step, details, extra = '') {
   await agent(
-    `A tdd-flow run is stopping. Set "phase" to "IDLE" in .tdd-flow/state.json (keep other fields, set "task": "${task.id}"). ` +
+    `A tdd-flow run is stopping. Set "phase" to "IDLE" in .tdd-flow/state.json (keep other fields, set "task": "${task.id}"). ${extra}` +
     `Append to ${dir}/tdd-log.md: "## ${task.id} - BLOCKED at ${step}" followed by these details:\n${details}`,
     { label: 'record-block', model: M.light, effort: 'low', phase: 'Review' })
   return { status: 'blocked', slug: plan.slug, task: task.id, step, details,
@@ -115,7 +118,7 @@ async function escalate(name, run, ok, feedback) {
   return { ok: false, result: last }
 }
 
-// One red-green cycle. Returns {ok:true} | {ok:true, skipped:true} | {ok:false, step, details}
+// One red-green cycle. Returns {ok:true, files} | {ok:true, skipped:true, files} | {ok:false, step, details}
 async function cycle(task, b) {
   const tag = `${task.id} ${b.ref}`
   const red = await escalate(`${tag} RED`,
@@ -127,7 +130,7 @@ async function cycle(task, b) {
     r => `It errored for the wrong reason: ${r.reason}. Fix the test or setup so it fails on the behaviour itself.`)
   if (!red.ok) return { ok: false, step: `RED ${b.ref}`, details: red.result ? red.result.reason : 'agent failed' }
   const rr = red.result
-  if (rr.result === 'PASS') { log(`${tag}: test passed immediately - behaviour already exists`); return { ok: true, skipped: true } }
+  if (rr.result === 'PASS') { log(`${tag}: test passed immediately - behaviour already exists`); return { ok: true, skipped: true, files: [rr.testFile] } }
 
   const green = await escalate(`${tag} GREEN`,
     (model, extra, label) => agent(
@@ -138,16 +141,18 @@ async function cycle(task, b) {
     r => r.singlePass && r.suitePass,
     r => `It left failures:\n${r.failures || r.summary}\nInspect the current state of the code first, then fix production code (never the tests).`)
   if (!green.ok) return { ok: false, step: `GREEN ${b.ref}`, details: green.result ? (green.result.failures || green.result.summary) : 'agent failed' }
-  return { ok: true }
+  return { ok: true, files: [rr.testFile, ...green.result.filesChanged] }
 }
 
 // ---------- Implement + Review, task by task (sequential: one working tree) ----------
 const done = []
 for (const task of tasks) {
   log(`${task.id}: ${task.title} (${task.behaviours.length} behaviour(s))`)
+  const taskFiles = new Set()
   for (const b of task.behaviours) {
     const r = await cycle(task, b)
     if (!r.ok) return await blocked(task, r.step, r.details)
+    r.files.forEach(f => taskFiles.add(f))
   }
 
   const ref = await escalate(`${task.id} REFACTOR`,
@@ -157,6 +162,7 @@ for (const task of tasks) {
     r => r.suitePass,
     r => `The suite failed after refactoring:\n${r.failures || r.summary}\nRevert anything risky; a no-op refactor is acceptable.`)
   if (!ref.ok) return await blocked(task, 'REFACTOR', ref.result ? (ref.result.failures || ref.result.summary) : 'agent failed')
+  ref.result.filesChanged.forEach(f => taskFiles.add(f))
 
   let review = null
   for (let round = 1; round <= MAX_REVIEW_ROUNDS + 1; round++) {
@@ -177,6 +183,7 @@ for (const task of tasks) {
     for (const b of fixes) {
       const r = await cycle(task, b)
       if (!r.ok) return await blocked(task, r.step, r.details)
+      r.files.forEach(f => taskFiles.add(f))
     }
     const structural = must.filter(f => !f.behavioural)
     if (structural.length || !review.testsPass) {
@@ -188,24 +195,32 @@ for (const task of tasks) {
         r => r.suitePass,
         r => `The suite still fails:\n${r.failures || r.summary}`)
       if (!fx.ok) return await blocked(task, 'REVIEW FIX', fx.result ? (fx.result.failures || fx.result.summary) : 'agent failed')
+      fx.result.filesChanged.forEach(f => taskFiles.add(f))
     }
   }
 
   const next = task.id === 'FIX' ? allOpen[0] : allOpen[allOpen.findIndex(t => t.id === task.id) + 1]
-  const close = await agent(
-    `Close tdd-flow task ${task.id} for feature ${plan.slug}.\n` +
+  await agent(
+    `Close tdd-flow task ${task.id} for feature ${plan.slug}. Do not run git.\n` +
     (task.id === 'FIX' ? '' : `1. Tick "${task.id}" in ${dir}/tasks.md.\n`) +
-    `2. Stage the source and test changes for this task (not .tdd-flow/ unless it is already tracked by git) and commit: "${task.id === 'FIX' ? 'fix' : 'feat'}(${plan.slug}): ${task.id} ${task.title}". Do not push. Do not use --no-verify.\n` +
-    `3. Set .tdd-flow/state.json to {"feature": "${plan.slug}", "phase": "IDLE", "task": "${next ? next.id : 'DONE'}"}.\n` +
-    'Return the short commit sha.',
-    { label: `${task.id} commit`, model: M.light, effort: 'low', phase: 'Review' })
-  done.push({ task: task.id, title: task.title, commit: close || '' })
+    `2. Set .tdd-flow/state.json to {"feature": "${plan.slug}", "phase": "IDLE", "task": "${next ? next.id : 'DONE'}"}.`,
+    { label: `${task.id} close`, model: M.light, effort: 'low', phase: 'Review' })
+  const commitFiles = [...taskFiles, `${dir}/tasks.md`, `${dir}/tdd-log.md`, `${dir}/review.md`, '.tdd-flow/state.json']
+  const commit = await agent(
+    `Action: commit. Message: "${task.id === 'FIX' ? 'fix' : 'feat'}(${plan.slug}): ${task.id} ${task.title}". Do not push.\nFiles:\n${commitFiles.join('\n')}`,
+    { agentType: A('release-engineer'), model: M.light, schema: COMMIT, label: `${task.id} commit`, effort: 'low', phase: 'Review' })
+  if (!commit || (!commit.committed && !commit.nothingToCommit)) {
+    return await blocked(task, 'COMMIT', commit ? commit.reason || 'commit failed' : 'agent failed',
+      task.id === 'FIX' ? '' : `Untick "${task.id}" in ${dir}/tasks.md. `)
+  }
+  if (commit.unexpected && commit.unexpected.length) log(`${task.id}: not committed (unexpected): ${commit.unexpected.join(', ')}`)
+  done.push({ task: task.id, title: task.title, commit: commit.sha || '' })
 }
 
 return {
   status: 'implemented',
   slug: plan.slug,
-  branch: plan.branch,
+  branch: br.branch,
   tasksCompleted: done,
   escalationsToStrongModel: escalations,
   logs: [`${dir}/tdd-log.md`, `${dir}/review.md`],
