@@ -72,6 +72,7 @@ Add `.tdd-flow/` to `.gitignore`, or commit it if you want specs versioned.
 
 ## Cost control
 
+- **Agent limits.** Every workflow runs at most 2 agents at the same time and has a hard cap on agents per run: analyze-requirements 12, document 15, deploy 20, tdd-implement 40. Override per run with `args.maxAgents` / `args.maxParallel` (positive integers). At the cap a workflow stops with `status: "agent_limit"`. tdd-implement only starts a task whose minimum cost fits, so it normally stops between tasks; rerun it to continue from `tasks.md`. deploy stops before the skeptic pass if verifying all findings would not fit.
 - Watch runs with `/workflows`; each agent's token use is shown there, and you can pause (`p`) or stop (`x`).
 - Use `tdd-implement` with `{maxTasks: 1}` for small, reviewable increments.
 - For the cheapest runs pass `models: {strong: "sonnet"}`; for hard features `models: {worker: "opus"}`.

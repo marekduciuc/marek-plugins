@@ -12,6 +12,7 @@ export const meta = {
 
 // ---------- input ----------
 const input = typeof args === 'string' ? args : args && args.input
+const opt = (typeof args === 'object' && args) || {}
 if (!input) throw new Error('tdd-flow: pass the requirement as args (issue id/url, file path, or text).')
 
 const A = (type) => 'tdd-flow:' + type
@@ -19,6 +20,22 @@ const str = { type: 'string' }
 const strs = { type: 'array', items: { type: 'string' } }
 // Model policy. Override per run with args {models: {worker, strong, light}}.
 const M = Object.assign({ worker: 'sonnet', strong: 'opus', light: 'haiku' }, (typeof args === 'object' && args && args.models) || {})
+// Agent limits. Override per run with args {maxAgents, maxParallel} (positive integers).
+const posInt = (v, d) => (Number.isInteger(v) && v > 0 ? v : d)
+const MAX_AGENTS = posInt(opt.maxAgents, 12)
+const MAX_PARALLEL = posInt(opt.maxParallel, 2)
+const LIMIT = `tdd-flow: agent limit (${MAX_AGENTS}) reached`
+let spawned = 0, active = 0, limitHit = false
+const waiting = []
+// Every agent call goes through run(): at most MAX_PARALLEL at once, started in request order,
+// and at most MAX_AGENTS per run.
+async function run(prompt, o) {
+  if (spawned >= MAX_AGENTS) { limitHit = true; throw new Error(LIMIT) }
+  spawned++
+  if (active < MAX_PARALLEL) active++
+  else await new Promise(r => waiting.push(r))
+  try { return await agent(prompt, o) } finally { if (waiting.length) waiting.shift()(); else active-- }
+}
 
 const STACK = {
   type: 'object',
@@ -61,91 +78,103 @@ const CRIT = {
   properties: { issues: { type: 'array', items: { type: 'object', required: ['severity', 'where', 'problem', 'fix'], properties: { severity: { type: 'string', enum: ['blocker', 'major', 'minor'] }, where: str, problem: str, fix: str } } } },
 }
 
-// ---------- Context ----------
-phase('Context')
-const [stack, req] = await parallel([
-  () => agent(
-    'Detect this repository\'s stack. If .tdd-flow/stack.md already exists, read it and return its values without re-detecting. Otherwise detect and write .tdd-flow/stack.md.',
-    { agentType: A('stack-detector'), schema: STACK, label: 'stack-detector', effort: 'low' }),
-  () => agent(
-    `Fetch the raw requirement for a software feature. Input: """${input}"""\n` +
-    '- If it is an issue number or URL: detect the tracker from `git remote -v` and installed CLIs. GitHub: `gh issue view <id> --json number,title,body,labels,comments`. Azure DevOps: `az boards work-item show --id <id> -o json`. Jira: a connected Jira MCP tool if available, else the `jira` CLI.\n' +
-    '- If it is an existing file path: read the file.\n' +
-    '- Otherwise the input itself is the requirement text.\n' +
-    'Return the full requirement text (include relevant comments), a title, the source (URL/path/"prompt"), the issue id if any, and a kebab-case slug like "142-csv-export" (max 40 chars). ' +
-    'If a CLI is missing or not authenticated, set ok=false and put the exact login/install command in problem.',
-    { schema: REQ, model: M.light, label: 'fetch-requirement', effort: 'low' }),
-])
-if (!stack || !req) throw new Error('tdd-flow: context step failed (see /workflows for the agent output).')
-if (!req.ok) throw new Error('tdd-flow: could not fetch the requirement. ' + (req.problem || ''))
-const dir = `.tdd-flow/features/${req.slug}`
-log(`Feature ${req.slug} - stack: ${stack.language}, tests: ${stack.testAll}`)
+try {
+  // ---------- Context ----------
+  phase('Context')
+  const [stack, req] = await parallel([
+    () => run(
+      'Detect this repository\'s stack. If .tdd-flow/stack.md already exists, read it and return its values without re-detecting. Otherwise detect and write .tdd-flow/stack.md.',
+      { agentType: A('stack-detector'), schema: STACK, label: 'stack-detector', effort: 'low' }),
+    () => run(
+      `Fetch the raw requirement for a software feature. Input: """${input}"""\n` +
+      '- If it is an issue number or URL: detect the tracker from `git remote -v` and installed CLIs. GitHub: `gh issue view <id> --json number,title,body,labels,comments`. Azure DevOps: `az boards work-item show --id <id> -o json`. Jira: a connected Jira MCP tool if available, else the `jira` CLI.\n' +
+      '- If it is an existing file path: read the file.\n' +
+      '- Otherwise the input itself is the requirement text.\n' +
+      'Return the full requirement text (include relevant comments), a title, the source (URL/path/"prompt"), the issue id if any, and a kebab-case slug like "142-csv-export" (max 40 chars). ' +
+      'If a CLI is missing or not authenticated, set ok=false and put the exact login/install command in problem.',
+      { schema: REQ, model: M.light, label: 'fetch-requirement', effort: 'low' }),
+  ])
+  if (limitHit) throw new Error(LIMIT)
+  if (!stack || !req) throw new Error('tdd-flow: context step failed (see /workflows for the agent output).')
+  if (!req.ok) throw new Error('tdd-flow: could not fetch the requirement. ' + (req.problem || ''))
+  const dir = `.tdd-flow/features/${req.slug}`
+  log(`Feature ${req.slug} - stack: ${stack.language}, tests: ${stack.testAll}`)
 
-// ---------- Draft (3 independent angles) ----------
-phase('Draft')
-const ANGLES = [
-  { key: 'behaviour', lens: 'BEHAVIOUR-FIRST: focus on user goals and the observable happy-path behaviour that proves each goal.' },
-  { key: 'risk', lens: 'RISK-FIRST: focus on edge cases, invalid input, error paths, limits, permissions, backward compatibility and security.' },
-  { key: 'scope', lens: 'MINIMAL-SCOPE: find the smallest shippable slice, state what is explicitly out of scope, and order tasks so each builds on a passing previous one.' },
-]
-const drafts = (await parallel(ANGLES.map(a => () => agent(
-  `Analyse this requirement and draft a spec. Angle: ${a.lens}\n\n` +
-  `Title: ${req.title}\nSource: ${req.source}\nRequirement:\n"""${req.text}"""\n\n` +
-  `Stack: ${stack.language}; tests via \`${stack.testAll}\`.\n` +
-  'Explore the codebase to ground the draft in real modules, entry points and existing tests. Every acceptance criterion must be verifiable by an automated test. Do NOT write any files - return the draft only.',
-  { agentType: A('requirements-analyst'), model: M.worker, schema: DRAFT, label: `analyst:${a.key}`, phase: 'Draft' },
-)))).filter(Boolean)
-if (!drafts.length) throw new Error('tdd-flow: all analyst drafts failed.')
+  // ---------- Draft (3 independent angles) ----------
+  phase('Draft')
+  const ANGLES = [
+    { key: 'behaviour', lens: 'BEHAVIOUR-FIRST: focus on user goals and the observable happy-path behaviour that proves each goal.' },
+    { key: 'risk', lens: 'RISK-FIRST: focus on edge cases, invalid input, error paths, limits, permissions, backward compatibility and security.' },
+    { key: 'scope', lens: 'MINIMAL-SCOPE: find the smallest shippable slice, state what is explicitly out of scope, and order tasks so each builds on a passing previous one.' },
+  ]
+  const drafts = (await parallel(ANGLES.map(a => () => run(
+    `Analyse this requirement and draft a spec. Angle: ${a.lens}\n\n` +
+    `Title: ${req.title}\nSource: ${req.source}\nRequirement:\n"""${req.text}"""\n\n` +
+    `Stack: ${stack.language}; tests via \`${stack.testAll}\`.\n` +
+    'Explore the codebase to ground the draft in real modules, entry points and existing tests. Every acceptance criterion must be verifiable by an automated test. Do NOT write any files - return the draft only.',
+    { agentType: A('requirements-analyst'), model: M.worker, schema: DRAFT, label: `analyst:${a.key}`, phase: 'Draft' },
+  )))).filter(Boolean)
+  if (limitHit) throw new Error(LIMIT)
+  if (!drafts.length) throw new Error('tdd-flow: all analyst drafts failed.')
 
-// ---------- Synthesize ----------
-phase('Synthesize')
-const synthPrompt = (extra) =>
-  `Merge these ${drafts.length} independent spec drafts for "${req.title}" into ONE spec.\n` +
-  'Do NOT simply take the union. Include an AC only if the requirement asks for it or it is an edge case a careful engineer would consider necessary; move speculative behaviour (unicode, performance, input types, limits not mentioned) to Open questions with an assumption instead of new ACs. ' +
-  'Keep scope proportional: a small function needs roughly 3-6 ACs and 1-3 tasks; group closely related ACs into one task. Drop duplicates, keep ACs sharp and testable, number them AC-1.., EC-1.., Q-1.., T-1... Order tasks so each builds on the previous.\n' +
-  `Write ${dir}/spec.md using your spec template (Status: draft, Source: ${req.source}, Slug: ${req.slug}).\n` +
-  `Write ${dir}/tasks.md as a checklist: "- [ ] T-1 <title> (AC-1, AC-2)".\n` +
-  `Create or overwrite .tdd-flow/state.json as {"feature": "${req.slug}", "phase": "IDLE", "task": "T-1"}.\n` +
-  'If .tdd-flow/ is not in .gitignore, do not change .gitignore - just mention it in assumptions.\n' +
-  (extra || '') +
-  `\nRaw requirement:\n"""${req.text}"""\n\nDrafts:\n${JSON.stringify(drafts, null, 1)}`
-let spec = await agent(synthPrompt(), { agentType: A('requirements-analyst'), model: M.strong, schema: SPEC, label: 'synthesize' })
-if (!spec) throw new Error('tdd-flow: synthesis failed.')
+  // ---------- Synthesize ----------
+  phase('Synthesize')
+  const synthPrompt = (extra) =>
+    `Merge these ${drafts.length} independent spec drafts for "${req.title}" into ONE spec.\n` +
+    'Do NOT simply take the union. Include an AC only if the requirement asks for it or it is an edge case a careful engineer would consider necessary; move speculative behaviour (unicode, performance, input types, limits not mentioned) to Open questions with an assumption instead of new ACs. ' +
+    'Keep scope proportional: a small function needs roughly 3-6 ACs and 1-3 tasks; group closely related ACs into one task. Drop duplicates, keep ACs sharp and testable, number them AC-1.., EC-1.., Q-1.., T-1... Order tasks so each builds on the previous.\n' +
+    `Write ${dir}/spec.md using your spec template (Status: draft, Source: ${req.source}, Slug: ${req.slug}).\n` +
+    `Write ${dir}/tasks.md as a checklist: "- [ ] T-1 <title> (AC-1, AC-2)".\n` +
+    `Create or overwrite .tdd-flow/state.json as {"feature": "${req.slug}", "phase": "IDLE", "task": "T-1"}.\n` +
+    'If .tdd-flow/ is not in .gitignore, do not change .gitignore - just mention it in assumptions.\n' +
+    (extra || '') +
+    `\nRaw requirement:\n"""${req.text}"""\n\nDrafts:\n${JSON.stringify(drafts, null, 1)}`
+  let spec = await run(synthPrompt(), { agentType: A('requirements-analyst'), model: M.strong, schema: SPEC, label: 'synthesize' })
+  if (!spec) throw new Error('tdd-flow: synthesis failed.')
 
-// ---------- Critique ----------
-phase('Critique')
-const CRITICS = [
-  { key: 'testability', ask: 'Check every AC: is it unambiguous, observable, and automatable with the repo\'s test framework? Flag vague words ("fast", "user-friendly"), hidden multiple behaviours in one AC, and tasks too big for a few red-green cycles.' },
-  { key: 'completeness', ask: 'Compare the spec against the RAW requirement below. Flag anything required but missing, anything in the spec NOT supported by the requirement (invented scope), and edge cases a careful engineer would expect.' },
-]
-const crits = (await parallel(CRITICS.map(c => () => agent(
-  `You are a skeptical reviewer of ${dir}/spec.md. ${c.ask}\nOnly report real problems; do not edit files.\n\nRaw requirement:\n"""${req.text}"""`,
-  { schema: CRIT, model: M.worker, label: `critic:${c.key}`, phase: 'Critique', agentType: A('code-reviewer') },
-)))).filter(Boolean)
-const serious = crits.flatMap(c => c.issues).filter(i => i.severity !== 'minor')
-const minor = crits.flatMap(c => c.issues).filter(i => i.severity === 'minor')
-if (serious.length) {
-  log(`Critics raised ${serious.length} blocker/major issue(s) - revising the spec`)
-  const revised = await agent(
-    `Revise ${dir}/spec.md and ${dir}/tasks.md to fix these review issues. Where an issue needs information only the user has, add it to Open questions with your assumption instead of guessing.\n` +
-    JSON.stringify(serious, null, 1),
-    { agentType: A('requirements-analyst'), model: M.strong, schema: SPEC, label: 'revise', phase: 'Critique' })
-  if (revised) spec = revised
-} else {
-  log('Critics found no blocker/major issues')
-}
-if (minor.length) log(`${minor.length} minor critique note(s) not applied - see the critic agents in /workflows`)
+  // ---------- Critique ----------
+  phase('Critique')
+  const CRITICS = [
+    { key: 'testability', ask: 'Check every AC: is it unambiguous, observable, and automatable with the repo\'s test framework? Flag vague words ("fast", "user-friendly"), hidden multiple behaviours in one AC, and tasks too big for a few red-green cycles.' },
+    { key: 'completeness', ask: 'Compare the spec against the RAW requirement below. Flag anything required but missing, anything in the spec NOT supported by the requirement (invented scope), and edge cases a careful engineer would expect.' },
+  ]
+  const crits = (await parallel(CRITICS.map(c => () => run(
+    `You are a skeptical reviewer of ${dir}/spec.md. ${c.ask}\nOnly report real problems; do not edit files.\n\nRaw requirement:\n"""${req.text}"""`,
+    { schema: CRIT, model: M.worker, label: `critic:${c.key}`, phase: 'Critique', agentType: A('code-reviewer') },
+  )))).filter(Boolean)
+  if (limitHit) throw new Error(LIMIT)
+  const serious = crits.flatMap(c => c.issues).filter(i => i.severity !== 'minor')
+  const minor = crits.flatMap(c => c.issues).filter(i => i.severity === 'minor')
+  if (serious.length) {
+    log(`Critics raised ${serious.length} blocker/major issue(s) - revising the spec`)
+    const revised = await run(
+      `Revise ${dir}/spec.md and ${dir}/tasks.md to fix these review issues. Where an issue needs information only the user has, add it to Open questions with your assumption instead of guessing.\n` +
+      JSON.stringify(serious, null, 1),
+      { agentType: A('requirements-analyst'), model: M.strong, schema: SPEC, label: 'revise', phase: 'Critique' })
+    if (revised) spec = revised
+  } else {
+    log('Critics found no blocker/major issues')
+  }
+  if (minor.length) log(`${minor.length} minor critique note(s) not applied - see the critic agents in /workflows`)
 
-return {
-  status: 'spec_draft_ready',
-  slug: req.slug,
-  source: req.source,
-  specPath: spec.specPath,
-  tasksPath: spec.tasksPath,
-  acceptanceCriteria: spec.acCount,
-  tasks: spec.tasks,
-  openQuestions: spec.openQuestions,
-  assumptions: spec.assumptions || [],
-  critiqueFixesApplied: serious.length,
-  next: 'GATE: show the user the spec summary and open questions. After they approve, set "Status: approved" in spec.md, then run /tdd-flow:tdd-implement.',
+  return {
+    status: 'spec_draft_ready',
+    slug: req.slug,
+    source: req.source,
+    specPath: spec.specPath,
+    tasksPath: spec.tasksPath,
+    acceptanceCriteria: spec.acCount,
+    tasks: spec.tasks,
+    openQuestions: spec.openQuestions,
+    assumptions: spec.assumptions || [],
+    critiqueFixesApplied: serious.length,
+    next: 'GATE: show the user the spec summary and open questions. After they approve, set "Status: approved" in spec.md, then run /tdd-flow:tdd-implement.',
+  }
+} catch (e) {
+  if (!limitHit) throw e
+  return {
+    status: 'agent_limit',
+    agentsUsed: spawned,
+    next: `Stopped at the agent limit (${MAX_AGENTS} agents per run). Rerun with a higher {maxAgents}. Resuming this run replays its finished agents, and they still count toward the limit.`,
+  }
 }
