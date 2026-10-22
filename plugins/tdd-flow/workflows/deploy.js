@@ -1,13 +1,13 @@
 export const meta = {
   name: 'deploy',
   description: 'Ship a tdd-flow feature through CI/CD: multi-lens verified review, PR, CI watch with fix loop; merge/release only with explicit approval',
-  whenToUse: 'mode "pr" (default): review + open PR + get CI green, then stop for approval. mode "merge" with approved:true: merge, optional release, watch post-merge pipeline',
+  whenToUse: 'mode "pr" (default): review + open PR + get CI green, then stop for approval. mode "merge" with approved:true (optional requireReview:true): check PR review status, merge, optional release, watch post-merge pipeline',
   phases: [
     { title: 'Preflight', detail: 'tasks, CLI auth, CI present' },
     { title: 'Review', detail: '3 review lenses, adversarially verified' },
     { title: 'PR', detail: 'commit hygiene, push, open PR' },
     { title: 'CI', detail: 'watch checks, fix and re-push (max 2 rounds)' },
-    { title: 'Merge', detail: 'approved merge/release, post-merge pipeline' },
+    { title: 'Merge', detail: 'review status check, approved merge/release, post-merge pipeline' },
   ],
 }
 
@@ -26,6 +26,7 @@ const PRE = {
   properties: {
     slug: str, base: str, branch: str, issueId: str, cliReady: { type: 'boolean' }, cliFix: str,
     hasCi: { type: 'boolean' }, openTasks: strs, existingPr: str, testSingle: str, testAll: str,
+    reviewDecision: { type: 'string', enum: ['APPROVED', 'CHANGES_REQUESTED', 'REVIEW_REQUIRED', 'NONE'] },
   },
 }
 const FIND = {
@@ -40,8 +41,10 @@ const CI = {
   properties: {
     status: { type: 'string', enum: ['passed', 'failed', 'none', 'timeout'] }, runUrl: str, failingJob: str, rootCause: str,
     category: { type: 'string', enum: ['code', 'test', 'infra', 'flaky', 'unknown'] }, onMerge: str,
+    reviewDecision: { type: 'string', enum: ['APPROVED', 'CHANGES_REQUESTED', 'REVIEW_REQUIRED', 'NONE'] },
   },
 }
+const COMMIT = { type: 'object', required: ['committed'], properties: { committed: { type: 'boolean' }, nothingToCommit: { type: 'boolean' }, sha: str, reason: str, unexpected: strs } }
 const MERGE = { type: 'object', required: ['merged'], properties: { merged: { type: 'boolean' }, mergeCommit: str, releaseUrl: str, notes: str } }
 
 // ---------- Preflight ----------
@@ -49,7 +52,7 @@ phase('Preflight')
 const pre = await agent(
   'Preflight for shipping a tdd-flow feature. Do not change anything.\n' +
   `Feature: ${opt.feature ? '"' + opt.feature + '"' : '"feature" in .tdd-flow/state.json'}. Read .tdd-flow/stack.md and .tdd-flow/features/<slug>/tasks.md and spec.md (issue id from its Source).\n` +
-  'Report: base (default) branch, current branch, unticked tasks, whether a CI pipeline exists (.github/workflows, azure-pipelines.yml, .gitlab-ci.yml, Jenkinsfile), whether a PR already exists for this branch, ' +
+  'Report: base (default) branch, current branch, unticked tasks, whether a CI pipeline exists (.github/workflows, azure-pipelines.yml, .gitlab-ci.yml, Jenkinsfile), whether a PR already exists for this branch and, if so, its review status (reviewDecision), ' +
   'and whether the tracker CLI is installed and authenticated (`gh auth status` / `az account show` / `glab auth status`). If not, put the exact command the user must run in cliFix.',
   { agentType: A('release-engineer'), model: M.light, schema: PRE, label: 'preflight', effort: 'low' })
 if (!pre) throw new Error('tdd-flow: preflight failed.')
@@ -59,23 +62,32 @@ if (pre.branch === pre.base) throw new Error(`tdd-flow: you are on ${pre.base}. 
 // ======================= MERGE MODE =======================
 if (mode === 'merge') {
   if (opt.approved !== true) throw new Error('tdd-flow: merge requires {mode: "merge", approved: true}. Only pass approved:true after the user explicitly approved the merge in this conversation.')
+  if (!pre.existingPr) return { status: 'no_pr', next: 'There is no open PR for this branch. Run /tdd-flow:deploy (mode "pr") first.' }
+  if (pre.reviewDecision === 'CHANGES_REQUESTED') {
+    return { status: 'review_changes_requested', prUrl: pre.existingPr, next: 'A reviewer requested changes on the PR. Show them to the user; fix them with /tdd-flow:tdd-implement {findings}, then run /tdd-flow:deploy again.' }
+  }
+  if (opt.requireReview === true && pre.reviewDecision !== 'APPROVED') {
+    return { status: 'review_required', prUrl: pre.existingPr, reviewDecision: pre.reviewDecision || 'NONE', next: 'requireReview is set and the PR has no approving review yet. Wait for approval, then run the merge again.' }
+  }
   phase('Merge')
   const merged = await agent(
-    `Action: merge${opt.release ? ' then release' : ''}. approved: true. Feature ${pre.slug}, branch ${pre.branch} into ${pre.base}${pre.existingPr ? ', PR ' + pre.existingPr : ''}.\n` +
-    'Merge using the repo\'s merge strategy (squash if unspecified) and delete the branch. Never bypass branch protection or failing required checks - if blocked, report why and stop.' +
+    `Action: merge${opt.release ? ' then release' : ''}. approved: true. Feature ${pre.slug}, branch ${pre.branch} into ${pre.base}, PR ${pre.existingPr}.\n` +
+    'Merge through the PR using the repo\'s merge strategy (squash if unspecified), delete the branch, then switch to the base branch and pull. Never bypass branch protection or failing required checks - if blocked, report why and stop.' +
     (opt.release ? ' Then create a release/tag following the repo\'s existing versioning (semver), with notes from the CHANGELOG Unreleased section.' : ''),
     { agentType: A('release-engineer'), schema: MERGE, label: 'merge' })
   if (!merged || !merged.merged) return { status: 'merge_blocked', details: merged ? merged.notes : 'agent failed' }
   const post = await agent(
     `Action: watch-ci for the post-merge pipeline on ${pre.base} (merge commit ${merged.mergeCommit || 'HEAD of ' + pre.base}). Poll until it finishes or 30 minutes pass. Report status, run URL, and any deployment URL/environment the pipeline reports.`,
     { agentType: A('release-engineer'), schema: CI, label: 'post-merge CI', stallMs: 2400000 })
-  await agent(
-    `Close out tdd-flow feature ${pre.slug}: set "Status: done" in .tdd-flow/features/${pre.slug}/spec.md and set .tdd-flow/state.json to {"feature": null, "phase": "IDLE", "task": null}. Switch back to ${pre.base} and pull.`,
-    { label: 'close-out', model: M.light, effort: 'low' })
+  const closed = await agent(
+    `Close out tdd-flow feature ${pre.slug}: set "Status: done" in .tdd-flow/features/${pre.slug}/spec.md and set .tdd-flow/state.json to {"feature": null, "phase": "IDLE", "task": null}. ` +
+    'Do not run git commands other than `git status`. Report uncommitted=true if `git status --porcelain .tdd-flow` shows changes afterwards.',
+    { label: 'close-out', model: M.light, effort: 'low', schema: { type: 'object', required: ['uncommitted'], properties: { uncommitted: { type: 'boolean' } } } })
+  const closeNote = closed && closed.uncommitted ? ` .tdd-flow/ is tracked by git: the close-out edits are uncommitted on ${pre.base}; commit them through a PR or discard them.` : ''
   return {
     status: post && post.status === 'passed' ? 'deployed' : 'merged_pipeline_' + (post ? post.status : 'unknown'),
     mergeCommit: merged.mergeCommit, releaseUrl: merged.releaseUrl, pipeline: post,
-    next: pre.issueId ? `Check whether issue ${pre.issueId} closed automatically; offer to close it with a link to the PR.` : 'Done.',
+    next: (pre.issueId ? `Check whether issue ${pre.issueId} closed automatically; offer to close it with a link to the PR.` : 'Done.') + closeNote,
   }
 }
 
@@ -127,7 +139,7 @@ let ci = null
 let rerunUsed = false
 for (let round = 0; round <= MAX_CI_ROUNDS; round++) {
   ci = await agent(
-    `Action: watch-ci for PR ${pr.prUrl}. Poll until all checks finish or 30 minutes pass. On failure fetch the failing job log, classify the root cause (code | test | infra | flaky | unknown) and summarise it in 3-5 lines. Also read the pipeline definition and describe in one line what merging into ${pre.base} will trigger (onMerge).`,
+    `Action: watch-ci for PR ${pr.prUrl}. Poll until all checks finish or 30 minutes pass. On failure fetch the failing job log, classify the root cause (code | test | infra | flaky | unknown) and summarise it in 3-5 lines. Also read the pipeline definition and describe in one line what merging into ${pre.base} will trigger (onMerge), and report the PR review status (reviewDecision).`,
     { agentType: A('release-engineer'), schema: CI, label: `watch CI ${round + 1}`, phase: 'CI', stallMs: 2400000 })
   if (!ci) throw new Error('tdd-flow: CI watch agent failed.')
   if (ci.status !== 'failed') break
@@ -146,9 +158,13 @@ for (let round = 0; round <= MAX_CI_ROUNDS; round++) {
     { agentType: A('test-writer'), schema: { type: 'object', required: ['result', 'reason'], properties: { result: { type: 'string', enum: ['FAIL', 'PASS', 'ERROR'] }, reason: str, testFile: str, testName: str } }, label: `CI repro ${round + 1}`, phase: 'CI' })
   if (!red || red.result !== 'FAIL') break
   const green = await agent(
-    `GREEN step. Make the reproducing test ${red.testFile} :: ${red.testName} pass with a minimal production fix (never weaken tests), run the full suite, then commit "fix(${pre.slug}): ${ci.failingJob || 'CI failure'}" and push the branch.`,
-    { agentType: A('implementer'), schema: { type: 'object', required: ['suitePass', 'summary'], properties: { suitePass: { type: 'boolean' }, summary: str } }, label: `CI fix ${round + 1}`, phase: 'CI', model: round === 0 ? M.worker : M.strong })
+    `GREEN step. Make the reproducing test ${red.testFile} :: ${red.testName} pass with a minimal production fix (never weaken tests) and run the full suite. Do not commit or push.`,
+    { agentType: A('implementer'), schema: { type: 'object', required: ['suitePass', 'summary', 'filesChanged'], properties: { suitePass: { type: 'boolean' }, summary: str, filesChanged: strs } }, label: `CI fix ${round + 1}`, phase: 'CI', model: round === 0 ? M.worker : M.strong })
   if (!green || !green.suitePass) break
+  const fixCommit = await agent(
+    `Action: commit. Message: "fix(${pre.slug}): ${ci.failingJob || 'CI failure'}". Push the branch after committing.\nFiles:\n${[red.testFile, ...green.filesChanged].join('\n')}`,
+    { agentType: A('release-engineer'), model: M.light, schema: COMMIT, label: `CI fix commit ${round + 1}`, phase: 'CI', effort: 'low' })
+  if (!fixCommit || !fixCommit.committed) { log(`CI fix commit failed: ${fixCommit ? fixCommit.reason : 'agent failed'}`); break }
 }
 
 if (!ci || ci.status !== 'passed') {
@@ -162,6 +178,7 @@ return {
   prUrl: pr.prUrl,
   ciRun: ci.runUrl,
   onMerge: ci.onMerge,
+  reviewDecision: ci.reviewDecision || 'NONE',
   reviewCandidatesRefuted: candidates.length,
-  next: 'GATE: show PR URL, green CI and what merging triggers. Only after the user explicitly approves, run /tdd-flow:deploy with {mode: "merge", approved: true' + (opt.release ? ', release: true' : '') + '}.',
+  next: 'GATE: show PR URL, green CI, review status and what merging triggers. Only after the user explicitly approves, run /tdd-flow:deploy with {mode: "merge", approved: true' + (opt.release ? ', release: true' : '') + (opt.requireReview ? ', requireReview: true' : '') + '}.',
 }
