@@ -42,4 +42,4 @@ plugins/
 1. Change the plugin.
 2. Bump `version` in `plugins/<plugin>/.claude-plugin/plugin.json` **and** in `.claude-plugin/marketplace.json`.
 3. Validate: `claude plugin validate .claude-plugin/marketplace.json`
-4. Commit, tag (e.g. `tdd-flow-v0.3.0`), push.
+4. Open a PR (see the `git-workflow` skill); after merge, tag `<plugin>-v<version>` (e.g. `tdd-flow-v0.3.0`) on the merge commit.
