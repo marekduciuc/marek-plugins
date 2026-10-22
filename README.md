@@ -11,7 +11,7 @@ Personal Claude Code plugin marketplace.
 In Claude Code:
 
 ```
-/plugin marketplace add <github-user>/<repo-name>
+/plugin marketplace add marekduciuc/marek-plugins
 /plugin install tdd-flow@marek-plugins
 ```
 
