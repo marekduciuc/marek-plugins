@@ -35,14 +35,21 @@ The base branch is the default branch from `.tdd-flow/stack.md`, else `git symbo
 3. Make sure no secrets or large binaries are staged (scan `git diff --cached` for keys, tokens, `.env`, connection strings). If any are, unstage them and report.
 4. Run `git status --porcelain`. Report other modified or untracked files as `unexpected`. Do not stage them.
 5. If nothing is staged, return `committed: false, nothingToCommit: true`. Otherwise commit with exactly the given message and return the short sha.
-6. Push only if the caller asks for it (`git push`, adding `-u origin <branch>` if there is no upstream).
+6. Push only if the caller asks for it (`git push`, adding `-u origin <branch>` if there is no upstream). Before pushing, follow **PR state check**.
+
+**PR state check** (before every push to a branch that may have a PR):
+
+1. Run `gh pr list --head <branch> --state all --json number,state,url --limit 1` (Azure DevOps: `az repos pr list --source-branch <branch> --status all`; GitLab: `glab mr list --source-branch <branch> --all`).
+2. If the PR is `MERGED` or `CLOSED`, do not push to that branch. Switch to the updated base (`git switch <base> && git pull --ff-only`), create `<branch>-followup` (carrying the uncommitted changes, or cherry-picking the unpushed commits), push it and open a follow-up PR that links the merged one. Report `followUp: true` and both URLs.
 
 **prepare-pr:**
 
 1. Check `git status`. If you are on the base branch, follow **create-branch** first. Never commit straight to the base branch.
 2. Run the full test suite and lint locally. Stop and report if anything fails.
 3. If feature work is still uncommitted, commit it following **commit** with a Conventional Commit message (`feat:`, `fix:`, `docs:`, `test:`, `refactor:`) that references the issue ID. Report anything else instead of staging it.
-4. Push and open a PR/merge request. The body lists: summary, linked issue, ACs covered, test evidence, docs changed, and risks.
+4. If the diff touches build, test, dependency or infra files (build manifests, lockfiles, test config, Dockerfiles, compose files, migrations), check the CI workflow files (`.github/workflows/`, `azure-pipelines.yml`, `.gitlab-ci.yml`). Their triggers, paths and commands must still cover the change. If they don't, still open the PR, list the gap under risks in the PR body, and start the `notes` you return with `CI GAP:` and the file that needs updating.
+5. Follow **PR state check**, then push and open a PR/merge request. The body lists: summary, linked issue, ACs covered, test evidence, docs changed, and risks.
+6. Report a PR URL only after the create command has returned it.
 
 **watch-ci:** poll the PR checks (e.g. `gh pr checks --watch`, `az pipelines runs show`). On failure, fetch the failing job log, summarise the root cause in 3-5 lines, and return it. Do not push fixes yourself. When asked, also report the PR review status.
 
@@ -57,7 +64,7 @@ The base branch is the default branch from `.tdd-flow/stack.md`, else `git symbo
 1. There must be an open PR. If there is none, stop and report. Never merge locally.
 2. The working tree must be clean (`git status --porcelain`). If it is not, stop and report.
 3. Merge through the PR using the repo's merge strategy (squash if unspecified) and delete the branch, e.g. `gh pr merge <pr> --squash --delete-branch --match-head-commit <sha>`. Never use `--admin`.
-4. Switch to the base branch and `git pull --ff-only`.
+4. Switch to the base branch and `git pull --ff-only`. Confirm the merge (`gh pr view <pr> --json state` is `MERGED`), then delete the local branch with `git branch -d <branch>`. Never use `-D`; if `-d` refuses, report it.
 5. If a release is requested, create a tag/release following existing versioning (semver). Report the resulting URL.
 
 **Output:** action, commands run, PR/run URL, check status, and next recommended step.
