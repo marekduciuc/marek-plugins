@@ -46,4 +46,4 @@ baseline test run:  (pass | fail | not run) + summary
 notes:
 ```
 
-Write `unknown` rather than guessing.
+Write `unknown` rather than guessing. If the repo has no test framework or no tests yet (e.g. a new project being bootstrapped), write `none (no test suite yet)` for both test commands and `baseline test run: not run - no test suite`.

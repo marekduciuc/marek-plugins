@@ -114,7 +114,7 @@ try {
   // ---------- Review: 3 lenses -> dedupe (barrier) -> adversarial verify ----------
   phase('Review')
   const LENSES = [
-    { key: 'spec', ask: 'SPEC COVERAGE & CORRECTNESS: every AC in the spec has a test that would fail if the behaviour broke; logic errors; unhandled edge cases listed in the spec.' },
+    { key: 'spec', ask: 'SPEC COVERAGE & CORRECTNESS: every AC in the spec has a test that would fail if the behaviour broke (ACs of [setup] tasks are covered by their verify command passing, or a manual check recorded in tdd-log.md, instead of a test); logic errors; unhandled edge cases listed in the spec.' },
     { key: 'security', ask: 'SECURITY: injection, unsafe deserialisation, secrets in code or config, path traversal, missing authorisation, unsafe defaults.' },
     { key: 'quality', ask: 'TEST QUALITY & MAINTAINABILITY: non-deterministic tests, tests asserting implementation details, dead code, duplication, convention violations.' },
   ]
