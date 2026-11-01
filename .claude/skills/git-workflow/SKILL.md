@@ -52,6 +52,14 @@ git commit                 # imperative subject line, body says what and why
 git push -u origin <branch>
 ```
 
+Before every push, check the branch's PR state:
+
+```bash
+gh pr list --head <branch> --state all --json number,state,url --limit 1
+```
+
+If the PR is `MERGED` or `CLOSED`, do not push to that branch. Start a new branch from the updated `main` (step 2), bring the changes along, and open a follow-up PR that links the merged one.
+
 ## 4. Open or update the PR
 
 If the branch has no open PR yet:
@@ -60,7 +68,16 @@ If the branch has no open PR yet:
 gh pr create --base main --head <branch> --title "<title>" --body "<summary + test plan>"
 ```
 
-If a PR is already open, pushing updates it. Change the title or description with `gh pr edit` if the scope changed. Report the PR URL to the user.
+If a PR is already open, pushing updates it. Change the title or description with `gh pr edit` if the scope changed. Report the PR URL to the user only after `gh pr create` or `gh pr view` has returned it. Never say a PR exists before the branch is committed and pushed.
+
+## 4b. Clean up after merge
+
+Once `gh pr view <number> --json state` shows `MERGED`:
+
+```bash
+git switch main && git pull --ff-only
+git branch -d <branch>     # never -D; if -d refuses, tell the user
+```
 
 Useful checks: `gh pr view --json url,state,mergeable`, `gh pr checks`.
 
