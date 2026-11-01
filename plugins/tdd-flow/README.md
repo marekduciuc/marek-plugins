@@ -15,7 +15,7 @@ Personal Claude Code plugin: an end-to-end dev pipeline built on **dynamic workf
 | Command | Shape | Agents (typical) |
 |---|---|---|
 | `/tdd-flow:analyze-requirements <issue \| file \| text>` | Context (stack + fetch, parallel) → 3 analysts from different angles (behaviour / risk / minimal scope) → synthesize spec.md + tasks.md → testability & completeness critics → revise | ~8-9 |
-| `/tdd-flow:tdd-implement {feature}` | Plan + baseline → per task, sequentially: per behaviour RED (test-writer, retry once) → GREEN (implementer, retry once) → REFACTOR → review with up to 2 fix rounds (behavioural findings become new RED cycles) → commit. `[setup]` tasks: SETUP + verify commands → review → commit | ~2 per behaviour + 3 per task; ~4 per setup task |
+| `/tdd-flow:tdd-implement {feature}` | Plan + baseline → per task, sequentially: RED (test-writer writes all of the task's failing tests) → GREEN (implementer makes them pass one at a time, then refactors) → review with up to 2 fix rounds (behavioural findings go through RED → GREEN again) → commit (also ticks the task). `[setup]` tasks: SETUP + verify commands → review → commit | ~4 per task (2 more per 5 extra behaviours); ~3 per setup task |
 | `/tdd-flow:document {feature}` | Survey diff → pipeline per target: write → adversarial fact-check → fix → commit | ~6-14 |
 | `/tdd-flow:deploy {feature}` | Preflight → 3 review lenses (spec, security, quality) → dedupe → 2 skeptics per finding → PR → CI watch with test-first fix loop (max 2) → stops at `ready_to_merge` | ~8-12 |
 | `/tdd-flow:deploy {feature, mode:"merge", approved:true}` | PR review status check → merge (+ optional release) → watch post-merge pipeline → close out | ~3 |
@@ -80,9 +80,9 @@ Workflows set the model on each call, so each step uses the cheapest model that 
 | Step | Model |
 |---|---|
 | Analyst drafts (x3), spec critics, per-task review, doc writing + fact-check, deploy sceptics | **Sonnet** (worker) |
-| Test-writer (RED), implementer (GREEN / REFACTOR / fixes) | **Sonnet**, auto-escalated to **Opus** if the step fails twice |
+| Test-writer (RED), implementer (GREEN + REFACTOR / fixes) | **Sonnet**, auto-escalated to **Opus** if the step fails twice |
 | Spec synthesis + revision, final pre-merge review (3 lenses) | **Opus** (strong) |
-| Fetching the issue, preflight, commits, close-out, stack detection | **Haiku** (light) |
+| Fetching the issue, preflight, commits (incl. ticking the task), close-out, stack detection | **Haiku** (light) |
 
 **Escalation ladder** for every coding step: Sonnet, then Sonnet again with the failure output, then Opus with the failure output. Only if all three fail does the workflow stop with `status: "blocked"`. `tdd-implement` reports `escalationsToStrongModel`, so you can see how often Opus was needed.
 
@@ -92,8 +92,8 @@ Override per run with `args.models`, e.g. `{feature: "x", models: {worker: "opus
 |---|---|---|
 | stack-detector | haiku | Language, test/build/lint commands, CI, tracker |
 | requirements-analyst | sonnet (opus for synthesis) | Drafts and synthesizes specs |
-| test-writer | sonnet | RED: one failing test, never production code |
-| implementer | sonnet | GREEN minimal code + REFACTOR; SETUP for setup tasks |
+| test-writer | sonnet | RED: one failing test per behaviour, never production code |
+| implementer | sonnet | GREEN minimal code, one test at a time, + REFACTOR; SETUP for setup tasks |
 | code-reviewer | sonnet (opus for final review) | Read-only review and fact-checking |
 | doc-writer | sonnet | Docs from the actual diff |
 | release-engineer | sonnet (haiku for branch/commits) | All git: feature branch, commits, PR, CI watch, review status, merge/release (only with approval) |
@@ -122,5 +122,6 @@ Add `.tdd-flow/` to `.gitignore`, or commit it if you want specs versioned.
 - **Agent limits.** Every workflow runs at most 2 agents at the same time and has a hard cap on agents per run: analyze-requirements 12, document 15, deploy 20, tdd-implement 40. Override per run with `args.maxAgents` / `args.maxParallel` (positive integers). At the cap a workflow stops with `status: "agent_limit"`. tdd-implement only starts a task whose minimum cost fits, so it normally stops between tasks; rerun it to continue from `tasks.md`. deploy stops before the skeptic pass if verifying all findings would not fit.
 - Watch runs with `/workflows`; each agent's token use is shown there, and you can pause (`p`) or stop (`x`).
 - Use `tdd-implement` with `{maxTasks: 1}` for small, reviewable increments.
+- **Tests first, per task.** For each task, the test-writer writes every failing test before the implementer touches production code (tdd-guard blocks production edits during RED). Each agent start costs about 17k tokens of context, so the tests are written in batches, not one agent per behaviour. `{batchSize: n}` sets how many behaviours share one RED/GREEN pair (default 5); `batchSize: 1` gives one cycle per behaviour, at about 2 extra agents per behaviour.
 - For the cheapest runs pass `models: {strong: "sonnet"}`; for hard features `models: {worker: "opus"}`.
 - Runs can be resumed in the same session after a pause or stop. Completed agents are replayed from cache.

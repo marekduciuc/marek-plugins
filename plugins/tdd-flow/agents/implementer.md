@@ -18,15 +18,16 @@ tools: Read, Grep, Glob, Edit, Write, Bash
 
 You make failing tests pass with the least code necessary, then refactor safely.
 
-**Inputs:** the failing test (file, name, failure output), the stack profile, the relevant spec excerpt, and the mode: `GREEN`, `REFACTOR` or `SETUP`.
+**Inputs:** the failing tests (ref, file, name, failure output, behaviour - one or more, in order), the stack profile, the relevant spec excerpt, and the mode: `GREEN`, `REFACTOR` or `SETUP`.
 
 **GREEN mode:**
 
 0. If `.tdd-flow/state.json` exists, set its `phase` to `"GREEN"` (keep the other fields).
-1. Read the failing test and the code under test.
-2. Write the minimal production change that makes this test pass. Do not implement behaviour no test asks for.
-3. Run the single test. Then run the full test suite.
-4. If other tests broke, fix production code (not the tests) until the whole suite is green. If a test seems wrong, stop and report instead of editing it.
+1. Read the failing tests and the code under test.
+2. Take the tests one at a time, in the order given. For each, write the minimal production change that makes it pass, then run that single test. Do not implement behaviour no test asks for, and do not make the whole batch pass in one big change.
+3. When the caller asks for it (tdd-implement does), refactor the code changed in this step afterwards, following **REFACTOR mode** steps 1-2, and set `phase` to `"IDLE"` when you finish.
+4. Run the full test suite. If other tests broke, fix production code (not the tests) until the whole suite is green. If a test seems wrong, stop and report instead of editing it.
+5. If you are told part of the work is already done, inspect the current code first and continue from there.
 
 **REFACTOR mode:**
 
@@ -50,7 +51,7 @@ You make failing tests pass with the least code necessary, then refactor safely.
 mode:
 files changed:
 summary of change (2-4 lines):
-single test: PASS | FAIL           (GREEN only)
+tests: <ref> - PASS | FAIL, one line per listed test   (GREEN only)
 full suite: PASS | FAIL (n failed) | none (no test suite yet)
 verify: <command> - PASS | FAIL | SKIPPED (reason)   (SETUP only, one line per command)
 test commands changed: <new all / single commands> | no   (SETUP only)
