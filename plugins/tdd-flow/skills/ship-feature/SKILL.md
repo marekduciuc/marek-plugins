@@ -15,7 +15,7 @@ Input: $ARGUMENTS
 | Step | Workflow | args |
 |---|---|---|
 | 1 | `/tdd-flow:analyze-requirements` | the input (issue id/URL, file path or text) |
-| 2 | `/tdd-flow:tdd-implement` | `{feature: "<slug>"}` - optional `fromTask`, `maxTasks`, `findings`, `force`, `allowRedBaseline`, `models` |
+| 2 | `/tdd-flow:tdd-implement` | `{feature: "<slug>"}` - optional `fromTask`, `maxTasks`, `findings`, `force`, `allowRedBaseline`, `models`, `batchSize` |
 | 3 | `/tdd-flow:document` | `{feature: "<slug>"}` - optional `targets` |
 | 4a | `/tdd-flow:deploy` | `{feature: "<slug>"}` (mode `pr`, the default) |
 | 4b | `/tdd-flow:deploy` | `{feature: "<slug>", mode: "merge", approved: true, release?: true, requireReview?: true}` |
@@ -58,4 +58,4 @@ After each workflow, give one status line. At the end: issue, PR URL, tasks and 
 
 ## Cost note
 
-`tdd-implement` uses about 2 agents per behaviour plus 3 per task (mostly Sonnet; Opus only when a step fails twice). A setup task uses about 4 agents. Pass `maxTasks` to keep runs small, and `models` to override the model policy (see README).
+`tdd-implement` uses about 4 agents per task: RED, GREEN, review, commit (mostly Sonnet; Opus only when a step fails twice). Tasks with more than 5 behaviours add a RED/GREEN pair per 5 behaviours (`batchSize`). A setup task uses about 3 agents. Pass `maxTasks` to keep runs small, and `models` to override the model policy (see README).

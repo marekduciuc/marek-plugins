@@ -1,11 +1,11 @@
 export const meta = {
   name: 'tdd-implement',
-  description: 'Implement an approved tdd-flow spec task by task with strict red-green-refactor cycles, per-task review and commits',
-  whenToUse: 'After the spec is approved. args: feature slug (optional), or {feature, fromTask, maxTasks, findings}',
+  description: 'Implement an approved tdd-flow spec task by task: failing tests first (test-writer), then code (implementer), per-task review and commits',
+  whenToUse: 'After the spec is approved. args: feature slug (optional), or {feature, fromTask, maxTasks, findings, batchSize}',
   phases: [
     { title: 'Plan', detail: 'load spec and tasks, baseline test run' },
-    { title: 'Implement', detail: 'RED test-writer -> GREEN implementer, per behaviour' },
-    { title: 'Review', detail: 'refactor, review, fix loop, commit per task' },
+    { title: 'Implement', detail: 'per task: RED test-writer writes all failing tests -> GREEN implementer makes them pass and refactors' },
+    { title: 'Review', detail: 'review, fix loop, commit per task' },
   ],
 }
 
@@ -21,6 +21,8 @@ const M = Object.assign({ worker: 'sonnet', strong: 'opus', light: 'haiku' }, op
 const posInt = (v, d) => (Number.isInteger(v) && v > 0 ? v : d)
 const MAX_AGENTS = posInt(opt.maxAgents, 40)
 const MAX_PARALLEL = posInt(opt.maxParallel, 2)
+// Behaviours per RED/GREEN pair. Bounds agent context and retry cost; batchSize 1 gives one cycle per behaviour.
+const BATCH = posInt(opt.batchSize, 5)
 const LIMIT = `tdd-flow: agent limit (${MAX_AGENTS}) reached`
 let spawned = 0, active = 0, limitHit = false
 const waiting = []
@@ -58,10 +60,20 @@ const SETUP = {
     } } },
   },
 }
-const RED = {
+const REDS = {
   type: 'object',
-  required: ['result', 'testFile', 'testName', 'reason'],
-  properties: { result: { type: 'string', enum: ['FAIL', 'PASS', 'ERROR'] }, testFile: str, testName: str, command: str, reason: str },
+  required: ['tests'],
+  properties: { tests: { type: 'array', items: { type: 'object', required: ['ref', 'result', 'testFile', 'testName', 'reason'], properties: {
+    ref: str, result: { type: 'string', enum: ['FAIL', 'PASS', 'ERROR'] }, testFile: str, testName: str, command: str, reason: str,
+  } } } },
+}
+const GREEN = {
+  type: 'object',
+  required: ['tests', 'suitePass', 'filesChanged', 'summary'],
+  properties: {
+    tests: { type: 'array', items: { type: 'object', required: ['ref', 'pass'], properties: { ref: str, pass: { type: 'boolean' } } } },
+    suitePass: { type: 'boolean' }, filesChanged: strs, summary: str, failures: str, concerns: str,
+  },
 }
 const CODE = {
   type: 'object',
@@ -80,7 +92,7 @@ const REVIEW = {
   },
 }
 const BRANCH = { type: 'object', required: ['branch'], properties: { branch: str } }
-const COMMIT = { type: 'object', required: ['committed'], properties: { committed: { type: 'boolean' }, nothingToCommit: { type: 'boolean' }, sha: str, reason: str, unexpected: strs } }
+const COMMIT = { type: 'object', required: ['committed'], properties: { committed: { type: 'boolean' }, nothingToCommit: { type: 'boolean' }, ticked: { type: 'boolean' }, sha: str, reason: str, unexpected: strs } }
 
 // ---------- Plan ----------
 phase('Plan')
@@ -132,7 +144,8 @@ async function blocked(task, step, details, extra = '', next = '') {
 }
 
 // Escalation ladder: worker model, worker model with feedback, then strong model with feedback.
-// Only steps that fail twice reach the strong model.
+// Only steps that fail twice reach the strong model. `attempts` holds every result, because an attempt that
+// did not succeed may still have changed files that belong to the task.
 let escalations = 0
 async function escalate(name, run, ok, feedback) {
   const ladder = [
@@ -141,41 +154,74 @@ async function escalate(name, run, ok, feedback) {
     { model: M.strong, suffix: ' ESCALATED' },
   ]
   let last = null
+  const attempts = []
   for (let i = 0; i < ladder.length; i++) {
     const step = ladder[i]
     if (i === 2) { escalations++; log(`${name}: failed twice on ${M.worker} - escalating to ${M.strong}`) }
     const extra = i === 0 ? '' : (last ? '\n\nA previous attempt did not succeed:\n' + feedback(last) : '\n\nA previous attempt crashed; start fresh.')
     const r = await run(step.model, extra, name + step.suffix)
-    if (r && ok(r)) return { ok: true, result: r, escalated: i === 2 }
+    if (r) attempts.push(r)
+    if (r && ok(r)) return { ok: true, result: r, attempts, escalated: i === 2 }
     if (r) last = r
   }
-  return { ok: false, result: last }
+  return { ok: false, result: last, attempts }
 }
+const changedFiles = (attempts) => attempts.flatMap(a => a.filesChanged || [])
 
-// One red-green cycle. Returns {ok:true, files} | {ok:true, skipped:true, files} | {ok:false, step, details}
-async function cycle(task, b) {
-  const tag = `${task.id} ${b.ref}`
-  const red = await escalate(`${tag} RED`,
-    (model, extra, label) => run(
-      `RED step. ${ctx}\nTask ${task.id}: ${task.title}\nBehaviour ${b.ref}: ${b.text}\n` +
-      'Write ONE failing test for exactly this behaviour, run it, and confirm it fails for the expected reason.' + extra,
-      { agentType: A('test-writer'), model, schema: RED, label, phase: 'Implement' }),
-    r => r.result !== 'ERROR',
-    r => `It errored for the wrong reason: ${r.reason}. Fix the test or setup so it fails on the behaviour itself.`)
-  if (!red.ok) return { ok: false, step: `RED ${b.ref}`, details: red.result ? red.result.reason : 'agent failed' }
-  const rr = red.result
-  if (rr.result === 'PASS') { log(`${tag}: test passed immediately - behaviour already exists`); return { ok: true, skipped: true, files: [rr.testFile] } }
+// RED then GREEN for a list of behaviours, in batches of BATCH. A separate test-writer writes every failing test of
+// the batch before the implementer changes production code. `structural` review findings go into the last GREEN call.
+// Returns {ok:true, files, greenRan, structuralDone} | {ok:false, step, details}
+async function tddStep(task, items, structural = []) {
+  const files = []
+  let greenRan = false, structuralDone = false
+  for (let i = 0; i < items.length; i += BATCH) {
+    const batch = items.slice(i, i + BATCH)
+    const refs = batch.map(b => b.ref)
+    const isLastBatch = i + BATCH >= items.length
+    const tag = `${task.id} ${refs.length > 1 ? refs[0] + '..' + refs[refs.length - 1] : refs[0]}`
 
-  const green = await escalate(`${tag} GREEN`,
-    (model, extra, label) => run(
-      `GREEN step. ${ctx}\nFailing test: ${rr.testFile} :: ${rr.testName}\nFailure: ${rr.reason}\nBehaviour ${b.ref}: ${b.text}\n` +
-      'Write the minimal production code to make it pass, then run the single test and the full suite. ' +
-      `Then append a cycle entry (RED + GREEN lines) for ${task.id} / ${b.ref} to ${dir}/tdd-log.md.` + extra,
-      { agentType: A('implementer'), model, schema: CODE, label, phase: 'Implement' }),
-    r => r.singlePass && r.suitePass,
-    r => `It left failures:\n${r.failures || r.summary}\nInspect the current state of the code first, then fix production code (never the tests).`)
-  if (!green.ok) return { ok: false, step: `GREEN ${b.ref}`, details: green.result ? (green.result.failures || green.result.summary) : 'agent failed' }
-  return { ok: true, files: [rr.testFile, ...green.result.filesChanged] }
+    // RED succeeds only if every requested ref is reported and none errored.
+    const redProblems = (r) => [
+      ...refs.filter(ref => !r.tests.some(t => t.ref === ref)).map(ref => `${ref}: no test reported`),
+      ...r.tests.filter(t => refs.includes(t.ref) && t.result === 'ERROR').map(t => `${t.ref}: ${t.reason}`),
+    ]
+    const red = await escalate(`${tag} RED`,
+      (model, extra, label) => run(
+        `RED step. ${ctx}\nTask ${task.id}: ${task.title}\nBehaviours, in order:\n${batch.map(b => `- ${b.ref}: ${b.text}`).join('\n')}\n` +
+        'Write ONE failing test per behaviour, run each, and confirm each fails for the expected reason. Report one entry per behaviour with its ref.' + extra,
+        { agentType: A('test-writer'), model, schema: REDS, label, phase: 'Implement' }),
+      r => !redProblems(r).length,
+      r => `These behaviours are not done:\n${redProblems(r).join('\n')}\nThe tests for the other behaviours are already on disk and correct: do not rewrite or duplicate them. ` +
+        'Fix or write only the tests listed here so each fails on the behaviour itself, then report every behaviour of the batch again.')
+    red.attempts.forEach(a => a.tests.forEach(t => t.testFile && files.push(t.testFile)))
+    if (!red.ok) return { ok: false, step: `RED ${refs.join(', ')}`, details: red.result ? redProblems(red.result).join('\n') : 'agent failed' }
+    const reported = refs.map(ref => red.result.tests.find(t => t.ref === ref))
+    reported.filter(t => t.result === 'PASS').forEach(t => log(`${task.id} ${t.ref}: test passed immediately - behaviour already exists`))
+    const failing = reported.filter(t => t.result === 'FAIL')
+    if (!failing.length) continue
+
+    // GREEN succeeds only if every listed test is reported passing and the full suite is green.
+    const withStructural = isLastBatch && structural.length > 0
+    const greenProblems = (r) => [
+      ...failing.filter(t => !r.tests.some(x => x.ref === t.ref && x.pass)).map(t => `${t.ref}: ${t.testFile} :: ${t.testName} is not passing`),
+      ...(r.suitePass ? [] : ['the full suite is failing']),
+    ]
+    const green = await escalate(`${tag} GREEN`,
+      (model, extra, label) => run(
+        `GREEN step. ${ctx}\nTask ${task.id}: ${task.title}\nFailing tests, in order:\n` +
+        failing.map(t => `- ${t.ref}: ${t.testFile} :: ${t.testName}\n  Failure: ${t.reason}\n  Behaviour: ${batch.find(b => b.ref === t.ref).text}`).join('\n') + '\n' +
+        'Make them pass one at a time, in this order, with minimal code, running each single test as you go. Then refactor the code changed in this step and run the full suite.\n' +
+        (withStructural ? `Also address these non-behavioural review findings without changing behaviour:\n${JSON.stringify(structural, null, 1)}\n` : '') +
+        `Append one entry per behaviour (RED + GREEN lines) and one REFACTOR line for ${task.id} to ${dir}/tdd-log.md. Report each test by ref.` + extra,
+        { agentType: A('implementer'), model, schema: GREEN, label, phase: 'Implement' }),
+      r => !greenProblems(r).length,
+      r => `Not done yet:\n${greenProblems(r).join('\n')}\n${r.failures || r.summary}\nThe work already done is on disk: inspect the current code first. Fix production code, never the tests.`)
+    files.push(...changedFiles(green.attempts))
+    if (!green.ok) return { ok: false, step: `GREEN ${refs.join(', ')}`, details: green.result ? greenProblems(green.result).join('\n') + '\n' + (green.result.failures || green.result.summary) : 'agent failed' }
+    greenRan = true
+    if (withStructural) structuralDone = true
+  }
+  return { ok: true, files, greenRan, structuralDone }
 }
 
 // Setup task (config/infrastructure, no red-green cycle): write the files, run the spec's verify commands.
@@ -218,7 +264,7 @@ async function setupStep(task, findings = null) {
     else unverified.delete(key)
   }
   manual.forEach(c => unverified.set(`${task.id}: manual ${c.ref}`, `${task.id}: manual check ${c.ref} - ${c.command}`))
-  return { ok: true, files: res.filesChanged }
+  return { ok: true, files: changedFiles(r.attempts) }
 }
 
 // ---------- Implement + Review, task by task (sequential: one working tree) ----------
@@ -231,9 +277,9 @@ try {
       return await blocked(task, 'NO TEST SUITE', `${task.id} is a tdd task, but the repo has no test command yet.`, '',
         `Add a [setup] task before ${task.id} that installs the test framework and updates .tdd-flow/stack.md (or set the framework up by hand), then rerun /tdd-flow:tdd-implement.`)
     }
-    // Start a task only if its minimum cost fits: tdd = 2 per behaviour + refactor, review, close, commit;
-    // setup = setup step, review, close, commit.
-    const est = isSetup ? 4 : task.behaviours.length * 2 + 4
+    // Start a task only if its minimum cost fits: tdd = RED + GREEN per batch, review, commit;
+    // setup = setup step, review, commit.
+    const est = isSetup ? 3 : Math.max(1, Math.ceil(task.behaviours.length / BATCH)) * 2 + 2
     if (spawned + est + 1 > MAX_AGENTS) {
       return { status: 'agent_limit', slug: plan.slug, branch: br.branch, tasksCompleted: done, escalationsToStrongModel: escalations,
         next: done.length
@@ -248,20 +294,9 @@ try {
       if (!s.ok) return await blocked(task, s.step, s.details)
       s.files.forEach(f => taskFiles.add(f))
     } else {
-      for (const b of task.behaviours) {
-        const r = await cycle(task, b)
-        if (!r.ok) return await blocked(task, r.step, r.details)
-        r.files.forEach(f => taskFiles.add(f))
-      }
-
-      const ref = await escalate(`${task.id} REFACTOR`,
-        (model, extra, label) => run(
-          `REFACTOR step. ${ctx}\nTask ${task.id}: ${task.title}. Refactor the code changed for this task (see \`git diff HEAD\`) without changing behaviour; keep the full suite green. Append a REFACTOR line to ${dir}/tdd-log.md.` + extra,
-          { agentType: A('implementer'), model, schema: CODE, label, phase: 'Review' }),
-        r => r.suitePass,
-        r => `The suite failed after refactoring:\n${r.failures || r.summary}\nRevert anything risky; a no-op refactor is acceptable.`)
-      if (!ref.ok) return await blocked(task, 'REFACTOR', ref.result ? (ref.result.failures || ref.result.summary) : 'agent failed')
-      ref.result.filesChanged.forEach(f => taskFiles.add(f))
+      const t = await tddStep(task, task.behaviours)
+      if (!t.ok) return await blocked(task, t.step, t.details)
+      t.files.forEach(f => taskFiles.add(f))
     }
 
     const scope = isSetup
@@ -298,13 +333,12 @@ try {
         ...review.uncoveredAcs.map((ac, i) => ({ ref: `${ac}-gap`, text: `${ac} is not adequately covered by a test. Re-read ${ac} in the spec and specify it.` })),
         ...must.filter(f => f.behavioural).map((f, i) => ({ ref: `R${round}-${i + 1}`, text: `Review finding at ${f.where}: ${f.issue}. Expected: ${f.fix || 'correct behaviour per spec'}` })),
       ]
-      for (const b of fixes) {
-        const r = await cycle(task, b)
-        if (!r.ok) return await blocked(task, r.step, r.details)
-        r.files.forEach(f => taskFiles.add(f))
-      }
       const structural = must.filter(f => !f.behavioural)
-      if (structural.length || !review.testsPass) {
+      const t = await tddStep(task, fixes, structural)
+      if (!t.ok) return await blocked(task, t.step, t.details)
+      t.files.forEach(f => taskFiles.add(f))
+      // Structural findings not handled by a GREEN call, or failing tests that no GREEN call fixed, go to a REFACTOR fix.
+      if ((structural.length && !t.structuralDone) || (!review.testsPass && !t.greenRan)) {
         const fx = await escalate(`${task.id} fix ${round}`,
           (model, extra, label) => run(
             `REFACTOR step. ${ctx}\nAddress these non-behavioural review findings without changing behaviour, and make sure the full suite and lint pass:\n${JSON.stringify(structural, null, 1)}` +
@@ -312,26 +346,32 @@ try {
             { agentType: A('implementer'), model, schema: CODE, label, phase: 'Review' }),
           r => r.suitePass,
           r => `The suite still fails:\n${r.failures || r.summary}`)
+        changedFiles(fx.attempts).forEach(f => taskFiles.add(f))
         if (!fx.ok) return await blocked(task, 'REVIEW FIX', fx.result ? (fx.result.failures || fx.result.summary) : 'agent failed')
-        fx.result.filesChanged.forEach(f => taskFiles.add(f))
       }
     }
 
+    // Closing the task (tick + state) is bookkeeping done by the commit agent before staging, so it lands in the same commit.
     const next = task.id === 'FIX' ? allOpen[0] : allOpen[allOpen.findIndex(t => t.id === task.id) + 1]
-    await run(
-      `Close tdd-flow task ${task.id} for feature ${plan.slug}. Do not run git.\n` +
-      (task.id === 'FIX' ? '' : `1. Tick "${task.id}" in ${dir}/tasks.md.\n`) +
-      `2. Set .tdd-flow/state.json to {"feature": "${plan.slug}", "phase": "IDLE", "task": "${next ? next.id : 'DONE'}"}.`,
-      { label: `${task.id} close`, model: M.light, effort: 'low', phase: 'Review' })
-    const commitFiles = [...taskFiles, `${dir}/tasks.md`, `${dir}/tdd-log.md`, `${dir}/review.md`, '.tdd-flow/state.json',
-      ...(isSetup ? ['.tdd-flow/stack.md'] : [])]
+    const needsTick = task.id !== 'FIX'
+    const state = JSON.stringify({ feature: plan.slug, phase: 'IDLE', task: next ? next.id : 'DONE' })
+    const commitFiles = [...new Set([...taskFiles, `${dir}/tasks.md`, `${dir}/tdd-log.md`, `${dir}/review.md`, '.tdd-flow/state.json',
+      ...(isSetup ? ['.tdd-flow/stack.md'] : [])])]
     const type = task.id === 'FIX' ? 'fix' : isSetup ? 'chore' : 'feat'
     const commit = await run(
-      `Action: commit. Message: "${type}(${plan.slug}): ${task.id} ${task.title}". Do not push.\nFiles:\n${commitFiles.join('\n')}`,
+      `Action: commit. Message: "${type}(${plan.slug}): ${task.id} ${task.title}". Do not push.\n` +
+      'Bookkeeping before staging:\n' +
+      (needsTick ? `- tick: in ${dir}/tasks.md, change the checkbox of task ${task.id} from "[ ]" to "[x]". Match only the line for ERE \`^[[:space:]]*[-*] \\[ \\] ${task.id}([^0-9]|$)\` (so ${task.id} never matches ${task.id}0). Report ticked = true only if that line changed.\n` : '') +
+      `- state: write exactly this JSON to .tdd-flow/state.json: ${state}\n` +
+      `Files:\n${commitFiles.join('\n')}`,
       { agentType: A('release-engineer'), model: M.light, schema: COMMIT, label: `${task.id} commit`, effort: 'low', phase: 'Review' })
     if (!commit || (!commit.committed && !commit.nothingToCommit)) {
       return await blocked(task, 'COMMIT', commit ? commit.reason || 'commit failed' : 'agent failed',
-        task.id === 'FIX' ? '' : `Untick "${task.id}" in ${dir}/tasks.md. `)
+        needsTick ? `Untick "${task.id}" in ${dir}/tasks.md if it is ticked. ` : '')
+    }
+    if (needsTick && !commit.ticked) {
+      return await blocked(task, 'TICK', `${task.id} was committed (${commit.sha || 'no sha'}), but its checkbox in ${dir}/tasks.md was not ticked.`, '',
+        `Tick ${task.id} in ${dir}/tasks.md by hand, then rerun /tdd-flow:tdd-implement to continue with the next task.`)
     }
     if (commit.unexpected && commit.unexpected.length) log(`${task.id}: not committed (unexpected): ${commit.unexpected.join(', ')}`)
     done.push({ task: task.id, title: task.title, commit: commit.sha || '' })
