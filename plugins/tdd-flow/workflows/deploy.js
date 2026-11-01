@@ -35,13 +35,36 @@ async function run(prompt, o) {
   try { return await agent(prompt, o) } finally { if (waiting.length) waiting.shift()(); else active-- }
 }
 const MAX_CI_ROUNDS = 2
+// Added by the PR phase to GitHub repos that have no secret scan in CI. Scans only the PR's commits, so
+// old, already-public history does not fail every PR. gitleaks CLI image: no GITLEAKS_LICENSE needed for orgs.
+const SECRET_SCAN_YML = [
+  'name: secret-scan',
+  'on:',
+  '  pull_request:',
+  'permissions:',
+  '  contents: read',
+  'jobs:',
+  '  gitleaks:',
+  '    runs-on: ubuntu-latest',
+  '    steps:',
+  '      - uses: actions/checkout@v6',
+  '        with:',
+  '          fetch-depth: 0',
+  '      - name: gitleaks (commits in this PR)',
+  '        run: >-',
+  '          docker run --rm -v "$PWD:/repo" -w /repo zricethezav/gitleaks:v8.30.1',
+  '          git --no-banner --redact',
+  '          --log-opts="${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}" .',
+  '',
+].join('\n')
 
 const PRE = {
   type: 'object',
   required: ['slug', 'base', 'branch', 'cliReady', 'hasCi', 'openTasks'],
   properties: {
     slug: str, base: str, branch: str, issueId: str, cliReady: { type: 'boolean' }, cliFix: str,
-    hasCi: { type: 'boolean' }, openTasks: strs, existingPr: str, testSingle: str, testAll: str,
+    hasCi: { type: 'boolean' }, openTasks: strs,
+    secretScan: { type: 'string', enum: ['present', 'missing', 'not_github'] }, workflowScope: { type: 'boolean' }, existingPr: str, testSingle: str, testAll: str,
     reviewDecision: { type: 'string', enum: ['APPROVED', 'CHANGES_REQUESTED', 'REVIEW_REQUIRED', 'NONE'] },
   },
 }
@@ -70,7 +93,9 @@ try {
     'Preflight for shipping a tdd-flow feature. Do not change anything.\n' +
     `Feature: ${opt.feature ? '"' + opt.feature + '"' : '"feature" in .tdd-flow/state.json'}. Read .tdd-flow/stack.md and .tdd-flow/features/<slug>/tasks.md and spec.md (issue id from its Source).\n` +
     'Report: base (default) branch, current branch, unticked tasks, whether a CI pipeline exists (.github/workflows, azure-pipelines.yml, .gitlab-ci.yml, Jenkinsfile), whether a PR already exists for this branch and, if so, its review status (reviewDecision), ' +
-    'and whether the tracker CLI is installed and authenticated (`gh auth status` / `az account show` / `glab auth status`). If not, put the exact command the user must run in cliFix.',
+    'and whether the tracker CLI is installed and authenticated (`gh auth status` / `az account show` / `glab auth status`). If not, put the exact command the user must run in cliFix.\n' +
+    'secretScan: "not_github" unless the repo uses GitHub Actions; "present" if any file in .github/workflows mentions gitleaks, trufflehog, detect-secrets or a secret-scan job (grep -il); else "missing". ' +
+    'workflowScope: true only if `gh auth status` lists the `workflow` token scope (needed to push files under .github/workflows).',
     { agentType: A('release-engineer'), model: M.light, schema: PRE, label: 'preflight', effort: 'low' })
   if (!pre) throw new Error('tdd-flow: preflight failed.')
   if (!pre.cliReady) throw new Error(`tdd-flow: tracker CLI not ready. Run: ${pre.cliFix || 'gh auth login / az login'}`)
@@ -150,9 +175,21 @@ try {
 
   // ---------- PR ----------
   phase('PR')
+  let secretScan = pre.secretScan || 'not_github'
+  if (secretScan === 'missing' && pre.workflowScope) {
+    const sc = await run(
+      'Action: commit. Create .github/workflows/secret-scan.yml with exactly this content (verbatim, do not change it):\n```yaml\n' + SECRET_SCAN_YML + '```\n' +
+      'Commit only that file as `ci: add gitleaks secret scan`. Do not push.',
+      { agentType: A('release-engineer'), model: M.light, schema: COMMIT, label: 'add secret scan', phase: 'PR', effort: 'low' })
+    secretScan = sc && sc.committed ? 'added' : 'add_failed'
+  } else if (secretScan === 'missing') secretScan = 'missing_no_workflow_scope'
+  const scanNote = {
+    added: ' This PR also adds .github/workflows/secret-scan.yml (gitleaks on the PR\'s commits) in a separate `ci:` commit; say so in the PR body.',
+    missing_no_workflow_scope: ' The repo has no secret scan in CI and the gh token lacks the `workflow` scope; list that under risks in the PR body.',
+  }[secretScan] || ''
   const pr = await run(
     `Action: prepare-pr. Feature ${pre.slug}, base ${pre.base}, issue ${pre.issueId || 'none'}.${pre.existingPr ? ' A PR already exists (' + pre.existingPr + '): push and update it instead of opening a new one.' : ''}\n` +
-    `PR body: summary from .tdd-flow/features/${pre.slug}/spec.md, linked issue (use "Closes #id" / "AB#id" as the tracker expects), ACs covered, test evidence from tdd-log.md, docs changed, risks. Final review found no blocker/major issues.`,
+    `PR body: summary from .tdd-flow/features/${pre.slug}/spec.md, linked issue (use "Closes #id" / "AB#id" as the tracker expects), ACs covered, test evidence from tdd-log.md, docs changed, risks. Final review found no blocker/major issues.${scanNote}`,
     { agentType: A('release-engineer'), schema: PR, label: 'open PR', phase: 'PR' })
   if (!pr) throw new Error('tdd-flow: opening the PR failed.')
   log(`PR: ${pr.prUrl}`)
@@ -205,6 +242,7 @@ try {
     onMerge: ci.onMerge,
     reviewDecision: ci.reviewDecision || 'NONE',
     reviewCandidatesRefuted: candidates.length,
+    secretScan,
     next: 'GATE: show PR URL, green CI, review status and what merging triggers. Only after the user explicitly approves, run /tdd-flow:deploy with {mode: "merge", approved: true' + (opt.release ? ', release: true' : '') + (opt.requireReview ? ', requireReview: true' : '') + '}.',
   }
 } catch (e) {
