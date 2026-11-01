@@ -35,28 +35,6 @@ async function run(prompt, o) {
   try { return await agent(prompt, o) } finally { if (waiting.length) waiting.shift()(); else active-- }
 }
 const MAX_CI_ROUNDS = 2
-// Added by the PR phase to GitHub repos that have no secret scan in CI. Scans only the PR's commits, so
-// old, already-public history does not fail every PR. gitleaks CLI image: no GITLEAKS_LICENSE needed for orgs.
-const SECRET_SCAN_YML = [
-  'name: secret-scan',
-  'on:',
-  '  pull_request:',
-  'permissions:',
-  '  contents: read',
-  'jobs:',
-  '  gitleaks:',
-  '    runs-on: ubuntu-latest',
-  '    steps:',
-  '      - uses: actions/checkout@v6',
-  '        with:',
-  '          fetch-depth: 0',
-  '      - name: gitleaks (commits in this PR)',
-  '        run: >-',
-  '          docker run --rm -v "$PWD:/repo" -w /repo zricethezav/gitleaks:v8.30.1',
-  '          git --no-banner --redact',
-  '          --log-opts="${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}" .',
-  '',
-].join('\n')
 
 const PRE = {
   type: 'object',
@@ -85,21 +63,67 @@ const CI = {
 }
 const COMMIT = { type: 'object', required: ['committed'], properties: { committed: { type: 'boolean' }, nothingToCommit: { type: 'boolean' }, sha: str, reason: str, unexpected: strs } }
 const MERGE = { type: 'object', required: ['merged'], properties: { merged: { type: 'boolean' }, mergeCommit: str, releaseUrl: str, notes: str } }
+const WATCH = {
+  type: 'object', required: ['status'],
+  properties: {
+    status: { type: 'string', enum: ['passed', 'failed', 'none', 'timeout', 'pending', 'unknown'] }, runUrl: str, failingJob: str, log: str, error: str,
+    onMerge: str, commit: str, reviewDecision: { type: 'string', enum: ['APPROVED', 'CHANGES_REQUESTED', 'REVIEW_REQUIRED', 'NONE'] },
+    deployments: { type: 'array', items: { type: 'object', properties: { environment: str, state: str, url: str } } },
+  },
+}
+const CAUSE = { type: 'object', required: ['category', 'rootCause'], properties: { category: { type: 'string', enum: ['code', 'test', 'infra', 'flaky', 'unknown'] }, rootCause: str } }
+
+// Deterministic steps run in the plugin's CLI (bin/tdd-flow) through the script-runner agent (haiku, Bash only)
+// instead of a reasoning agent. Returns {ok, result} or {ok: false, error, fallback}. Identical in every workflow
+// (scripts cannot import; tests/cli.test.cjs checks the copies match).
+const cliSchema = (schema) => ({ type: 'object', required: ['ok'], properties: {
+  ok: { type: 'boolean' }, error: str, fallback: { type: 'boolean' }, again: { type: 'boolean' }, result: schema } })
+async function cli(cmd, input, schema, o = {}) {
+  const r = await run(
+    `Run with the Bash tool (timeout 600000):\n\ntdd-flow ${cmd} <<'TDD_FLOW_JSON'\n${JSON.stringify(input)}\nTDD_FLOW_JSON\n\n` +
+    (o.repeat ? `While the printed JSON has "again": true, run the identical command again (at most ${o.repeat} runs).\n` : '') +
+    'Return the printed JSON object as your structured output.',
+    { agentType: A('script-runner'), model: M.light, effort: 'low', schema: cliSchema(schema), label: o.label || cmd, phase: o.phase, ...(o.stallMs ? { stallMs: o.stallMs } : {}) },
+    o.final)
+  if (!r) return { ok: false, error: 'script-runner agent failed' }
+  return r.ok && !r.result ? { ok: false, error: 'the command returned no result' } : r
+}
 
 try {
   // ---------- Preflight ----------
   phase('Preflight')
-  const pre = await run(
+  const pf = await cli('preflight', { feature: opt.feature || null }, PRE, { label: 'preflight' })
+  if (!pf.ok && !pf.fallback) throw new Error(`tdd-flow: preflight failed. ${pf.error}`)
+  // scripted = GitHub: the CLI also watches CI and closes out. Otherwise the release-engineer does those steps.
+  const scripted = pf.ok
+  const pre = scripted ? pf.result : await run(
     'Preflight for shipping a tdd-flow feature. Do not change anything.\n' +
     `Feature: ${opt.feature ? '"' + opt.feature + '"' : '"feature" in .tdd-flow/state.json'}. Read .tdd-flow/stack.md and .tdd-flow/features/<slug>/tasks.md and spec.md (issue id from its Source).\n` +
     'Report: base (default) branch, current branch, unticked tasks, whether a CI pipeline exists (.github/workflows, azure-pipelines.yml, .gitlab-ci.yml, Jenkinsfile), whether a PR already exists for this branch and, if so, its review status (reviewDecision), ' +
     'and whether the tracker CLI is installed and authenticated (`gh auth status` / `az account show` / `glab auth status`). If not, put the exact command the user must run in cliFix.\n' +
     'secretScan: "not_github" unless the repo uses GitHub Actions; "present" if any file in .github/workflows mentions gitleaks, trufflehog, detect-secrets or a secret-scan job (grep -il); else "missing". ' +
     'workflowScope: true only if `gh auth status` lists the `workflow` token scope (needed to push files under .github/workflows).',
-    { agentType: A('release-engineer'), model: M.light, schema: PRE, label: 'preflight', effort: 'low' })
+    { agentType: A('release-engineer'), model: M.light, schema: PRE, label: 'preflight (agent)', effort: 'low' })
   if (!pre) throw new Error('tdd-flow: preflight failed.')
   if (!pre.cliReady) throw new Error(`tdd-flow: tracker CLI not ready. Run: ${pre.cliFix || 'gh auth login / az login'}`)
   if (pre.branch === pre.base) throw new Error(`tdd-flow: you are on ${pre.base}. Deploy works from a feature branch.`)
+
+  // CI watch. GitHub: the CLI polls (the runner repeats the call every ~8.5 minutes up to 30 minutes, cheap
+  // because each call prints one line), and an agent reads the failure log only when a check failed.
+  async function watchCi(target, label, agentPrompt) {
+    if (!scripted) return run(agentPrompt, { agentType: A('release-engineer'), schema: CI, label, phase: target.pr ? 'CI' : 'Merge', stallMs: 2400000 })
+    const w = await cli('ci-watch', { ...target, base: pre.base, maxMinutes: 30 }, WATCH, { label, phase: target.pr ? 'CI' : 'Merge', repeat: 6, stallMs: 2400000 })
+    if (!w.ok) return { status: 'unknown', rootCause: w.error }
+    const c = w.result
+    if (c.status === 'pending') c.status = 'timeout'
+    if (c.status !== 'failed') return c
+    const cause = await run(
+      `CI failed${target.pr ? ' on PR ' + target.pr : ''}: ${c.failingJob || 'unknown job'} (${c.runUrl || 'no run URL'}). Failed-step log (tail):\n${c.log}\n\n` +
+      'Classify the root cause: code (production bug), test (broken or wrong test), infra (runner, network, credentials, config), flaky (timing, nondeterminism) or unknown. ' +
+      'Summarise it in 3-5 lines. Read the repo if you need to; do not change anything.',
+      { schema: CAUSE, model: M.worker, effort: 'low', label: `${label} cause`, phase: target.pr ? 'CI' : 'Merge' })
+    return { ...c, ...(cause || { category: 'unknown', rootCause: 'classification agent failed' }) }
+  }
 
   // ======================= MERGE MODE =======================
   if (mode === 'merge') {
@@ -118,10 +142,10 @@ try {
       (opt.release ? ' Then create a release/tag following the repo\'s existing versioning (semver), with notes from the CHANGELOG Unreleased section.' : ''),
       { agentType: A('release-engineer'), schema: MERGE, label: 'merge' })
     if (!merged || !merged.merged) return { status: 'merge_blocked', details: merged ? merged.notes : 'agent failed' }
-    const post = await run(
-      `Action: watch-ci for the post-merge pipeline on ${pre.base} (merge commit ${merged.mergeCommit || 'HEAD of ' + pre.base}). Poll until it finishes or 30 minutes pass. Report status, run URL, and any deployment URL/environment the pipeline reports.`,
-      { agentType: A('release-engineer'), schema: CI, label: 'post-merge CI', stallMs: 2400000 })
-    const closed = await run(
+    const post = await watchCi({ commit: merged.mergeCommit || null }, 'post-merge CI',
+      `Action: watch-ci for the post-merge pipeline on ${pre.base} (merge commit ${merged.mergeCommit || 'HEAD of ' + pre.base}). Poll until it finishes or 30 minutes pass. Report status, run URL, and any deployment URL/environment the pipeline reports.`)
+    const closeOut = scripted ? await cli('close-out', { slug: pre.slug }, { type: 'object', required: ['uncommitted'], properties: { uncommitted: { type: 'boolean' } } }, { label: 'close-out', phase: 'Merge' }) : null
+    const closed = closeOut ? (closeOut.ok ? closeOut.result : null) : await run(
       `Close out tdd-flow feature ${pre.slug}: set "Status: done" in .tdd-flow/features/${pre.slug}/spec.md and set .tdd-flow/state.json to {"feature": null, "phase": "IDLE", "task": null}. ` +
       'Do not run git commands other than `git status`. Report uncommitted=true if `git status --porcelain .tdd-flow` shows changes afterwards.',
       { label: 'close-out', model: M.light, effort: 'low', schema: { type: 'object', required: ['uncommitted'], properties: { uncommitted: { type: 'boolean' } } } })
@@ -177,11 +201,9 @@ try {
   phase('PR')
   let secretScan = pre.secretScan || 'not_github'
   if (secretScan === 'missing' && pre.workflowScope) {
-    const sc = await run(
-      'Action: commit. Create .github/workflows/secret-scan.yml with exactly this content (verbatim, do not change it):\n```yaml\n' + SECRET_SCAN_YML + '```\n' +
-      'Commit only that file as `ci: add gitleaks secret scan`. Do not push.',
-      { agentType: A('release-engineer'), model: M.light, schema: COMMIT, label: 'add secret scan', phase: 'PR', effort: 'low' })
-    secretScan = sc && sc.committed ? 'added' : 'add_failed'
+    // secretScan is "missing" only from the CLI preflight (GitHub), so the CLI writes and commits the file.
+    const sc = await cli('add-secret-scan', {}, COMMIT, { label: 'add secret scan', phase: 'PR' })
+    secretScan = sc.ok && sc.result.committed ? 'added' : 'add_failed'
   } else if (secretScan === 'missing') secretScan = 'missing_no_workflow_scope'
   const scanNote = {
     added: ' This PR also adds .github/workflows/secret-scan.yml (gitleaks on the PR\'s commits) in a separate `ci:` commit; say so in the PR body.',
@@ -200,23 +222,23 @@ try {
   let ci = null
   let rerunUsed = false
   for (let round = 0; round <= MAX_CI_ROUNDS; round++) {
-    ci = await run(
-      `Action: watch-ci for PR ${pr.prUrl}. Poll until all checks finish or 30 minutes pass. On failure fetch the failing job log, classify the root cause (code | test | infra | flaky | unknown) and summarise it in 3-5 lines. Also read the pipeline definition and describe in one line what merging into ${pre.base} will trigger (onMerge), and report the PR review status (reviewDecision).`,
-      { agentType: A('release-engineer'), schema: CI, label: `watch CI ${round + 1}`, phase: 'CI', stallMs: 2400000 })
+    ci = await watchCi({ pr: pr.prUrl }, `watch CI ${round + 1}`,
+      `Action: watch-ci for PR ${pr.prUrl}. Poll until all checks finish or 30 minutes pass. On failure fetch the failing job log, classify the root cause (code | test | infra | flaky | unknown) and summarise it in 3-5 lines. Also read the pipeline definition and describe in one line what merging into ${pre.base} will trigger (onMerge), and report the PR review status (reviewDecision).`)
     if (!ci) throw new Error('tdd-flow: CI watch agent failed.')
     if (ci.status !== 'failed') break
     if (round === MAX_CI_ROUNDS) break
     if ((ci.category === 'infra' || ci.category === 'flaky') && !rerunUsed) {
       rerunUsed = true
       log(`CI failed (${ci.category}): re-running once`)
-      await run(`Re-run the failed jobs for PR ${pr.prUrl} (e.g. \`gh run rerun --failed\` / \`az pipelines run\`). Do not change code.`,
+      if (scripted) await cli('ci-rerun', { pr: pr.prUrl }, { type: 'object', properties: { rerun: strs, failed: strs } }, { label: 'rerun CI', phase: 'CI' })
+      else await run(`Re-run the failed jobs for PR ${pr.prUrl} (e.g. \`gh run rerun --failed\` / \`az pipelines run\`). Do not change code.`,
         { agentType: A('release-engineer'), label: 'rerun CI', phase: 'CI', effort: 'low' })
       continue
     }
     if (ci.category !== 'code' && ci.category !== 'test') break
     log(`CI failed (${ci.category}) - fixing test-first, round ${round + 1}`)
     const red = await run(
-      `RED step. CI failed on PR ${pr.prUrl}: job ${ci.failingJob}. Root cause: ${ci.rootCause}\nWrite (or adjust setup for) a local test that reproduces this failure, and confirm it fails locally. If it cannot be reproduced locally, return result ERROR with why.`,
+      `RED step. CI failed on PR ${pr.prUrl}: job ${ci.failingJob}. Root cause: ${ci.rootCause}\n${ci.log ? 'Failed-step log (tail):\n' + ci.log + '\n' : ''}Write (or adjust setup for) a local test that reproduces this failure, and confirm it fails locally. If it cannot be reproduced locally, return result ERROR with why.`,
       { agentType: A('test-writer'), schema: { type: 'object', required: ['result', 'reason'], properties: { result: { type: 'string', enum: ['FAIL', 'PASS', 'ERROR'] }, reason: str, testFile: str, testName: str } }, label: `CI repro ${round + 1}`, phase: 'CI' })
     if (!red || red.result !== 'FAIL') break
     const green = await run(

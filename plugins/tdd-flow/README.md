@@ -6,6 +6,7 @@ Personal Claude Code plugin: an end-to-end dev pipeline built on **dynamic workf
 
 - **Workflows** (`workflows/*.js`): the orchestration. Loops, retries, fan-out and verification are code, so every run follows the same process.
 - **Agents** (`agents/*.md`): the specialists the workflows call (`agentType: "tdd-flow:<agent>"`). They also carry the domain knowledge: spec template, TDD rules, doc templates.
+- **CLI** `bin/tdd-flow`: the deterministic steps (parsing the spec, git bookkeeping, commits, GitHub preflight, CI polling) as plain Node code. Workflow scripts cannot run commands, so they call it through the `script-runner` agent (Haiku, Bash only, a few lines of prompt) instead of a reasoning agent. See [tdd-flow CLI](#tdd-flow-cli).
 - **Skill** `ship-feature`: chains the workflows and holds the human approval gates. Workflows can't ask questions mid-run, so the gates sit between runs.
 - **Hook** `tdd-guard`: blocks production-code edits while a cycle is in RED.
 - **Hook** `push-gate`: before Claude runs `git push` or `gh pr create` in any repo, runs the type check, lint and tests and a gitleaks secret scan; a failure blocks the command. See [push-gate](#push-gate).
@@ -39,9 +40,29 @@ A task is `setup` only if it has no logic that a test could check. Logic always 
 
 Merge mode stops with `review_changes_requested` when a reviewer requested changes on the PR. Pass `requireReview: true` to also require an approving review (`review_required` otherwise). This is off by default because GitHub does not let you approve your own PR.
 
-All git actions (branch, commits, push, PR, merge) go through the `release-engineer` agent. The feature branch is `feature/<slug>`.
+The feature branch (`feature/<slug>`), task and docs commits run in the tdd-flow CLI. Pushing, the PR, CI fix commits and merge/release go through the `release-engineer` agent, so pushes still pass the push-gate hook.
 
 Each workflow returns `{status, ..., next}`. If a coding step still fails after escalating to Opus, it stops cleanly with `status: "blocked"` and resets the TDD phase, rather than guessing.
+
+## tdd-flow CLI
+
+`bin/tdd-flow` does the steps that need no judgement. Claude Code adds the plugin's `bin/` to the Bash `PATH`, so agents call it as `tdd-flow`. Workflows pass JSON on stdin; it prints `{"ok": true, "result": {...}}` or `{"ok": false, "error": "...", "fallback": true?}`.
+
+| Command | Used by | Does |
+|---|---|---|
+| `context` | analyze-requirements | Reads an existing `.tdd-flow/stack.md`; fetches a GitHub issue (`gh issue view`) or reads a spec file. Text input needs no fetch. |
+| `plan` | tdd-implement | Parses `spec.md` and `tasks.md` (tasks, behaviours, verify commands, approval) and runs the baseline suite |
+| `branch` | tdd-implement | Switches to or creates `feature/<slug>` |
+| `commit` | tdd-implement, document | Ticks the task line (`T-1` never matches `T-10`), writes `state.json`, stages only the listed files, refuses secret-looking content, secret files and files over 5 MB (plus gitleaks on the staged changes when installed), commits. Never pushes. |
+| `block` | tdd-implement | Records a stop: `state.json` phase `IDLE`, an entry in `tdd-log.md`, optional untick |
+| `preflight` | deploy | Base and current branch, open tasks, CI, `gh` auth and `workflow` scope, secret scan, open PR and its review status |
+| `ci-watch` | deploy | Polls `gh pr checks` (or `gh run list --commit` after merge) for up to 30 minutes; on failure returns the failed-step log tail. Each call stops after about 8.5 minutes with `"again": true` and the runner repeats it. |
+| `ci-rerun`, `add-secret-scan`, `close-out` | deploy | Rerun failed jobs; add the gitleaks workflow; mark the spec done and reset `state.json` |
+| `test [-- <command>]` | test-writer, implementer, code-reviewer | Runs the suite from `stack.md` (or the given command) and prints PASS/FAIL, the exit code and only the tail of a failure |
+
+**Fallbacks.** Where the input is outside what the code handles, the step reports `fallback` and the workflow runs the agent that did it before: a `spec.md`/`tasks.md` the parser does not recognise or a missing `stack.md` (planning agent), a tracker other than GitHub (release-engineer for preflight, CI watch, rerun and close-out; fetch agent for Azure DevOps and Jira issues), no `stack.md` yet (stack-detector). A failed CI check still gets an agent, which reads the log tail and classifies the root cause.
+
+Self-check: `node --test plugins/tdd-flow/tests/` from the repo root.
 
 ## push-gate
 
@@ -82,7 +103,8 @@ Workflows set the model on each call, so each step uses the cheapest model that 
 | Analyst drafts (x3), spec critics, per-task review, doc writing + fact-check, deploy sceptics | **Sonnet** (worker) |
 | Test-writer (RED), implementer (GREEN + REFACTOR / fixes) | **Sonnet**, auto-escalated to **Opus** if the step fails twice |
 | Spec synthesis + revision, final pre-merge review (3 lenses) | **Opus** (strong) |
-| Fetching the issue, preflight, commits (incl. ticking the task), close-out, stack detection | **Haiku** (light) |
+| CLI steps through `script-runner` (spec parsing, branch, commits, preflight, CI polling, close-out), stack detection, fetching non-GitHub issues | **Haiku** (light) |
+| Classifying a failed CI check from its log | **Sonnet** (worker), low effort |
 
 **Escalation ladder** for every coding step: Sonnet, then Sonnet again with the failure output, then Opus with the failure output. Only if all three fail does the workflow stop with `status: "blocked"`. `tdd-implement` reports `escalationsToStrongModel`, so you can see how often Opus was needed.
 
@@ -96,7 +118,8 @@ Override per run with `args.models`, e.g. `{feature: "x", models: {worker: "opus
 | implementer | sonnet | GREEN minimal code, one test at a time, + REFACTOR; SETUP for setup tasks |
 | code-reviewer | sonnet (opus for final review) | Read-only review and fact-checking |
 | doc-writer | sonnet | Docs from the actual diff |
-| release-engineer | sonnet (haiku for branch/commits) | All git: feature branch, commits, PR, CI watch, review status, merge/release (only with approval) |
+| release-engineer | sonnet | Push + PR, CI fix commits, merge/release (only with approval); preflight and CI watch for non-GitHub trackers |
+| script-runner | haiku | Runs one `tdd-flow` CLI command and returns its JSON |
 
 ## Files it creates in your repo
 
@@ -115,11 +138,12 @@ Add `.tdd-flow/` to `.gitignore`, or commit it if you want specs versioned.
 - Claude Code with dynamic workflows enabled (on Pro, turn on "Dynamic workflows" in `/config`).
 - Tracker CLIs, authenticated as needed: `gh auth login`; for Azure DevOps, `az login` + `az extension add --name azure-devops` + `az devops configure --defaults organization=<url> project=<name>`; for Jira, a Jira MCP server or the `jira` CLI.
 - A CI pipeline in the repo, for `deploy`.
-- To avoid permission prompts on long runs, allow the tools the agents need (Bash for your test command, git, gh/az, Edit/Write) in your Claude Code permission settings. When the workflow prompt appears, choose "Yes, and don't ask again" for each tdd-flow workflow.
+- To avoid permission prompts on long runs, allow the tools the agents need (Bash for your test command, git, gh/az, Edit/Write, and `Bash(tdd-flow:*)` for the CLI) in your Claude Code permission settings. When the workflow prompt appears, choose "Yes, and don't ask again" for each tdd-flow workflow.
 
 ## Cost control
 
 - **Agent limits.** Every workflow runs at most 2 agents at the same time and has a hard cap on agents per run: analyze-requirements 12, document 15, deploy 20, tdd-implement 40. Override per run with `args.maxAgents` / `args.maxParallel` (positive integers). At the cap a workflow stops with `status: "agent_limit"`. tdd-implement only starts a task whose minimum cost fits, so it normally stops between tasks; rerun it to continue from `tasks.md`. deploy stops before the skeptic pass if verifying all findings would not fit.
+- **Code before agents.** Steps that need no judgement run in the tdd-flow CLI through the Haiku `script-runner`, which runs one command and returns its JSON, instead of a Sonnet agent reasoning through git and file edits. CI polling no longer keeps an agent busy for up to 30 minutes, and agents run tests through `tdd-flow test`, so a passing suite costs 3 lines of context and a failure 60 at most. A runner still counts as one agent toward the limits.
 - Watch runs with `/workflows`; each agent's token use is shown there, and you can pause (`p`) or stop (`x`).
 - Use `tdd-implement` with `{maxTasks: 1}` for small, reviewable increments.
 - **Tests first, per task.** For each task, the test-writer writes every failing test before the implementer touches production code (tdd-guard blocks production edits during RED). Each agent start costs about 17k tokens of context, so the tests are written in batches, not one agent per behaviour. `{batchSize: n}` sets how many behaviours share one RED/GREEN pair (default 5); `batchSize: 1` gives one cycle per behaviour, at about 2 extra agents per behaviour.

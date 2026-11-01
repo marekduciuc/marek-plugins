@@ -93,10 +93,32 @@ const REVIEW = {
 }
 const BRANCH = { type: 'object', required: ['branch'], properties: { branch: str } }
 const COMMIT = { type: 'object', required: ['committed'], properties: { committed: { type: 'boolean' }, nothingToCommit: { type: 'boolean' }, ticked: { type: 'boolean' }, sha: str, reason: str, unexpected: strs } }
+const BLOCK = { type: 'object', required: ['logged'], properties: { logged: { type: 'boolean' }, unticked: { type: 'boolean' } } }
+
+// Deterministic steps run in the plugin's CLI (bin/tdd-flow) through the script-runner agent (haiku, Bash only)
+// instead of a reasoning agent. Returns {ok, result} or {ok: false, error, fallback}. Identical in every workflow
+// (scripts cannot import; tests/cli.test.cjs checks the copies match).
+const cliSchema = (schema) => ({ type: 'object', required: ['ok'], properties: {
+  ok: { type: 'boolean' }, error: str, fallback: { type: 'boolean' }, again: { type: 'boolean' }, result: schema } })
+async function cli(cmd, input, schema, o = {}) {
+  const r = await run(
+    `Run with the Bash tool (timeout 600000):\n\ntdd-flow ${cmd} <<'TDD_FLOW_JSON'\n${JSON.stringify(input)}\nTDD_FLOW_JSON\n\n` +
+    (o.repeat ? `While the printed JSON has "again": true, run the identical command again (at most ${o.repeat} runs).\n` : '') +
+    'Return the printed JSON object as your structured output.',
+    { agentType: A('script-runner'), model: M.light, effort: 'low', schema: cliSchema(schema), label: o.label || cmd, phase: o.phase, ...(o.stallMs ? { stallMs: o.stallMs } : {}) },
+    o.final)
+  if (!r) return { ok: false, error: 'script-runner agent failed' }
+  return r.ok && !r.result ? { ok: false, error: 'the command returned no result' } : r
+}
 
 // ---------- Plan ----------
 phase('Plan')
-const plan = await run(
+// The CLI parses spec.md/tasks.md and runs the baseline. For a spec it cannot parse it reports fallback, and the
+// planning agent does the same work.
+const planned = await cli('plan', { feature: opt.feature || null }, PLAN, { label: 'plan' })
+if (!planned.ok && !planned.fallback) throw new Error(`tdd-flow: planning failed. ${planned.error}`)
+if (!planned.ok) log(`plan: ${planned.error} - using the planning agent`)
+const plan = planned.ok ? planned.result : await run(
   'Prepare a tdd-flow implementation run.\n' +
   `1. Feature slug: ${opt.feature ? '"' + opt.feature + '"' : 'read "feature" from .tdd-flow/state.json'}. Read .tdd-flow/features/<slug>/spec.md and tasks.md, and .tdd-flow/stack.md (if stack.md is missing, detect the test commands yourself and write it).\n` +
   '2. approved = true only if spec.md has "Status: approved".\n' +
@@ -104,7 +126,7 @@ const plan = await run(
   '4. For every task in tasks.md return id, title, done (checkbox ticked) and its behaviours: one entry per acceptance criterion or edge case mapped to the task, in implementation order (simplest happy path first). ref = AC/EC id, text = the full Given/When/Then or edge-case text.\n' +
   '   kind = "setup" if the task line ends with "[setup]" (or its Kind in the spec task table is setup), otherwise "tdd". For setup tasks also return verify: one entry per "Verify:" line of the task\'s criteria in spec.md, with ref = AC id and command = the exact command; for a "Verify (manual):" line set manual = true and command = the check text.\n' +
   'Do not modify source or test files. Do not run git commands that change anything.',
-  { schema: PLAN, model: M.worker, label: 'plan', effort: 'low' })
+  { schema: PLAN, model: M.worker, label: 'plan (agent)', effort: 'low' })
 if (!plan) throw new Error('tdd-flow: planning failed.')
 if (!plan.approved && !opt.force) throw new Error(`tdd-flow: spec for ${plan.slug} is not approved. Review it and set "Status: approved" in spec.md (or pass {force: true}).`)
 // Test commands can be "none"/"unknown" in a repo being bootstrapped; a setup task may add them later.
@@ -112,13 +134,14 @@ const none = (v) => !v || /^(none|unknown|n\/a)\b/i.test(String(v).trim())
 let hasTests = !plan.noTestSuite && !none(plan.testAll)
 const tests = { all: plan.testAll, single: plan.testSingle }
 if (!plan.baselinePass && hasTests && !opt.allowRedBaseline) throw new Error(`tdd-flow: baseline test suite is failing - fix it first or pass {allowRedBaseline: true}. ${plan.baselineSummary || ''}`)
-const br = await run(`Action: create-branch. Feature slug: ${plan.slug}.`,
-  { agentType: A('release-engineer'), model: M.light, schema: BRANCH, label: 'branch', effort: 'low' })
-if (!br) throw new Error('tdd-flow: creating the feature branch failed.')
+const branched = await cli('branch', { slug: plan.slug }, BRANCH, { label: 'branch' })
+if (!branched.ok) throw new Error(`tdd-flow: creating the feature branch failed. ${branched.error}`)
+const br = branched.result
 
 const dir = `.tdd-flow/features/${plan.slug}`
 const ctxFor = () => `Feature: ${plan.slug}. Spec: ${dir}/spec.md. ` +
-  (hasTests ? `Test all: \`${tests.all}\`. Single test: \`${tests.single}\`.` : 'No test suite yet.') + (plan.lint ? ` Lint: \`${plan.lint}\`.` : '')
+  (hasTests ? `Test all: \`${tests.all}\`. Single test: \`${tests.single}\`. Run tests as \`tdd-flow test -- '<command>'\` (prints only the exit code and the failure tail).` : 'No test suite yet.') +
+  (plan.lint ? ` Lint: \`${plan.lint}\`.` : '')
 let ctx = ctxFor()
 
 const allOpen = plan.tasks.filter(t => !t.done)
@@ -133,11 +156,9 @@ if (!tasks.length) return { status: 'nothing_to_do', slug: plan.slug, next: 'All
 log(`${tasks.length} task(s) to implement on ${br.branch}`)
 
 // ---------- helpers ----------
-async function blocked(task, step, details, extra = '', next = '') {
-  await run(
-    `A tdd-flow run is stopping. Set "phase" to "IDLE" in .tdd-flow/state.json (keep other fields, set "task": "${task.id}"). ${extra}` +
-    `Append to ${dir}/tdd-log.md: "## ${task.id} - BLOCKED at ${step}" followed by these details:\n${details}`,
-    { label: 'record-block', model: M.light, effort: 'low', phase: 'Review' }, true)
+async function blocked(task, step, details, untick = false, next = '') {
+  const rec = await cli('block', { dir, task: task.id, step, details, untick }, BLOCK, { label: 'record-block', phase: 'Review', final: true })
+  if (!rec.ok) log(`record-block failed: ${rec.error}`)
   return { status: 'blocked', slug: plan.slug, task: task.id, step, details,
     escalationsToStrongModel: escalations, unverified: [...unverified.values()],
     next: next || 'The step failed on both models. Show the user the details. After the issue is resolved, rerun /tdd-flow:tdd-implement (it resumes from tasks.md).' }
@@ -274,7 +295,7 @@ try {
   for (const task of tasks) {
     const isSetup = task.kind === 'setup'
     if (!isSetup && !hasTests) {
-      return await blocked(task, 'NO TEST SUITE', `${task.id} is a tdd task, but the repo has no test command yet.`, '',
+      return await blocked(task, 'NO TEST SUITE', `${task.id} is a tdd task, but the repo has no test command yet.`, false,
         `Add a [setup] task before ${task.id} that installs the test framework and updates .tdd-flow/stack.md (or set the framework up by hand), then rerun /tdd-flow:tdd-implement.`)
     }
     // Start a task only if its minimum cost fits: tdd = RED + GREEN per batch, review, commit;
@@ -354,23 +375,22 @@ try {
     // Closing the task (tick + state) is bookkeeping done by the commit agent before staging, so it lands in the same commit.
     const next = task.id === 'FIX' ? allOpen[0] : allOpen[allOpen.findIndex(t => t.id === task.id) + 1]
     const needsTick = task.id !== 'FIX'
-    const state = JSON.stringify({ feature: plan.slug, phase: 'IDLE', task: next ? next.id : 'DONE' })
+    const state = { feature: plan.slug, phase: 'IDLE', task: next ? next.id : 'DONE' }
     const commitFiles = [...new Set([...taskFiles, `${dir}/tasks.md`, `${dir}/tdd-log.md`, `${dir}/review.md`, '.tdd-flow/state.json',
       ...(isSetup ? ['.tdd-flow/stack.md'] : [])])]
     const type = task.id === 'FIX' ? 'fix' : isSetup ? 'chore' : 'feat'
-    const commit = await run(
-      `Action: commit. Message: "${type}(${plan.slug}): ${task.id} ${task.title}". Do not push.\n` +
-      'Bookkeeping before staging:\n' +
-      (needsTick ? `- tick: in ${dir}/tasks.md, change the checkbox of task ${task.id} from "[ ]" to "[x]". Match only the line for ERE \`^[[:space:]]*[-*] \\[ \\] ${task.id}([^0-9]|$)\` (so ${task.id} never matches ${task.id}0). Report ticked = true only if that line changed.\n` : '') +
-      `- state: write exactly this JSON to .tdd-flow/state.json: ${state}\n` +
-      `Files:\n${commitFiles.join('\n')}`,
-      { agentType: A('release-engineer'), model: M.light, schema: COMMIT, label: `${task.id} commit`, effort: 'low', phase: 'Review' })
+    // The CLI ticks the task line (T-1 never matches T-10), writes state.json, stages only these files, refuses
+    // secrets and files over 5 MB, and commits. It never pushes.
+    const committed = await cli('commit', {
+      message: `${type}(${plan.slug}): ${task.id} ${task.title}`, files: commitFiles, state,
+      tick: needsTick ? { file: `${dir}/tasks.md`, task: task.id } : null,
+    }, COMMIT, { label: `${task.id} commit`, phase: 'Review' })
+    const commit = committed.ok ? committed.result : null
     if (!commit || (!commit.committed && !commit.nothingToCommit)) {
-      return await blocked(task, 'COMMIT', commit ? commit.reason || 'commit failed' : 'agent failed',
-        needsTick ? `Untick "${task.id}" in ${dir}/tasks.md if it is ticked. ` : '')
+      return await blocked(task, 'COMMIT', commit ? commit.reason || 'commit failed' : committed.error, needsTick)
     }
     if (needsTick && !commit.ticked) {
-      return await blocked(task, 'TICK', `${task.id} was committed (${commit.sha || 'no sha'}), but its checkbox in ${dir}/tasks.md was not ticked.`, '',
+      return await blocked(task, 'TICK', `${task.id} was committed (${commit.sha || 'no sha'}), but its checkbox in ${dir}/tasks.md was not ticked.`, false,
         `Tick ${task.id} in ${dir}/tasks.md by hand, then rerun /tdd-flow:tdd-implement to continue with the next task.`)
     }
     if (commit.unexpected && commit.unexpected.length) log(`${task.id}: not committed (unexpected): ${commit.unexpected.join(', ')}`)

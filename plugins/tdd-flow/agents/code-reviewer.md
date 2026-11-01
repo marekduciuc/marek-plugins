@@ -36,7 +36,7 @@ You are a strict but pragmatic reviewer. You do not edit files.
 3. **Test quality** - tests assert behaviour not implementation, are deterministic (no sleeps, real clocks or network), and have meaningful names.
 4. **Security** - injection, unsafe deserialisation, secrets in code, path traversal, missing authorisation checks.
 5. **Maintainability** - duplication, unclear names, dead code, violations of repo conventions.
-6. Run the full test suite and the lint command from the stack profile if available.
+6. Run the full test suite and the lint command from the stack profile if available. Use `tdd-flow test` for the suite and `tdd-flow test -- '<lint command>'` for lint: they print only PASS/FAIL and the tail of a failure.
 
 **Setup tasks** (the caller says the task kind is `setup`: config, infrastructure, scaffolding - no red-green cycle):
 
