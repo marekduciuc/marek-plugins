@@ -58,10 +58,10 @@ const DRAFT = {
   required: ['acceptanceCriteria', 'edgeCases', 'openQuestions', 'tasks'],
   properties: {
     codeContext: strs,
-    acceptanceCriteria: { type: 'array', items: { type: 'object', required: ['name', 'given', 'when', 'then'], properties: { name: str, given: str, when: str, then: str } } },
+    acceptanceCriteria: { type: 'array', items: { type: 'object', required: ['name', 'given', 'when', 'then'], properties: { name: str, given: str, when: str, then: str, verify: str } } },
     edgeCases: strs, nonFunctional: strs, outOfScope: strs,
     openQuestions: { type: 'array', items: { type: 'object', required: ['question', 'assumption'], properties: { question: str, assumption: str } } },
-    tasks: { type: 'array', items: { type: 'object', required: ['title', 'covers'], properties: { title: str, covers: strs } } },
+    tasks: { type: 'array', items: { type: 'object', required: ['title', 'covers'], properties: { title: str, covers: strs, kind: { type: 'string', enum: ['tdd', 'setup'] } } } },
   },
 }
 const SPEC = {
@@ -111,7 +111,8 @@ try {
     `Analyse this requirement and draft a spec. Angle: ${a.lens}\n\n` +
     `Title: ${req.title}\nSource: ${req.source}\nRequirement:\n"""${req.text}"""\n\n` +
     `Stack: ${stack.language}; tests via \`${stack.testAll}\`.\n` +
-    'Explore the codebase to ground the draft in real modules, entry points and existing tests. Every acceptance criterion must be verifiable by an automated test. Do NOT write any files - return the draft only.',
+    'Explore the codebase to ground the draft in real modules, entry points and existing tests. Every acceptance criterion must be verifiable by an automated test. ' +
+    'Exception: config, infrastructure or scaffolding work that no test can describe (docker-compose, Dockerfile, CI, manifests, installing the test framework) goes into tasks with kind "setup" (see "Task kinds" in your instructions); give each of their criteria a verify command. All other tasks are kind "tdd". Do NOT write any files - return the draft only.',
     { agentType: A('requirements-analyst'), model: M.worker, schema: DRAFT, label: `analyst:${a.key}`, phase: 'Draft' },
   )))).filter(Boolean)
   if (limitHit) throw new Error(LIMIT)
@@ -124,7 +125,7 @@ try {
     'Do NOT simply take the union. Include an AC only if the requirement asks for it or it is an edge case a careful engineer would consider necessary; move speculative behaviour (unicode, performance, input types, limits not mentioned) to Open questions with an assumption instead of new ACs. ' +
     'Keep scope proportional: a small function needs roughly 3-6 ACs and 1-3 tasks; group closely related ACs into one task. Drop duplicates, keep ACs sharp and testable, number them AC-1.., EC-1.., Q-1.., T-1... Order tasks so each builds on the previous.\n' +
     `Write ${dir}/spec.md using your spec template (Status: draft, Source: ${req.source}, Slug: ${req.slug}).\n` +
-    `Write ${dir}/tasks.md as a checklist: "- [ ] T-1 <title> (AC-1, AC-2)".\n` +
+    `Write ${dir}/tasks.md as a checklist: "- [ ] T-1 <title> (AC-1, AC-2)"; end the line of a setup task with " [setup]". Every criterion of a setup task needs a "- **Verify:** \`<command>\`" line in spec.md (or "- **Verify (manual):**" only when no automatic check exists). In a repo with no test suite, put the setup task that installs the test framework before the first tdd task.\n` +
     `Create or overwrite .tdd-flow/state.json as {"feature": "${req.slug}", "phase": "IDLE", "task": "T-1"}.\n` +
     'If .tdd-flow/ is not in .gitignore, do not change .gitignore - just mention it in assumptions.\n' +
     (extra || '') +
@@ -135,7 +136,7 @@ try {
   // ---------- Critique ----------
   phase('Critique')
   const CRITICS = [
-    { key: 'testability', ask: 'Check every AC: is it unambiguous, observable, and automatable with the repo\'s test framework? Flag vague words ("fast", "user-friendly"), hidden multiple behaviours in one AC, and tasks too big for a few red-green cycles.' },
+    { key: 'testability', ask: 'Check every AC: is it unambiguous, observable, and automatable with the repo\'s test framework? Flag vague words ("fast", "user-friendly"), hidden multiple behaviours in one AC, and tasks too big for a few red-green cycles. Setup tasks ([setup] in tasks.md) are checked by verify commands instead of tests: flag a setup criterion without a Verify line or with a command that cannot tell pass from fail, and flag a setup task that contains logic a test could check (it must be a tdd task).' },
     { key: 'completeness', ask: 'Compare the spec against the RAW requirement below. Flag anything required but missing, anything in the spec NOT supported by the requirement (invented scope), and edge cases a careful engineer would expect.' },
   ]
   const crits = (await parallel(CRITICS.map(c => () => run(

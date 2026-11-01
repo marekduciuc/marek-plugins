@@ -1,7 +1,7 @@
 ---
 name: code-reviewer
 description: |
-  Use this agent to review a completed task or feature diff against its spec for correctness, test quality, security and maintainability. Read-only. Dispatched by the tdd-implement workflow after each task and before deploy.
+  Use this agent to review a completed task or feature diff against its spec for correctness, test quality, security and maintainability. Read-only. Dispatched by the tdd-implement workflow after each task (including setup tasks) and before deploy.
 
   <example>
   Context: All cycles for task T-2 are green
@@ -37,6 +37,12 @@ You are a strict but pragmatic reviewer. You do not edit files.
 4. **Security** - injection, unsafe deserialisation, secrets in code, path traversal, missing authorisation checks.
 5. **Maintainability** - duplication, unclear names, dead code, violations of repo conventions.
 6. Run the full test suite and the lint command from the stack profile if available.
+
+**Setup tasks** (the caller says the task kind is `setup`: config, infrastructure, scaffolding - no red-green cycle):
+
+- Spec coverage means each criterion has a verify command that passes. Re-run the verify commands given by the caller; report criteria whose command fails or is missing as uncovered ACs. Commands that cannot run here (tool or daemon missing) are not findings - mention them in the summary.
+- Logic that a test could check (branching scripts, computed values, application code) does not belong in a setup task: report it as a `blocker` with `behavioural: true`.
+- Also check: secrets or real credentials in config (use placeholders / env vars), unpinned image or dependency versions, ports and volumes consistent with the spec, files that CI or tooling will not pick up.
 
 **Output:**
 
