@@ -44,6 +44,22 @@ const SURVEY = {
     } } },
   },
 }
+// Deterministic steps run in the plugin's CLI (bin/tdd-flow) through the script-runner agent (haiku, Bash only)
+// instead of a reasoning agent. Returns {ok, result} or {ok: false, error, fallback}. Identical in every workflow
+// (scripts cannot import; tests/cli.test.cjs checks the copies match).
+const cliSchema = (schema) => ({ type: 'object', required: ['ok'], properties: {
+  ok: { type: 'boolean' }, error: str, fallback: { type: 'boolean' }, again: { type: 'boolean' }, result: schema } })
+async function cli(cmd, input, schema, o = {}) {
+  const r = await run(
+    `Run with the Bash tool (timeout 600000):\n\ntdd-flow ${cmd} <<'TDD_FLOW_JSON'\n${JSON.stringify(input)}\nTDD_FLOW_JSON\n\n` +
+    (o.repeat ? `While the printed JSON has "again": true, run the identical command again (at most ${o.repeat} runs).\n` : '') +
+    'Return the printed JSON object as your structured output.',
+    { agentType: A('script-runner'), model: M.light, effort: 'low', schema: cliSchema(schema), label: o.label || cmd, phase: o.phase, ...(o.stallMs ? { stallMs: o.stallMs } : {}) },
+    o.final)
+  if (!r) return { ok: false, error: 'script-runner agent failed' }
+  return r.ok && !r.result ? { ok: false, error: 'the command returned no result' } : r
+}
+
 const WROTE = { type: 'object', required: ['files', 'summary'], properties: { files: strs, summary: str, unverified: strs } }
 const CHECK = {
   type: 'object',
@@ -98,12 +114,11 @@ try {
   phase('Commit')
   const files = [...new Set(ok.flatMap(r => [...r.wrote.files, ...((r.fixed && r.fixed.files) || [])]))]
   const touchedSource = targets.some(t => t.kind === 'api')
-  const commit = await run(
-    `Action: commit. Message: "docs(${survey.slug}): update documentation". Do not push.` +
-    `${touchedSource ? ' Doc comments were added to source files: run the full test suite first; if it fails, do not commit.' : ''}\nFiles:\n${files.join('\n')}`,
-    { agentType: A('release-engineer'), model: M.light, schema: COMMIT, label: 'commit', effort: 'low' })
+  // Doc comments in source files: the CLI runs the full suite first and does not commit if it fails.
+  const committed = await cli('commit', { message: `docs(${survey.slug}): update documentation`, files, runTests: touchedSource }, COMMIT, { label: 'commit' })
+  const commit = committed.ok ? committed.result : null
   if (!commit || (!commit.committed && !commit.nothingToCommit)) {
-    return { status: 'commit_failed', slug: survey.slug, reason: commit ? commit.reason : 'agent failed', next: 'Show the reason to the user, resolve it, then rerun /tdd-flow:document.' }
+    return { status: 'commit_failed', slug: survey.slug, reason: commit ? commit.reason : committed.error, next: 'Show the reason to the user, resolve it, then rerun /tdd-flow:document.' }
   }
 
   return {

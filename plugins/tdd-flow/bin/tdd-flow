@@ -1,0 +1,605 @@
+#!/usr/bin/env node
+'use strict';
+// tdd-flow CLI: the deterministic steps of the tdd-flow workflows (parsing the spec, git bookkeeping, commits,
+// preflight, CI polling). Workflow scripts cannot run commands, so they call this through the cheap
+// script-runner agent instead of a reasoning agent. Claude Code puts the plugin's bin/ on the Bash PATH.
+//
+//   tdd-flow <command> <<'TDD_FLOW_JSON'      JSON input on stdin, prints {"ok":true,"result":{...}}
+//   {...}                                     or {"ok":false,"error":"...","fallback":true?}
+//   TDD_FLOW_JSON
+//   tdd-flow test [-- <command>]              runs the tests (default: stack.md "test command (all)")
+//                                             and prints only the exit code and the failure tail
+//
+// "fallback": true means the input is outside what the script handles (unexpected spec format, a tracker
+// other than GitHub); the workflow then uses its agent for that step. See plugins/tdd-flow/README.md.
+const { spawn, spawnSync } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+
+const TEST_TIMEOUT_MS = 570000; // stays under the Bash tool's 10-minute limit
+const POLL_MS = 20000;
+const CALL_MS = 510000; // one ci-watch call; the runner repeats the call while "again" is true
+const NO_CHECKS_GRACE_MS = 180000; // CI may take a while to register checks for a new push
+const SECRET_SCAN_PATH = '.github/workflows/secret-scan.yml';
+// Added by deploy to GitHub repos with no secret scan in CI. Scans only the PR's commits, so old,
+// already-public history does not fail every PR. gitleaks CLI image: no GITLEAKS_LICENSE needed for orgs.
+const SECRET_SCAN_YML = [
+  'name: secret-scan',
+  'on:',
+  '  pull_request:',
+  'permissions:',
+  '  contents: read',
+  'jobs:',
+  '  gitleaks:',
+  '    runs-on: ubuntu-latest',
+  '    steps:',
+  '      - uses: actions/checkout@v6',
+  '        with:',
+  '          fetch-depth: 0',
+  '      - name: gitleaks (commits in this PR)',
+  '        run: >-',
+  '          docker run --rm -v "$PWD:/repo" -w /repo zricethezav/gitleaks:v8.30.1',
+  '          git --no-banner --redact',
+  '          --log-opts="${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}" .',
+  '',
+].join('\n');
+
+class Fallback extends Error {}
+
+// ---------- process helpers ----------
+function exec(cmd, args, input, raw = false) {
+  const r = spawnSync(cmd, args, { encoding: 'utf8', input, maxBuffer: 64 * 1024 * 1024, env: { ...process.env, GH_PROMPT_DISABLED: '1' } });
+  const out = r.stdout || '';
+  return { code: r.error ? 127 : r.status, out: raw ? out : out.trim(), err: (r.stderr || '').trim() };
+}
+const git = (...args) => exec('git', args);
+const gitOut = (...args) => { const r = git(...args); return r.code === 0 ? r.out : ''; };
+const gh = (...args) => exec('gh', args);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** Shell command in its own process group; on timeout the whole group is killed. Resolves {code, out, timedOut}. */
+function runShell(cmd, timeoutMs) {
+  return new Promise((resolve) => {
+    let out = '';
+    let done = false;
+    const finish = (r) => { if (!done) { done = true; clearTimeout(timer); resolve({ out, ...r }); } };
+    const child = spawn('/bin/sh', ['-c', cmd], { env: { ...process.env, CI: 'true' }, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    const add = (d) => { out = (out + d).slice(-400000); };
+    child.stdout.on('data', add);
+    child.stderr.on('data', add);
+    const kill = () => { try { process.kill(-child.pid, 'SIGKILL'); } catch { /* already gone */ } };
+    const timer = setTimeout(() => { kill(); finish({ code: null, timedOut: true }); }, timeoutMs);
+    child.on('error', (e) => finish({ code: 127, out: String(e), timedOut: false }));
+    child.on('close', (code) => finish({ code, timedOut: false }));
+    child.on('exit', (code) => setTimeout(() => { kill(); finish({ code, timedOut: false }); }, 2000).unref());
+  });
+}
+
+// ---------- file helpers ----------
+const read = (p) => { try { return fs.readFileSync(p, 'utf8'); } catch { return null; } };
+const readJSON = (p) => { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; } };
+const writeJSON = (p, v) => { fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, JSON.stringify(v) + '\n'); };
+const none = (v) => !v || /^(none|unknown|n\/a)\b/i.test(String(v).trim());
+const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const STATE = '.tdd-flow/state.json';
+const featureDir = (slug) => `.tdd-flow/features/${slug}`;
+
+function resolveSlug(feature) {
+  const slug = feature || (readJSON(STATE) || {}).feature;
+  if (!slug) throw new Error('no feature given and .tdd-flow/state.json names none');
+  return slug;
+}
+
+/** Fields of .tdd-flow/stack.md (see agents/stack-detector.md), or null if the file is missing. */
+function readStack() {
+  const txt = read('.tdd-flow/stack.md');
+  if (txt == null) return null;
+  const get = (label, command) => {
+    const m = txt.match(new RegExp(`^[ \\t]*[-*]?[ \\t]*${esc(label)}[ \\t]*:[ \\t]*(.*)$`, 'mi'));
+    if (!m) return '';
+    const v = m[1].trim();
+    const bt = command && v.match(/`([^`]+)`/);
+    return (bt ? bt[1] : v.replace(/^`+|`+$/g, '')).trim();
+  };
+  return {
+    language: get('language(s)'), testAll: get('test command (all)', true), testSingle: get('test command (single file / filter)', true),
+    lint: get('lint/format command', true), tracker: get('tracker'), defaultBranch: get('default branch'), ci: get('ci system'),
+    baseline: get('baseline test run'),
+  };
+}
+
+function baseBranch() {
+  const s = readStack();
+  const d = s && s.defaultBranch ? s.defaultBranch.split(/[\s(]/)[0].replace(/^origin\//, '') : '';
+  if (d && !none(d)) return d;
+  const h = gitOut('symbolic-ref', '--quiet', '--short', 'refs/remotes/origin/HEAD');
+  if (h) return h.replace(/^origin\//, '');
+  for (const b of ['main', 'master']) {
+    if (git('rev-parse', '--verify', '--quiet', `refs/heads/${b}`).code === 0 || git('rev-parse', '--verify', '--quiet', `refs/remotes/origin/${b}`).code === 0) return b;
+  }
+  return 'main';
+}
+
+function tracker() {
+  const url = gitOut('remote', 'get-url', 'origin');
+  if (/github\.com[:/]/i.test(url)) return 'github';
+  if (/dev\.azure\.com|visualstudio\.com/i.test(url)) return 'azure-devops';
+  if (/gitlab/i.test(url)) return 'gitlab';
+  return url ? 'other' : 'none';
+}
+
+// ---------- tests ----------
+/** Output reduced to what an agent needs: a pass shows 3 lines, a failure the last 60 (ANSI codes stripped). */
+function compact(out, passed) {
+  const lines = String(out).replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '').split(/\r?\n/).map((l) => l.replace(/\s+$/, '')).filter((l) => l.trim());
+  let s = lines.slice(passed ? -3 : -60).map((l) => (l.length > 300 ? l.slice(0, 300) + ' ...' : l)).join('\n');
+  if (s.length > 6000) s = '...' + s.slice(-6000);
+  return s;
+}
+
+async function runTests(cmd) {
+  const r = await runShell(cmd, TEST_TIMEOUT_MS);
+  const pytestEmpty = /pytest/.test(cmd) && r.code === 5; // pytest 5 = no tests collected
+  const pass = !r.timedOut && (r.code === 0 || pytestEmpty);
+  const summary = r.timedOut ? `timed out after ${TEST_TIMEOUT_MS / 1000} s\n${compact(r.out, false)}` : compact(r.out, pass) || (pass ? 'passed, no output' : 'failed, no output');
+  return { command: cmd, pass, exitCode: r.code, timedOut: !!r.timedOut, summary };
+}
+
+// ---------- spec and task parsing (formats from agents/requirements-analyst.md) ----------
+function parseSpec(spec) {
+  const status = ((spec.match(/^[ \t]*[-*]?[ \t]*\**Status\**[ \t]*:[ \t]*\**[ \t]*([A-Za-z]+)/mi) || [])[1] || '').toLowerCase();
+  const source = ((spec.match(/^[ \t]*[-*]?[ \t]*\**Source\**[ \t]*:[ \t]*\**[ \t]*(.+)$/mi) || [])[1] || '').trim();
+  const crit = {};
+  let cur = null;
+  for (const line of spec.split(/\r?\n/)) {
+    const h = line.match(/^#{2,4}\s+((?:AC|EC)-\d+)\b[\s:.\-–—]*(.*)$/);
+    if (h) { cur = crit[h[1]] = { name: h[2].trim(), parts: [], verify: [] }; continue; }
+    if (/^#{1,4}\s/.test(line)) { cur = null; }
+    const ec = !cur && line.match(/^\s*[-*]\s+\**(EC-\d+)\**\b[\s:.\-–—]*(.*)$/);
+    if (ec) { if (!crit[ec[1]]) crit[ec[1]] = { name: '', parts: [ec[2].trim()], verify: [] }; continue; }
+    if (!cur) continue;
+    const v = line.match(/^\s*[-*]\s*\*{0,2}Verify(\s*\(manual\))?\s*:?\s*\*{0,2}\s*:?\s*(.+)$/i);
+    if (v) {
+      const manual = !!v[1];
+      const bt = v[2].match(/`([^`]+)`/);
+      cur.verify.push({ command: (manual ? v[2] : bt ? bt[1] : v[2]).trim(), manual });
+      continue;
+    }
+    const g = line.match(/^\s*[-*]\s+(.*\S)\s*$/) || line.match(/^\s*(\**(?:Given|When|Then|And|But)\b.*\S)\s*$/i);
+    if (g) cur.parts.push(g[1].replace(/\*\*/g, ''));
+  }
+  const text = (c) => [c.name, c.parts.join(' ')].filter(Boolean).join(': ');
+  return { status, source, crit, text };
+}
+
+/** "| T-1 | title | tdd | AC-1, AC-2 | notes |" rows of the spec's task table: {id: {kind, refs}}. */
+function parseTaskTable(spec) {
+  const rows = {};
+  let cols = null;
+  for (const line of spec.split(/\r?\n/)) {
+    if (!/^\s*\|/.test(line)) { cols = null; continue; }
+    const cells = line.trim().replace(/^\||\|$/g, '').split('|').map((c) => c.trim());
+    if (!cols && cells.some((c) => /^id$/i.test(c))) { cols = cells.map((c) => c.toLowerCase()); continue; }
+    const id = (cells[0] || '').match(/^T-\d+$/);
+    if (!cols || !id) continue;
+    const at = (name) => cells[cols.findIndex((c) => c.startsWith(name))] || '';
+    rows[id[0]] = { kind: /setup/i.test(at('kind')) ? 'setup' : 'tdd', refs: at('ac').match(/\b(?:AC|EC)-\d+\b/g) || [] };
+  }
+  return rows;
+}
+
+function parseTasks(md) {
+  const out = [];
+  for (const line of md.split(/\r?\n/)) {
+    const m = line.match(/^\s*[-*]\s*\[([ xX])\]\s*\**(T-\d+)\**(?![0-9])[\s:.\-–—]*(.*)$/);
+    if (!m) continue;
+    let rest = m[3].trim();
+    const setup = /\[setup\]/i.test(rest);
+    rest = rest.replace(/\s*\[setup\]\s*/gi, ' ').trim();
+    const refs = [...new Set(rest.match(/\b(?:AC|EC)-\d+\b/g) || [])];
+    const title = rest.replace(/\s*\([^()]*\b(?:AC|EC)-\d+\b[^()]*\)\s*/g, ' ').trim();
+    out.push({ id: m[2], title, done: m[1] !== ' ', kind: setup ? 'setup' : 'tdd', refs });
+  }
+  return out;
+}
+
+const taskLine = (id) => new RegExp(`^([ \\t]*[-*][ \\t]*\\[)([ xX])(\\][ \\t]*\\**${esc(id)}(?![0-9]))`, 'm');
+
+// ---------- commands ----------
+async function plan(inp) {
+  const slug = resolveSlug(inp.feature);
+  const dir = featureDir(slug);
+  const spec = read(`${dir}/spec.md`);
+  const tasksMd = read(`${dir}/tasks.md`);
+  const stack = readStack();
+  if (spec == null || tasksMd == null) throw new Error(`${dir}/spec.md or tasks.md is missing - run /tdd-flow:analyze-requirements first`);
+  if (!stack) throw new Fallback('.tdd-flow/stack.md is missing');
+  const s = parseSpec(spec);
+  const table = parseTaskTable(spec);
+  const problems = [];
+  const tasks = parseTasks(tasksMd).map((t) => {
+    const row = table[t.id];
+    const refs = t.refs.length ? t.refs : row ? row.refs : [];
+    const kind = t.kind === 'setup' || (row && row.kind === 'setup') ? 'setup' : 'tdd';
+    if (!refs.length) problems.push(`${t.id}: no AC/EC ids in tasks.md or the spec task table`);
+    const behaviours = refs.map((ref) => {
+      if (!s.crit[ref]) problems.push(`${t.id}: ${ref} not found in spec.md`);
+      return { ref, text: s.crit[ref] ? s.text(s.crit[ref]) : '' };
+    });
+    refs.filter((ref) => s.crit[ref] && !s.crit[ref].parts.length).forEach((ref) => problems.push(`${t.id}: ${ref} has no Given/When/Then lines`));
+    const task = { id: t.id, title: t.title, done: t.done, kind, behaviours };
+    if (kind === 'setup') task.verify = refs.flatMap((ref) => (s.crit[ref] ? s.crit[ref].verify : []).map((v) => ({ ref, ...v })));
+    return task;
+  });
+  if (!tasks.length) problems.push('no "- [ ] T-n ..." lines in tasks.md');
+  if (problems.length) throw new Fallback(`spec format not recognised: ${problems.slice(0, 5).join('; ')}`);
+
+  const noTestSuite = none(stack.testAll);
+  const res = {
+    slug, approved: s.status === 'approved', testAll: noTestSuite ? 'none' : stack.testAll,
+    testSingle: noTestSuite || none(stack.testSingle) ? 'none' : stack.testSingle, noTestSuite,
+    baselinePass: true, baselineSummary: noTestSuite ? 'no test suite' : 'not run', tasks,
+  };
+  if (!none(stack.lint)) res.lint = stack.lint;
+  if (!noTestSuite && inp.baseline !== false && res.approved && tasks.some((t) => !t.done)) {
+    const t = await runTests(stack.testAll);
+    res.baselinePass = t.pass;
+    res.baselineSummary = t.summary;
+  }
+  return res;
+}
+
+function branch(inp) {
+  const base = baseBranch();
+  const current = gitOut('branch', '--show-current');
+  if (current && current !== base) return { branch: current };
+  const name = `feature/${inp.slug}`;
+  const exists = git('rev-parse', '--verify', '--quiet', `refs/heads/${name}`).code === 0 ||
+    git('rev-parse', '--verify', '--quiet', `refs/remotes/origin/${name}`).code === 0;
+  const r = exists ? git('switch', name) : git('switch', '-c', name);
+  if (r.code !== 0) throw new Error(`git switch ${name} failed: ${r.err || r.out}`);
+  return { branch: name };
+}
+
+function block(inp) {
+  const st = readJSON(STATE) || {};
+  writeJSON(STATE, { ...st, phase: 'IDLE', task: inp.task });
+  const log = `${inp.dir}/tdd-log.md`;
+  fs.mkdirSync(inp.dir, { recursive: true });
+  fs.appendFileSync(log, `\n## ${inp.task} - BLOCKED at ${inp.step}\n${inp.details}\n`);
+  let unticked = false;
+  if (inp.untick) {
+    const f = `${inp.dir}/tasks.md`;
+    const md = read(f);
+    const re = taskLine(inp.task);
+    if (md && re.test(md)) {
+      const next = md.replace(re, '$1 $3');
+      unticked = next !== md;
+      fs.writeFileSync(f, next);
+    }
+  }
+  return { logged: true, unticked };
+}
+
+const SECRET_LINE = [
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----/, /\bAKIA[0-9A-Z]{16}\b/, /\bgh[pousr]_[A-Za-z0-9]{36,}\b/, /\bgithub_pat_[A-Za-z0-9_]{50,}\b/,
+  /\bxox[abpr]-[A-Za-z0-9-]{10,}\b/, /\bsk-(?:ant-|proj-)?[A-Za-z0-9_-]{24,}\b/, /\bAIza[0-9A-Za-z_-]{35}\b/,
+  /\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp):\/\/[^\s:/@]+:[^\s@/]{3,}@/i,
+];
+const SECRET_FILE = /(^|\/)(\.env(\.(?!example$|sample$|template$|dist$)[\w-]+)?|id_rsa|id_ed25519|[^/]+\.(pem|p12|pfx|key))$/i;
+const MAX_FILE_BYTES = 5 * 1024 * 1024;
+
+/** Paths in `paths` that look like secrets or large binaries in the index: [{path, why}]. */
+function riskyStaged(paths) {
+  const bad = [];
+  for (const p of paths) {
+    if (SECRET_FILE.test(p)) bad.push({ path: p, why: 'secret-looking file name' });
+    else { try { if (fs.statSync(p).size > MAX_FILE_BYTES) bad.push({ path: p, why: 'larger than 5 MB' }); } catch { /* deleted */ } }
+  }
+  const diff = git('diff', '--cached', '-U0', '--no-color', '--', ...paths).out;
+  let file = null;
+  for (const line of diff.split('\n')) {
+    const f = line.match(/^\+\+\+ b\/(.*)$/);
+    if (f) { file = f[1]; continue; }
+    if (file && line.startsWith('+') && SECRET_LINE.some((re) => re.test(line)) && !bad.some((b) => b.path === file)) bad.push({ path: file, why: 'possible secret in added lines' });
+  }
+  if (exec('sh', ['-c', 'command -v gitleaks']).code === 0) {
+    const g = exec('gitleaks', ['git', '--pre-commit', '--staged', '--no-banner', '--redact', '--exit-code', '3', '--log-level', 'warn', '.']);
+    if (g.code === 3) bad.push({ path: '(staged changes)', why: `gitleaks: ${(g.out + '\n' + g.err).replace(/\x1b\[[0-9;]*m/g, '').trim().split('\n').slice(-6).join(' | ')}` });
+  }
+  return bad;
+}
+
+async function commit(inp) {
+  // Git runs inside this one Bash call, so hooks that guard `git commit` on the default branch never see it: check here.
+  const current = gitOut('branch', '--show-current');
+  if (current && current === baseBranch()) return { committed: false, reason: `on the default branch ${current}: tdd-flow commits only on a feature branch` };
+  const files = [...new Set(inp.files || [])].filter(Boolean);
+  let ticked = false;
+  if (inp.tick) {
+    const md = read(inp.tick.file);
+    const re = taskLine(inp.tick.task);
+    const m = md && md.match(re);
+    if (m) {
+      ticked = true;
+      if (m[2] === ' ') fs.writeFileSync(inp.tick.file, md.replace(re, '$1x$3'));
+    }
+  }
+  if (inp.state) writeJSON(inp.state.file || STATE, inp.state.json || inp.state);
+  if (inp.runTests) {
+    const stack = readStack();
+    if (stack && !none(stack.testAll)) {
+      const t = await runTests(stack.testAll);
+      if (!t.pass) return { committed: false, ticked, reason: `full test suite failed (\`${t.command}\`):\n${t.summary}` };
+    }
+  }
+  // Tracked files are staged (changes and deletions). Untracked ones only if they exist, are not ignored and are
+  // not tdd-flow bookkeeping (.tdd-flow/ is committed only in repos that already track it).
+  const stage = files.filter((p) => {
+    if (git('ls-files', '--error-unmatch', '--', p).code === 0) return true;
+    return fs.existsSync(p) && !p.startsWith('.tdd-flow/') && git('check-ignore', '-q', '--', p).code !== 0;
+  });
+  if (stage.length) {
+    const a = git('add', '--', ...stage);
+    if (a.code !== 0) return { committed: false, ticked, reason: `git add failed: ${a.err}` };
+  }
+  const staged = stage.length ? gitOut('diff', '--cached', '--name-only', '--', ...stage).split('\n').filter(Boolean) : [];
+  const unexpected = exec('git', ['status', '--porcelain'], undefined, true).out.split('\n').filter(Boolean)
+    .map((l) => l.slice(3).replace(/^.* -> /, '').replace(/^"|"$/g, ''))
+    .filter((p) => !staged.includes(p) && !stage.includes(p));
+  if (!staged.length) return { committed: false, nothingToCommit: true, ticked, unexpected };
+  const bad = riskyStaged(staged);
+  if (bad.length) {
+    const own = bad.map((b) => b.path).filter((p) => staged.includes(p));
+    if (own.length) git('restore', '--staged', '--', ...own);
+    return { committed: false, ticked, unexpected, reason: `not committed - ${bad.map((b) => `${b.path}: ${b.why}`).join('; ')}. Remove the secret or file, or commit it by hand if it is a false positive.` };
+  }
+  const c = exec('git', ['commit', '-F', '-', '--', ...staged], inp.message + '\n');
+  if (c.code !== 0) return { committed: false, ticked, unexpected, reason: `git commit failed: ${(c.err || c.out).split('\n').slice(-15).join('\n')}` };
+  return { committed: true, ticked, sha: gitOut('rev-parse', '--short', 'HEAD'), unexpected };
+}
+
+function closeOut(inp) {
+  const f = `${featureDir(inp.slug)}/spec.md`;
+  const spec = read(f);
+  if (spec != null) fs.writeFileSync(f, spec.replace(/^([ \t]*[-*]?[ \t]*\**Status\**[ \t]*:[ \t]*\**[ \t]*)[A-Za-z]+/mi, '$1done'));
+  writeJSON(STATE, { feature: null, phase: 'IDLE', task: null });
+  return { uncommitted: !!gitOut('status', '--porcelain', '--', '.tdd-flow') };
+}
+
+async function addSecretScan() {
+  if (fs.existsSync(SECRET_SCAN_PATH)) return { committed: false, nothingToCommit: true, reason: `${SECRET_SCAN_PATH} already exists` };
+  fs.mkdirSync(path.dirname(SECRET_SCAN_PATH), { recursive: true });
+  fs.writeFileSync(SECRET_SCAN_PATH, SECRET_SCAN_YML);
+  return commit({ message: 'ci: add gitleaks secret scan', files: [SECRET_SCAN_PATH] });
+}
+
+function workflowFiles() {
+  try { return fs.readdirSync('.github/workflows').filter((f) => /\.ya?ml$/i.test(f)).map((f) => path.join('.github/workflows', f)); } catch { return []; }
+}
+
+/** One line on which GitHub Actions workflows run on a push to `base` (heuristic over the `on:` blocks). */
+function onMergeSummary(base) {
+  const hits = [];
+  for (const f of workflowFiles()) {
+    const txt = read(f) || '';
+    const name = ((txt.match(/^name:\s*['"]?(.+?)['"]?\s*$/m) || [])[1]) || path.basename(f);
+    const on = txt.match(/^['"]?on['"]?\s*:(.*(?:\n(?:[ \t].*|\s*))*)/m);
+    if (!on || !/\bpush\b/.test(on[1])) continue;
+    const push = on[1].slice(on[1].search(/\bpush\b/));
+    const br = push.match(/^\s*push\s*:\s*\n\s+branches\s*:\s*(\[[^\]]*\]|(?:\n\s+-\s*.+)+)/);
+    if (br && !br[1].includes(base) && !br[1].includes('*')) continue;
+    hits.push(name + (/deploy|release|publish/i.test(txt) ? ' (has deploy/release steps)' : ''));
+  }
+  return hits.length ? `Merging into ${base} runs: ${hits.join('; ')} (push triggers in .github/workflows)` : `No GitHub Actions workflow runs on push to ${base}.`;
+}
+
+function preflight(inp) {
+  const tr = tracker();
+  if (tr !== 'github') throw new Fallback(`tracker is ${tr}; the script handles GitHub only`);
+  const slug = resolveSlug(inp.feature);
+  const dir = featureDir(slug);
+  const spec = read(`${dir}/spec.md`) || '';
+  const tasks = parseTasks(read(`${dir}/tasks.md`) || '');
+  const source = parseSpec(spec).source;
+  const issue = source.match(/\/issues\/(\d+)/) || source.match(/(?:^|\s)#(\d+)\b/);
+  const stack = readStack() || {};
+  const wf = workflowFiles();
+  const hasCi = wf.length > 0 || ['azure-pipelines.yml', '.gitlab-ci.yml', 'Jenkinsfile'].some((f) => fs.existsSync(f));
+  const res = {
+    slug, base: baseBranch(), branch: gitOut('branch', '--show-current'), openTasks: tasks.filter((t) => !t.done).map((t) => t.id),
+    hasCi, cliReady: false, secretScan: wf.length ? 'missing' : 'not_github', workflowScope: false,
+  };
+  if (issue) res.issueId = issue[1];
+  if (!none(stack.testAll)) res.testAll = stack.testAll;
+  if (!none(stack.testSingle)) res.testSingle = stack.testSingle;
+  if (wf.some((f) => /gitleaks|trufflehog|detect-secrets|secret-scan/i.test(read(f) || ''))) res.secretScan = 'present';
+  const auth = gh('auth', 'status');
+  if (auth.code === 127) { res.cliFix = 'Install the GitHub CLI (https://cli.github.com), then run: gh auth login'; return res; }
+  if (auth.code !== 0) { res.cliFix = 'gh auth login'; return res; }
+  res.cliReady = true;
+  res.workflowScope = /Token scopes:.*\bworkflow\b/i.test(auth.out + '\n' + auth.err);
+  const pr = gh('pr', 'view', '--json', 'url,state,reviewDecision');
+  if (pr.code === 0) {
+    const p = JSON.parse(pr.out);
+    if (p.state === 'OPEN') { res.existingPr = p.url; res.reviewDecision = p.reviewDecision || 'NONE'; }
+  }
+  return res;
+}
+
+function gitDir() { return path.resolve(gitOut('rev-parse', '--git-dir') || '.git'); }
+
+function prChecks(pr) {
+  const r = gh('pr', 'checks', String(pr), '--json', 'name,state,bucket,link,workflow');
+  if (!r.out) {
+    if (/no checks/i.test(r.err)) return { checks: [] };
+    return { error: r.err || `gh pr checks exited ${r.code}` };
+  }
+  return { checks: JSON.parse(r.out).map((c) => ({ name: c.workflow ? `${c.workflow} / ${c.name}` : c.name, bucket: c.bucket, link: c.link })) };
+}
+
+function commitRuns(sha) {
+  const r = gh('run', 'list', '--commit', sha, '--json', 'databaseId,name,workflowName,status,conclusion,url');
+  if (r.code !== 0) return { error: r.err || `gh run list exited ${r.code}` };
+  const okC = ['success', 'skipped', 'neutral'];
+  return { checks: JSON.parse(r.out || '[]').map((x) => ({
+    name: x.workflowName || x.name, link: x.url,
+    bucket: x.status !== 'completed' ? 'pending' : okC.includes(x.conclusion) ? 'pass' : 'fail',
+  })) };
+}
+
+function failedLog(link) {
+  const run = (link || '').match(/\/actions\/runs\/(\d+)/);
+  if (!run) return '';
+  const job = link.match(/\/job\/(\d+)/);
+  const r = job ? gh('run', 'view', run[1], '--job', job[1], '--log-failed') : gh('run', 'view', run[1], '--log-failed');
+  const lines = (r.out || r.err).split('\n').map((l) => l.split('\t').pop().replace(/^\uFEFF?\d{4}-\d\d-\d\dT[\d:.]+Z\s?/, ''));
+  return compact(lines.join('\n'), false).split('\n').slice(-80).join('\n');
+}
+
+function deployments(sha) {
+  const r = gh('api', `repos/{owner}/{repo}/deployments?sha=${sha}`, '--jq', '[.[] | {id, environment}]');
+  if (r.code !== 0 || !r.out) return [];
+  return JSON.parse(r.out).slice(0, 5).map((d) => {
+    const s = gh('api', `repos/{owner}/{repo}/deployments/${d.id}/statuses`, '--jq', '.[0] | {state, environment_url}');
+    const st = s.code === 0 && s.out ? JSON.parse(s.out) : {};
+    return { environment: d.environment, state: st.state || '', url: st.environment_url || '' };
+  });
+}
+
+async function ciWatch(inp) {
+  let sha = inp.commit && (gitOut('rev-parse', '--verify', '--quiet', `${inp.commit}^{commit}`) || inp.commit); // gh needs the full SHA
+  if (!inp.pr && !sha) {
+    git('fetch', '--quiet', 'origin', inp.base || baseBranch());
+    sha = gitOut('rev-parse', `origin/${inp.base || baseBranch()}`);
+    if (!sha) throw new Error('no PR or commit to watch');
+  }
+  const key = inp.pr ? `pr:${inp.pr}` : `commit:${sha}`;
+  const stFile = path.join(gitDir(), 'tdd-flow-ci-watch.json');
+  let st = readJSON(stFile);
+  const maxMs = (inp.maxMinutes || 30) * 60000;
+  // A state file left by an aborted run would end a new watch at once: reset it when it is too old.
+  if (!st || st.key !== key || Date.now() - st.start > maxMs + 600000) { st = { key, start: Date.now() }; writeJSON(stFile, st); }
+  const callEnd = Date.now() + (inp.callSeconds ? inp.callSeconds * 1000 : CALL_MS);
+  const finish = (r) => { try { fs.unlinkSync(stFile); } catch { /* gone */ } return r; };
+  for (;;) {
+    const snap = inp.pr ? prChecks(inp.pr) : commitRuns(sha);
+    if (snap.error) return finish({ status: 'unknown', error: snap.error });
+    const checks = snap.checks;
+    const elapsed = Date.now() - st.start;
+    let status = 'pending';
+    if (!checks.length) status = elapsed > NO_CHECKS_GRACE_MS ? 'none' : 'pending';
+    else if (!checks.some((c) => c.bucket === 'pending')) status = checks.some((c) => c.bucket === 'fail' || c.bucket === 'cancel') ? 'failed' : 'passed';
+    if (status !== 'pending') {
+      const res = { status };
+      const failed = checks.find((c) => c.bucket === 'fail' || c.bucket === 'cancel');
+      const runLink = ((failed || checks[0] || {}).link || '').replace(/(\/actions\/runs\/\d+).*$/, '$1');
+      if (runLink) res.runUrl = runLink;
+      if (failed) { res.failingJob = failed.name; res.log = failedLog(failed.link) || `(no log available; see ${failed.link || 'the PR checks'})`; }
+      if (inp.pr) {
+        const pv = gh('pr', 'view', String(inp.pr), '--json', 'reviewDecision');
+        res.reviewDecision = (pv.code === 0 && JSON.parse(pv.out).reviewDecision) || 'NONE';
+        res.onMerge = onMergeSummary(inp.base || baseBranch());
+      } else {
+        res.commit = sha;
+        res.deployments = deployments(sha);
+      }
+      return finish(res);
+    }
+    if (elapsed > maxMs) return finish({ status: 'timeout' });
+    if (Date.now() + POLL_MS > callEnd) return { again: true, status: 'pending', pendingChecks: checks.filter((c) => c.bucket === 'pending').map((c) => c.name) };
+    await sleep(POLL_MS);
+  }
+}
+
+function ciRerun(inp) {
+  const snap = prChecks(inp.pr);
+  if (snap.error) throw new Error(snap.error);
+  const ids = [...new Set(snap.checks.filter((c) => c.bucket === 'fail' || c.bucket === 'cancel')
+    .map((c) => ((c.link || '').match(/\/actions\/runs\/(\d+)/) || [])[1]).filter(Boolean))];
+  const rerun = [];
+  const failedIds = [];
+  for (const id of ids) (gh('run', 'rerun', id, '--failed').code === 0 ? rerun : failedIds).push(id);
+  return { rerun, failed: failedIds };
+}
+
+function kebab(s, max = 40) {
+  const k = String(s).normalize('NFKD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+  if (k.length <= max) return k || 'feature';
+  const cut = k.slice(0, max);
+  return (cut.includes('-') ? cut.slice(0, cut.lastIndexOf('-')) : cut) || 'feature';
+}
+
+/** analyze-requirements context: the stack profile (if detected before) and the requirement, where code can get it. */
+function context(inp) {
+  const input = String(inp.input || '').trim();
+  const res = { stack: readStack(), kind: 'text' };
+  const ghIssue = input.match(/^#?(\d+)$/) || input.match(/^https?:\/\/github\.com\/[^/]+\/[^/]+\/issues\/(\d+)/i);
+  if (ghIssue && (!/^#?\d+$/.test(input) || tracker() === 'github')) {
+    res.kind = 'issue';
+    const r = gh('issue', 'view', /^https?:/.test(input) ? input : ghIssue[1], '--json', 'number,title,body,labels,comments,url');
+    if (r.code !== 0) { res.note = `gh issue view failed: ${r.err.split('\n')[0]}`; return res; }
+    const i = JSON.parse(r.out);
+    const labels = (i.labels || []).map((l) => l.name).join(', ');
+    const comments = (i.comments || []).map((c) => `Comment by @${(c.author || {}).login || 'unknown'}:\n${c.body}`).join('\n\n');
+    res.req = {
+      ok: true, title: i.title, source: i.url, issueId: String(i.number), slug: kebab(`${i.number}-${i.title}`),
+      text: [i.title, i.body, labels && `Labels: ${labels}`, comments].filter(Boolean).join('\n\n'),
+    };
+    return res;
+  }
+  if (/^(#?\d+|https?:\/\/)/.test(input)) { res.kind = 'issue'; res.note = 'not a GitHub issue in this repo'; return res; }
+  if (input && !/\n/.test(input) && input.length < 400) {
+    let isFile = false;
+    try { isFile = fs.statSync(input).isFile(); } catch { /* not a path */ }
+    if (isFile) {
+      const text = read(input);
+      const title = ((text.match(/^#\s+(.+)$/m) || [])[1] || path.basename(input).replace(/\.[^.]+$/, '')).trim();
+      res.kind = 'file';
+      res.req = { ok: true, title, text, source: input, slug: kebab(title) };
+    }
+  }
+  return res;
+}
+
+const COMMANDS = {
+  plan, branch, block, commit, 'close-out': closeOut, 'add-secret-scan': addSecretScan, preflight,
+  'ci-watch': ciWatch, 'ci-rerun': ciRerun, context,
+};
+
+async function main(argv) {
+  const [cmd, ...rest] = argv;
+  if (cmd === 'test') {
+    const dash = rest.indexOf('--');
+    const stack = readStack();
+    const given = dash >= 0 ? rest.slice(dash + 1) : [];
+    const shq = (a) => (/^[\w@%+=:,./-]+$/.test(a) ? a : `'${a.replace(/'/g, `'\\''`)}'`);
+    const command = given.length === 1 ? given[0] : given.length ? given.map(shq).join(' ') : stack && !none(stack.testAll) ? stack.testAll : '';
+    if (!command) { process.stdout.write('tdd-flow test: no test command (pass one after --, or set "test command (all)" in .tdd-flow/stack.md)\n'); return 2; }
+    const t = await runTests(command);
+    process.stdout.write(`${t.pass ? 'PASS' : 'FAIL'} (exit ${t.timedOut ? 'timeout' : t.exitCode}) \`${command}\`\n${t.summary}\n`);
+    return t.pass ? 0 : 1;
+  }
+  const fn = COMMANDS[cmd];
+  const print = (o) => process.stdout.write(JSON.stringify(o) + '\n');
+  if (!fn) { print({ ok: false, error: `unknown command "${cmd}". Commands: test, ${Object.keys(COMMANDS).join(', ')}` }); return 2; }
+  let input = {};
+  try {
+    const raw = process.stdin.isTTY ? '' : fs.readFileSync(0, 'utf8').trim();
+    if (raw) input = JSON.parse(raw);
+  } catch (e) { print({ ok: false, error: `input is not valid JSON: ${e.message}` }); return 2; }
+  try {
+    const result = await fn(input);
+    const again = result && result.again;
+    if (again) delete result.again;
+    print(again ? { ok: true, again: true, result } : { ok: true, result });
+    return 0;
+  } catch (e) {
+    print(e instanceof Fallback ? { ok: false, fallback: true, error: e.message } : { ok: false, error: e.message });
+    return 1;
+  }
+}
+
+if (require.main === module) main(process.argv.slice(2)).then((code) => { process.exitCode = code; });
+
+module.exports = { main, parseSpec, parseTasks, parseTaskTable, readStack, compact, kebab, onMergeSummary, taskLine, COMMANDS };

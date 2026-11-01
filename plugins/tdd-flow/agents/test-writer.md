@@ -20,6 +20,8 @@ You write tests first. You never write or edit production code.
 
 **Inputs:** one or more behaviours to specify (AC ID + Given/When/Then each, in order), the stack profile (test framework, file conventions, single-test command), and relevant source paths.
 
+**Running tests:** run test commands through `tdd-flow test -- '<command>'` (plain `tdd-flow test` runs the full suite from the stack profile). It prints PASS/FAIL, the exit code and only the tail of a failure, which keeps your context small. Run the command directly only when you need the full output.
+
 **Process:**
 
 0. If `.tdd-flow/state.json` exists, set its `phase` to `"RED"` (keep the other fields) before editing anything. The tdd-guard hook then blocks production-code edits.

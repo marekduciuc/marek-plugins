@@ -53,6 +53,26 @@ const REQ = {
     issueId: str, slug: str, problem: str,
   },
 }
+const CONTEXT = {
+  type: 'object', required: ['kind'],
+  properties: { kind: { type: 'string', enum: ['issue', 'file', 'text'] }, note: str, stack: STACK, req: REQ },
+}
+// Deterministic steps run in the plugin's CLI (bin/tdd-flow) through the script-runner agent (haiku, Bash only)
+// instead of a reasoning agent. Returns {ok, result} or {ok: false, error, fallback}. Identical in every workflow
+// (scripts cannot import; tests/cli.test.cjs checks the copies match).
+const cliSchema = (schema) => ({ type: 'object', required: ['ok'], properties: {
+  ok: { type: 'boolean' }, error: str, fallback: { type: 'boolean' }, again: { type: 'boolean' }, result: schema } })
+async function cli(cmd, input, schema, o = {}) {
+  const r = await run(
+    `Run with the Bash tool (timeout 600000):\n\ntdd-flow ${cmd} <<'TDD_FLOW_JSON'\n${JSON.stringify(input)}\nTDD_FLOW_JSON\n\n` +
+    (o.repeat ? `While the printed JSON has "again": true, run the identical command again (at most ${o.repeat} runs).\n` : '') +
+    'Return the printed JSON object as your structured output.',
+    { agentType: A('script-runner'), model: M.light, effort: 'low', schema: cliSchema(schema), label: o.label || cmd, phase: o.phase, ...(o.stallMs ? { stallMs: o.stallMs } : {}) },
+    o.final)
+  if (!r) return { ok: false, error: 'script-runner agent failed' }
+  return r.ok && !r.result ? { ok: false, error: 'the command returned no result' } : r
+}
+
 const DRAFT = {
   type: 'object',
   required: ['acceptanceCriteria', 'edgeCases', 'openQuestions', 'tasks'],
@@ -81,11 +101,24 @@ const CRIT = {
 try {
   // ---------- Context ----------
   phase('Context')
+  // The CLI reads an existing .tdd-flow/stack.md and fetches GitHub issues and spec files. Text input needs no fetch.
+  // Agents run only for what it could not get: stack detection on the first run, other trackers (Azure DevOps, Jira).
+  const cx = await cli('context', { input }, CONTEXT, { label: 'context', phase: 'Context' })
+  const known = cx.ok ? cx.result : { kind: 'unknown' }
+  if (!cx.ok) log(`context: ${cx.error} - using the agents`)
+  else if (known.note) log(`context: ${known.note} - fetching with an agent`)
+  const firstLine = input.split('\n').find(l => l.trim()) || input
+  const title = firstLine.trim().replace(/\s+/g, ' ').slice(0, 80)
+  const textReq = known.kind === 'text' && {
+    ok: true, title, text: input, source: 'prompt',
+    slug: title.toLowerCase().normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40).replace(/-+$/, '') || 'feature',
+  }
+  const stackKnown = known.stack && !/^(unknown)?$/i.test(known.stack.testAll || '') ? known.stack : null
   const [stack, req] = await parallel([
-    () => run(
+    () => stackKnown || run(
       'Detect this repository\'s stack. If .tdd-flow/stack.md already exists, read it and return its values without re-detecting. Otherwise detect and write .tdd-flow/stack.md.',
       { agentType: A('stack-detector'), schema: STACK, label: 'stack-detector', effort: 'low' }),
-    () => run(
+    () => known.req || textReq || run(
       `Fetch the raw requirement for a software feature. Input: """${input}"""\n` +
       '- If it is an issue number or URL: detect the tracker from `git remote -v` and installed CLIs. GitHub: `gh issue view <id> --json number,title,body,labels,comments`. Azure DevOps: `az boards work-item show --id <id> -o json`. Jira: a connected Jira MCP tool if available, else the `jira` CLI.\n' +
       '- If it is an existing file path: read the file.\n' +
