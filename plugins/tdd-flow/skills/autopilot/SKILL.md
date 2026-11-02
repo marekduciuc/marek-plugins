@@ -36,19 +36,20 @@ For each spec to start:
    TDD_FLOW_JSON
    ```
    → `path`, `branch`. On error, record the spec as blocked with the message and go on with the next one.
-2. Start the session in a subshell, so this session's directory does not change:
+2. Pick the session name, which is also what the user types in `claude attach <name>`: a 3-word kebab-case summary of what the spec builds, from its `title` (and the goal in `spec.md` if the title is missing or vague), e.g. `invitation-password-reset` or `customer-address-management`. Lowercase letters, digits and hyphens only. If a session in `claude agents --json --all` already has that name, add the spec number (e.g. `customer-address-management-23`).
+3. Start the session in a subshell, so this session's directory does not change:
    ```bash
-   (cd "<path>" && claude --bg -n "tdd-<slug>" "/tdd-flow:implement-spec <slug> <base>")
+   (cd "<path>" && claude --bg -n <name> "/tdd-flow:implement-spec <slug> <base>")
    ```
-   `<base>` is `base` from step 1. The output contains `backgrounded · <id> · tdd-<slug>`; take the id.
-3. ```bash
+   `<base>` is `base` from step 1. The output contains `backgrounded · <id> · <name>`; take the id.
+4. ```bash
    tdd-flow run-report <<'TDD_FLOW_JSON'
    {"slug": "<slug>", "status": "running", "session": "<id>"}
    TDD_FLOW_JSON
    ```
    This also replaces the result of an earlier run.
 
-Tell the user, per started spec: slug, worktree, `claude attach <id>` to watch it.
+Tell the user, per started spec: slug, worktree and `claude attach <name>` to watch it.
 
 ## 3. Wait, refill, repeat
 
@@ -64,7 +65,7 @@ When it exits, read `finished`:
 
 - `done` → note the `prUrl`.
 - `blocked` → note `details`.
-- `stalled` → the session went idle or disappeared without a report (it asked something or stopped early). Note its `attach` command; do not restart it.
+- `stalled` → the session went idle or disappeared without a report (it asked something or stopped early). Note its `attach` command (`runs-wait` gives the name, or the id when the name is ambiguous); do not restart it.
 
 Then start the next queued specs (step 2) until N are running again, and start `runs-wait` again for the running slugs. Repeat until nothing runs and nothing is queued. If `runs-wait` reports `timedOut`, list the running sessions with their `attach` commands and ask the user whether to keep waiting.
 
@@ -72,11 +73,11 @@ Give one status line per finished spec as it comes in.
 
 ## 4. Summary
 
-A table: spec, result (`done` / `blocked` / `stalled` / skipped), PR URL or reason, worktree, `claude attach <id>` for blocked and stalled ones. Then:
+A table: spec, result (`done` / `blocked` / `stalled` / skipped), PR URL or reason, worktree, `claude attach <name>` for blocked and stalled ones. Then:
 
 - A blocked spec: fix the cause (in its worktree), then run `/tdd-flow:autopilot <slug>`; it resumes from `tasks.md` on the same branch.
-- A stalled spec: `claude attach <id>` and answer the session.
-- Worktrees stay until the PR is merged (fixes after PR review go there). Afterwards: `claude rm <id>` or `git worktree remove .claude/worktrees/<slug>`, and `/tdd-flow:deploy {feature, mode: "merge", approved: true}` sets the spec to `done` if you want that.
+- A stalled spec: `claude attach <name>` and answer the session.
+- Worktrees stay until the PR is merged (fixes after PR review go there). Afterwards: `claude rm <id>` (it takes the id from `claude agents`, not the name) or `git worktree remove .claude/worktrees/<slug>`, and `/tdd-flow:deploy {feature, mode: "merge", approved: true}` sets the spec to `done` if you want that.
 
 ## Notes
 

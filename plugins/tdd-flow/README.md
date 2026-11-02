@@ -64,7 +64,7 @@ Each workflow returns `{status, ..., next}`. If a coding step still fails after 
 | `preflight` | deploy | Base and current branch, open tasks, CI, `gh` auth and `workflow` scope, secret scan, open PR and its review status |
 | `ci-watch` | deploy | Polls `gh pr checks` (or `gh run list --commit` after merge) for up to 30 minutes; on failure returns the failed-step log tail. Each call stops after about 8.5 minutes with `"again": true` and the runner repeats it. |
 | `ci-rerun`, `add-secret-scan`, `close-out` | deploy | Rerun failed jobs; add the gitleaks workflow; mark the spec done and reset `state.json` |
-| `specs` | autopilot | Checks that `.tdd-flow/` is in git and `state.json` is not; lists the specs to start (status `approved` on `feature/<slug>` or, without that branch, on the base; committed, no local changes, no session running, not blocked last time unless named) and why the others are skipped |
+| `specs` | autopilot | Checks that `.tdd-flow/` is in git and `state.json` is not; lists the specs to start, with their title (status `approved` on `feature/<slug>` or, without that branch, on the base; committed, no local changes, no session running, not blocked last time unless named) and why the others are skipped |
 | `worktree` | autopilot | Creates or reuses `.claude/worktrees/<slug>` on `feature/<slug>`; adds `/.claude/worktrees/` and `/.tdd-flow/state.json` to `.git/info/exclude` |
 | `run-report` | autopilot, implement-spec | Writes a run result (`running` / `done` / `blocked`, session id, PR URL, details) to `<git common dir>/tdd-flow/runs/<slug>.json`, shared by all worktrees and never committed |
 | `runs-wait` | autopilot | Blocks until one of the given runs is `done` or `blocked`, or its session is idle or gone without a report (`stalled`); reads `claude agents --json --all` |
@@ -79,9 +79,9 @@ Self-check: `node --test plugins/tdd-flow/tests/` from the repo root.
 `/tdd-flow:autopilot` implements every approved spec without you watching, several at once. Run it in the main checkout.
 
 1. `tdd-flow specs` selects the specs (see the CLI table) and shows why the others are skipped.
-2. For each spec, at most N at a time (`--parallel N`, default 3): `tdd-flow worktree` creates `.claude/worktrees/<slug>` on `feature/<slug>`, and `claude --bg -n tdd-<slug> "/tdd-flow:implement-spec <slug> <base>"` starts a background session there.
+2. For each spec, at most N at a time (`--parallel N`, default 3): `tdd-flow worktree` creates `.claude/worktrees/<slug>` on `feature/<slug>`, and `claude --bg -n <name> "/tdd-flow:implement-spec <slug> <base>"` starts a background session there. `<name>` is a 3-word kebab-case summary of the spec (e.g. `invitation-password-reset`), so you watch it with `claude attach invitation-password-reset`.
 3. `implement-spec`, in that session: one `tdd-implement {maxTasks: 1}` run per task, in `tasks.md` order (a task that hits `agent_limit` gets one more run) → `superpowers:requesting-code-review` over the branch (falls back to the `code-reviewer` agent without superpowers) → Critical and Important findings go through one `tdd-implement {findings}` run, with no second review → `git push` (push-gate runs the checks) → `gh pr create` with goal, ACs, tasks, review findings (Minor ones listed) and unverified checks. It ends with `tdd-flow run-report`.
-4. `tdd-flow runs-wait`, in a background Bash call, waits for results. The autopilot then starts the next queued spec and finally prints a table: PR URL, or why a spec is blocked or stalled, and `claude attach <id>` for those.
+4. `tdd-flow runs-wait`, in a background Bash call, waits for results. The autopilot then starts the next queued spec and finally prints a table: PR URL, or why a spec is blocked or stalled, and `claude attach <name>` for those.
 
 **Requirements**
 
@@ -92,7 +92,7 @@ Self-check: `node --test plugins/tdd-flow/tests/` from the repo root.
 **Things to know**
 
 - A run that ends `blocked` keeps its worktree. Fix the cause there and run `/tdd-flow:autopilot <slug>`: it resumes from `tasks.md`. Without the slug, blocked specs are skipped.
-- `stalled` means the session went idle without a report, for example because it asked a question. Answer it with `claude attach <id>`.
+- `stalled` means the session went idle without a report, for example because it asked a question. Answer it with `claude attach <name>`.
 - N sessions use the rolling rate-limit window N times faster. Tests running at the same time can collide on ports, a shared local database or docker compose; use `--parallel 1` for such repos. PRs of parallel specs can conflict; that is resolved at merge.
 - Worktrees stay until you remove them (`claude rm <id>` or `git worktree remove .claude/worktrees/<slug>`), so fixes after PR review can go into the same branch.
 

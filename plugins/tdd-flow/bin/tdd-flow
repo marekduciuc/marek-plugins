@@ -623,13 +623,15 @@ function claudeSessions() {
   try { return JSON.parse(r.out); } catch { return []; }
 }
 
-/** The session of a run: by the id the autopilot recorded, else by the name tdd-<slug> or the worktree cwd. */
-function findSession(sessions, slug, run, wtPath) {
+/** The session of a run: by the id the autopilot recorded, else by the worktree it runs in. */
+function findSession(sessions, run, wtPath) {
   const byId = run && run.session && sessions.find((s) => s.id === run.session || s.sessionId === run.session);
   if (byId) return byId;
-  return sessions.find((s) => s.kind === 'background' && (s.name === `tdd-${slug}` || (s.cwd && realpath(s.cwd) === wtPath)));
+  return sessions.find((s) => s.kind === 'background' && s.cwd && realpath(s.cwd) === wtPath);
 }
 const isLive = (s) => !!s && s.state === 'working';
+/** What to pass to `claude attach`: the session name when it is one word and unique, else the id. */
+const attachRef = (sessions, s) => (s.name && !/\s/.test(s.name) && sessions.filter((x) => x.name === s.name).length === 1 ? s.name : s.id);
 
 /** Specs the autopilot can start, and why the others are skipped. Input: {slugs?: [...]} to limit the selection. */
 function specs(inp) {
@@ -664,11 +666,12 @@ function specs(inp) {
     const branch = `feature/${slug}`;
     const onBranch = git('rev-parse', '--verify', '--quiet', `refs/heads/${branch}`).code === 0
       ? exec('git', ['show', `${branch}:${specPath}`], undefined, true) : null;
-    const status = parseSpec(onBranch && onBranch.code === 0 ? onBranch.out : committed.out).status || 'none';
+    const specText = onBranch && onBranch.code === 0 ? onBranch.out : committed.out;
+    const status = parseSpec(specText).status || 'none';
     const run = readRun(slug);
     const wtPath = path.join(root, WORKTREES, slug);
     if (status !== 'approved') { skip(`status ${status}${run && run.prUrl ? ` (${run.prUrl})` : ''}`); continue; }
-    if (isLive(findSession(sessions, slug, run, wtPath))) { skip('a session is still running on it'); continue; }
+    if (isLive(findSession(sessions, run, wtPath))) { skip('a session is still running on it'); continue; }
     if (run && run.status === 'blocked' && !(wanted && wanted.has(slug))) {
       skip(`blocked last time: ${String(run.details || '').split('\n')[0]} - fix it, then start it by name`);
       continue;
@@ -678,7 +681,9 @@ function specs(inp) {
       skip(`${WORKTREES}/${slug} has uncommitted changes - commit or discard them first`);
       continue;
     }
-    runnable.push({ slug, resume: hasWorktree || !!onBranch, lastRun: run ? run.status : null });
+    // The title lets the autopilot give the background session a readable name.
+    const title = ((specText.match(/^#\s+(.+)$/m) || [])[1] || '').trim();
+    runnable.push({ slug, title, resume: hasWorktree || !!onBranch, lastRun: run ? run.status : null });
   }
   return { base, runnable, skipped };
 }
@@ -730,8 +735,8 @@ async function runsWait(inp) {
     const running = [];
     for (const slug of slugs) {
       const run = readRun(slug) || { slug, status: 'unknown' };
-      const s = findSession(sessions, slug, run, path.join(root, WORKTREES, slug));
-      const attach = s && s.id ? `claude attach ${s.id}` : '';
+      const s = findSession(sessions, run, path.join(root, WORKTREES, slug));
+      const attach = s && s.id ? `claude attach ${attachRef(sessions, s)}` : '';
       // A session that has just been started may not be listed as working yet.
       const starting = run.status === 'running' && Date.now() - Date.parse(run.at) < START_GRACE_MS && !(s && s.state === 'done');
       if (RUN_FINAL.includes(run.status)) finished.push({ ...run, ...(attach ? { attach } : {}) });

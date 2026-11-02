@@ -29,7 +29,7 @@ TDD_FLOW_JSON
 Tasks run in order, each in its own `tdd-implement` run, so each task gets the full agent budget and a failure stops at that task. Loop:
 
 1. Count the open tasks: lines `- [ ] T-<n>` in `.tdd-flow/features/<slug>/tasks.md`.
-2. Run the `tdd-implement` workflow with the Workflow tool, args `{"feature": "<slug>", "maxTasks": 1}`, and wait for its completion notification. It takes the first open task in `tasks.md` order.
+2. Run the workflow `tdd-flow:tdd-implement` with the Workflow tool (`name` is that full name, with the plugin prefix), args `{"feature": "<slug>", "maxTasks": 1}`, and wait for its completion notification. It takes the first open task in `tasks.md` order.
 3. Act on the result `status`:
 
 | Result `status` | Action |
@@ -57,7 +57,7 @@ Sort the findings by severity. You act as the executor in that skill: drop a fin
 
 ## 3. One fix round
 
-If there are Critical or Important findings, run the `tdd-implement` workflow once more with `{"feature": "<slug>", "findings": [...]}`. Write each finding as one string: `"<severity>: <file:line> - <issue>. Expected: <fix>"`.
+If there are Critical or Important findings, run the workflow `tdd-flow:tdd-implement` once more with `{"feature": "<slug>", "findings": [...]}`. Write each finding as one string: `"<severity>: <file:line> - <issue>. Expected: <fix>"`.
 
 - `implemented` → continue. Do **not** review again (one review pass per change).
 - `blocked`, `agent_limit` or an error → report blocked with the details, and say which findings are still open.
