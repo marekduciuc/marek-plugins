@@ -256,7 +256,8 @@ test('specs selects approved specs and says why it skips the others', () => {
   add('a-draft', 'draft');
   add('b-done-on-branch', 'approved');
   add('c-uncommitted', 'approved');
-  g('add', '.tdd-flow/features/a-draft', '.tdd-flow/features/b-done-on-branch');
+  write('.tdd-flow/features/12-csv/spec.md', `# Export report as CSV\n${SPEC}`);
+  g('add', '.tdd-flow/features/a-draft', '.tdd-flow/features/b-done-on-branch', '.tdd-flow/features/12-csv');
   g('commit', '-qm', 'more specs');
   g('switch', '-q', '-c', 'feature/b-done-on-branch');
   write('.tdd-flow/features/b-done-on-branch/spec.md', SPEC.replace('Status: approved', 'Status: implemented'));
@@ -264,7 +265,7 @@ test('specs selects approved specs and says why it skips the others', () => {
   g('switch', '-q', 'main');
   const r = run(dir, 'specs', {}, fakeClaude([]));
   assert.strictEqual(r.ok, true, r.error);
-  assert.deepStrictEqual(r.result.runnable, [{ slug: '12-csv', resume: false, lastRun: null }]);
+  assert.deepStrictEqual(r.result.runnable, [{ slug: '12-csv', title: 'Export report as CSV', resume: false, lastRun: null }]);
   assert.deepStrictEqual(Object.fromEntries(r.result.skipped.map((s) => [s.slug, s.why.split(' ').slice(0, 3).join(' ')])), {
     'a-draft': 'status draft', 'b-done-on-branch': 'status implemented', 'c-uncommitted': 'spec is not',
   });
@@ -272,11 +273,12 @@ test('specs selects approved specs and says why it skips the others', () => {
 
 test('specs skips a running session and a blocked run unless named', () => {
   const { dir } = trackedRepo();
-  const busy = fakeClaude([{ id: 'ab12', kind: 'background', name: 'tdd-12-csv', cwd: '/x', state: 'working' }]);
+  // Found by its worktree directory: no run file records the session id yet.
+  const busy = fakeClaude([{ id: 'ab12', kind: 'background', name: 'csv-report-export', cwd: path.join(fs.realpathSync(dir), '.claude/worktrees/12-csv'), state: 'working' }]);
   assert.match(run(dir, 'specs', {}, busy).result.skipped[0].why, /still running/);
   run(dir, 'run-report', { slug: '12-csv', status: 'blocked', details: 'GREEN AC-1\nmore' });
   assert.match(run(dir, 'specs', {}, fakeClaude([])).result.skipped[0].why, /blocked last time: GREEN AC-1 -/);
-  assert.deepStrictEqual(run(dir, 'specs', { slugs: ['12-csv'] }, fakeClaude([])).result.runnable, [{ slug: '12-csv', resume: false, lastRun: 'blocked' }]);
+  assert.deepStrictEqual(run(dir, 'specs', { slugs: ['12-csv'] }, fakeClaude([])).result.runnable, [{ slug: '12-csv', title: '', resume: false, lastRun: 'blocked' }]);
 });
 
 test('worktree creates .claude/worktrees/<slug> on feature/<slug>, excludes it, and is reused', () => {
@@ -301,15 +303,17 @@ test('runs-wait returns finished runs and stalled sessions, waits for starting o
   run(dir, 'run-report', { slug: 'c', status: 'running', session: 's-c' });
   run(dir, 'run-report', { slug: 'd', status: 'running', session: 's-d' }); // just started, not listed yet
   const sessions = fakeClaude([
-    { id: 's-b', kind: 'background', name: 'tdd-b', state: 'working' },
-    { id: 's-c', kind: 'background', name: 'tdd-c', state: 'done', status: 'idle' },
+    { id: 's-b', kind: 'background', name: 'invite-reset-flow', state: 'working' },
+    { id: 's-c', kind: 'background', name: 'customer-address-crud', state: 'done', status: 'idle' },
+    { id: 'old', kind: 'background', name: 'customer-address-crud', state: 'done' },
   ]);
   const r = run(dir, 'runs-wait', { slugs: ['a', 'b', 'c', 'd'] }, sessions).result;
   assert.deepStrictEqual(r.finished.map((f) => [f.slug, f.status, f.prUrl || f.details]), [
     ['a', 'done', 'https://github.com/o/r/pull/1'], ['c', 'stalled', 'session is done without a report'],
   ]);
-  assert.deepStrictEqual(r.running, [{ slug: 'b', attach: 'claude attach s-b' }, { slug: 'd' }]);
+  assert.strictEqual(r.finished[1].attach, 'claude attach s-c'); // name used by two sessions: the id is unambiguous
+  assert.deepStrictEqual(r.running, [{ slug: 'b', attach: 'claude attach invite-reset-flow' }, { slug: 'd' }]);
   const t = run(dir, 'runs-wait', { slugs: ['b'], maxMinutes: 0.005 }, sessions).result;
-  assert.deepStrictEqual(t, { finished: [], running: [{ slug: 'b', attach: 'claude attach s-b' }], timedOut: true });
+  assert.deepStrictEqual(t, { finished: [], running: [{ slug: 'b', attach: 'claude attach invite-reset-flow' }], timedOut: true });
   assert.match(run(dir, 'run-report', { slug: 'a', status: 'merged' }).error, /running, done or blocked/);
 });
