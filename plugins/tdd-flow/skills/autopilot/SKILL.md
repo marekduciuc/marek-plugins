@@ -1,0 +1,85 @@
+---
+name: autopilot
+description: This skill should be used when the user runs /tdd-flow:autopilot, or asks to "implement all approved specs", "run the specs in parallel", "work through the open specs" or "implement every spec that is not implemented yet". It starts one background Claude session per approved tdd-flow spec, each in its own git worktree (tasks through tdd-implement, superpowers code review, pull request), runs several at once and reports the pull requests.
+argument-hint: "[slug ...] [--parallel N]"
+---
+
+# Autopilot: implement every approved spec in parallel
+
+Input: $ARGUMENTS - optional feature slugs (default: every spec), optional `--parallel N` (default 3).
+
+Each spec runs in its own background session (`claude --bg`) in `.claude/worktrees/<slug>` on branch `feature/<slug>`. That session runs `/tdd-flow:implement-spec`, which implements the tasks, reviews, fixes once and opens a PR. This skill selects the specs, starts the sessions, keeps at most N running and reports. It never merges.
+
+`tdd-flow` is the plugin CLI (on the Bash `PATH`); it takes JSON on stdin and prints `{"ok": ..., "result": ...}`. Run it from the main checkout's root.
+
+## 1. Select specs
+
+```bash
+tdd-flow specs <<'TDD_FLOW_JSON'
+{"slugs": []}
+TDD_FLOW_JSON
+```
+
+Pass the slugs from the input in `slugs` (naming a spec also restarts it after a `blocked` run). On `ok: false` show the error and stop; it says what to fix: `.tdd-flow/` git-ignored, `state.json` tracked, not the main checkout.
+
+Show `runnable` and `skipped` (one line each: slug - reason). Specs are runnable when their status on `feature/<slug>`, or on the base branch if that branch does not exist yet, is `approved`. They must also be committed on the base branch without local changes. If nothing is runnable, stop.
+
+Before starting, check `gh auth status`; if it fails, tell the user to run `! gh auth login` and stop.
+
+## 2. Start sessions (at most N at a time)
+
+For each spec to start:
+
+1. ```bash
+   tdd-flow worktree <<'TDD_FLOW_JSON'
+   {"slug": "<slug>"}
+   TDD_FLOW_JSON
+   ```
+   → `path`, `branch`. On error, record the spec as blocked with the message and go on with the next one.
+2. Start the session in a subshell, so this session's directory does not change:
+   ```bash
+   (cd "<path>" && claude --bg -n "tdd-<slug>" "/tdd-flow:implement-spec <slug> <base>")
+   ```
+   `<base>` is `base` from step 1. The output contains `backgrounded · <id> · tdd-<slug>`; take the id.
+3. ```bash
+   tdd-flow run-report <<'TDD_FLOW_JSON'
+   {"slug": "<slug>", "status": "running", "session": "<id>"}
+   TDD_FLOW_JSON
+   ```
+   This also replaces the result of an earlier run.
+
+Tell the user, per started spec: slug, worktree, `claude attach <id>` to watch it.
+
+## 3. Wait, refill, repeat
+
+Run with the Bash tool and `run_in_background: true` (it blocks until a run finishes, up to 4 hours):
+
+```bash
+tdd-flow runs-wait <<'TDD_FLOW_JSON'
+{"slugs": ["<every running slug>"]}
+TDD_FLOW_JSON
+```
+
+When it exits, read `finished`:
+
+- `done` → note the `prUrl`.
+- `blocked` → note `details`.
+- `stalled` → the session went idle or disappeared without a report (it asked something or stopped early). Note its `attach` command; do not restart it.
+
+Then start the next queued specs (step 2) until N are running again, and start `runs-wait` again for the running slugs. Repeat until nothing runs and nothing is queued. If `runs-wait` reports `timedOut`, list the running sessions with their `attach` commands and ask the user whether to keep waiting.
+
+Give one status line per finished spec as it comes in.
+
+## 4. Summary
+
+A table: spec, result (`done` / `blocked` / `stalled` / skipped), PR URL or reason, worktree, `claude attach <id>` for blocked and stalled ones. Then:
+
+- A blocked spec: fix the cause (in its worktree), then run `/tdd-flow:autopilot <slug>`; it resumes from `tasks.md` on the same branch.
+- A stalled spec: `claude attach <id>` and answer the session.
+- Worktrees stay until the PR is merged (fixes after PR review go there). Afterwards: `claude rm <id>` or `git worktree remove .claude/worktrees/<slug>`, and `/tdd-flow:deploy {feature, mode: "merge", approved: true}` sets the spec to `done` if you want that.
+
+## Notes
+
+- Background sessions stop at permission prompts until someone attaches. For unattended runs, allow in your settings what the sessions need: the Workflow tool for tdd-flow workflows, `Bash(tdd-flow:*)`, your test/build commands, `Bash(git:*)`, `Bash(gh pr:*)`, Edit and Write (or run in auto mode).
+- N sessions use the rolling rate-limit window N times faster. Tests of parallel sessions can collide on shared resources (ports, one local database, docker compose): use `--parallel 1` for such repos.
+- PRs of parallel specs can conflict with each other; that is resolved at merge.

@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 'use strict';
 // tdd-flow CLI: the deterministic steps of the tdd-flow workflows (parsing the spec, git bookkeeping, commits,
-// preflight, CI polling). Workflow scripts cannot run commands, so they call this through the cheap
-// script-runner agent instead of a reasoning agent. Claude Code puts the plugin's bin/ on the Bash PATH.
+// preflight, CI polling) and of the autopilot skill (spec selection, worktrees, run results). Workflow scripts
+// cannot run commands, so they call this through the cheap script-runner agent instead of a reasoning agent.
+// Claude Code puts the plugin's bin/ on the Bash PATH.
 //
 //   tdd-flow <command> <<'TDD_FLOW_JSON'      JSON input on stdin, prints {"ok":true,"result":{...}}
 //   {...}                                     or {"ok":false,"error":"...","fallback":true?}
@@ -146,8 +147,20 @@ async function runTests(cmd) {
 }
 
 // ---------- spec and task parsing (formats from agents/requirements-analyst.md) ----------
+// "Status: <word>" line of spec.md. Lifecycle: draft -> approved -> implemented (tdd-implement) -> done (deploy close-out).
+const STATUS_LINE = /^([ \t]*[-*]?[ \t]*\**Status\**[ \t]*:[ \t]*\**[ \t]*)([A-Za-z]+)/mi;
+
+/** Sets the spec's Status word; returns false if the file or its Status line is missing. */
+function setSpecStatus(file, value) {
+  const spec = read(file);
+  if (spec == null || !STATUS_LINE.test(spec)) return false;
+  const next = spec.replace(STATUS_LINE, `$1${value}`);
+  if (next !== spec) fs.writeFileSync(file, next);
+  return true;
+}
+
 function parseSpec(spec) {
-  const status = ((spec.match(/^[ \t]*[-*]?[ \t]*\**Status\**[ \t]*:[ \t]*\**[ \t]*([A-Za-z]+)/mi) || [])[1] || '').toLowerCase();
+  const status = ((spec.match(STATUS_LINE) || [])[2] || '').toLowerCase();
   const source = ((spec.match(/^[ \t]*[-*]?[ \t]*\**Source\**[ \t]*:[ \t]*\**[ \t]*(.+)$/mi) || [])[1] || '').trim();
   const crit = {};
   let cur = null;
@@ -236,7 +249,8 @@ async function plan(inp) {
 
   const noTestSuite = none(stack.testAll);
   const res = {
-    slug, approved: s.status === 'approved', testAll: noTestSuite ? 'none' : stack.testAll,
+    // "implemented" still counts as approved, so a review-fix run ({findings}) works on a finished spec.
+    slug, status: s.status, approved: s.status === 'approved' || s.status === 'implemented', testAll: noTestSuite ? 'none' : stack.testAll,
     testSingle: noTestSuite || none(stack.testSingle) ? 'none' : stack.testSingle, noTestSuite,
     baselinePass: true, baselineSummary: noTestSuite ? 'no test suite' : 'not run', tasks,
   };
@@ -326,6 +340,11 @@ async function commit(inp) {
     }
   }
   if (inp.state) writeJSON(inp.state.file || STATE, inp.state.json || inp.state);
+  let specStatus;
+  if (inp.specStatus) {
+    if (!setSpecStatus(inp.specStatus.file, inp.specStatus.value)) return { committed: false, ticked, reason: `no "Status:" line in ${inp.specStatus.file}` };
+    specStatus = inp.specStatus.value;
+  }
   if (inp.runTests) {
     const stack = readStack();
     if (stack && !none(stack.testAll)) {
@@ -347,7 +366,8 @@ async function commit(inp) {
   const unexpected = exec('git', ['status', '--porcelain'], undefined, true).out.split('\n').filter(Boolean)
     .map((l) => l.slice(3).replace(/^.* -> /, '').replace(/^"|"$/g, ''))
     .filter((p) => !staged.includes(p) && !stage.includes(p));
-  if (!staged.length) return { committed: false, nothingToCommit: true, ticked, unexpected };
+  // An ignored .tdd-flow/ is never staged: the spec status then lives only in the file, which is still reported.
+  if (!staged.length) return { committed: false, nothingToCommit: true, ticked, unexpected, ...(specStatus ? { specStatus } : {}) };
   const bad = riskyStaged(staged);
   if (bad.length) {
     const own = bad.map((b) => b.path).filter((p) => staged.includes(p));
@@ -356,13 +376,13 @@ async function commit(inp) {
   }
   const c = exec('git', ['commit', '-F', '-', '--', ...staged], inp.message + '\n');
   if (c.code !== 0) return { committed: false, ticked, unexpected, reason: `git commit failed: ${(c.err || c.out).split('\n').slice(-15).join('\n')}` };
-  return { committed: true, ticked, sha: gitOut('rev-parse', '--short', 'HEAD'), unexpected };
+  const res = { committed: true, ticked, sha: gitOut('rev-parse', '--short', 'HEAD'), unexpected };
+  if (specStatus) res.specStatus = specStatus;
+  return res;
 }
 
 function closeOut(inp) {
-  const f = `${featureDir(inp.slug)}/spec.md`;
-  const spec = read(f);
-  if (spec != null) fs.writeFileSync(f, spec.replace(/^([ \t]*[-*]?[ \t]*\**Status\**[ \t]*:[ \t]*\**[ \t]*)[A-Za-z]+/mi, '$1done'));
+  setSpecStatus(`${featureDir(inp.slug)}/spec.md`, 'done');
   writeJSON(STATE, { feature: null, phase: 'IDLE', task: null });
   return { uncommitted: !!gitOut('status', '--porcelain', '--', '.tdd-flow') };
 }
@@ -562,9 +582,171 @@ function context(inp) {
   return res;
 }
 
+// ---------- autopilot: one background Claude session per spec, each in its own worktree ----------
+const WORKTREES = '.claude/worktrees';
+const SLUG = /^[a-z0-9][a-z0-9._-]*$/i;
+const RUN_FINAL = ['done', 'blocked'];
+const RUN_POLL_MS = 15000;
+const START_GRACE_MS = 90000;
+
+function checkSlug(slug) {
+  if (!SLUG.test(String(slug || ''))) throw new Error(`invalid feature slug "${slug}"`);
+  return slug;
+}
+const realpath = (p) => { try { return fs.realpathSync(p); } catch { return path.resolve(p); } };
+const commonDir = () => realpath(gitOut('rev-parse', '--git-common-dir') || '.git');
+/** Run results live in the shared git dir: visible from every worktree, never committed. */
+const runFile = (slug) => path.join(commonDir(), 'tdd-flow', 'runs', `${slug}.json`);
+const readRun = (slug) => readJSON(runFile(slug));
+
+/** Writes the run file atomically (temp file + rename), because runs-wait reads it while sessions write. */
+function writeRun(slug, run) {
+  const f = runFile(slug);
+  fs.mkdirSync(path.dirname(f), { recursive: true });
+  const tmp = `${f}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(run) + '\n');
+  fs.renameSync(tmp, f);
+}
+
+/** The main checkout's root; autopilot commands must not run inside a worktree. */
+function mainRoot() {
+  const top = gitOut('rev-parse', '--show-toplevel');
+  if (!top) throw new Error('not inside a git repository');
+  if (realpath(gitOut('rev-parse', '--git-dir')) !== commonDir()) throw new Error('run this from the main checkout, not from a worktree');
+  return realpath(top);
+}
+
+/** Background and interactive Claude sessions (`claude agents --json --all`); [] when the CLI is unavailable. */
+function claudeSessions() {
+  const r = exec(process.env.TDD_FLOW_CLAUDE_BIN || 'claude', ['agents', '--json', '--all']);
+  if (r.code !== 0) return [];
+  try { return JSON.parse(r.out); } catch { return []; }
+}
+
+/** The session of a run: by the id the autopilot recorded, else by the name tdd-<slug> or the worktree cwd. */
+function findSession(sessions, slug, run, wtPath) {
+  const byId = run && run.session && sessions.find((s) => s.id === run.session || s.sessionId === run.session);
+  if (byId) return byId;
+  return sessions.find((s) => s.kind === 'background' && (s.name === `tdd-${slug}` || (s.cwd && realpath(s.cwd) === wtPath)));
+}
+const isLive = (s) => !!s && s.state === 'working';
+
+/** Specs the autopilot can start, and why the others are skipped. Input: {slugs?: [...]} to limit the selection. */
+function specs(inp) {
+  const root = mainRoot();
+  const probe = '.tdd-flow/features/x/spec.md';
+  if (git('check-ignore', '-q', '--no-index', '--', probe).code === 0) {
+    throw new Error('.tdd-flow/ is git-ignored. The autopilot needs specs in git: remove .tdd-flow/ from .gitignore and commit the specs.');
+  }
+  const base = baseBranch();
+  if (git('cat-file', '-e', `${base}:${STATE}`).code === 0) {
+    throw new Error(`${STATE} is tracked on ${base}; parallel PRs would conflict on it. Run \`git rm --cached ${STATE}\`, add it to .gitignore and commit.`);
+  }
+  let slugs;
+  try { slugs = fs.readdirSync('.tdd-flow/features', { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name).sort(); } catch { slugs = []; }
+  const wanted = (inp.slugs || []).length ? new Set(inp.slugs) : null;
+  const unknown = wanted ? [...wanted].filter((s) => !slugs.includes(s)) : [];
+  if (unknown.length) throw new Error(`no spec folder for: ${unknown.map((s) => `.tdd-flow/features/${s}`).join(', ')}`);
+  const sessions = claudeSessions();
+  const runnable = [];
+  const skipped = [];
+  for (const slug of slugs) {
+    if (wanted && !wanted.has(slug)) continue;
+    const skip = (why) => skipped.push({ slug, why });
+    if (!SLUG.test(slug)) { skip('folder name is not a valid slug'); continue; }
+    const specPath = `${featureDir(slug)}/spec.md`;
+    const committed = exec('git', ['show', `${base}:${specPath}`], undefined, true);
+    if (committed.code !== 0) { skip(`spec is not committed on ${base} - commit it to ${base} first`); continue; }
+    if (gitOut('status', '--porcelain', '--', specPath, `${featureDir(slug)}/tasks.md`)) {
+      skip(`uncommitted changes in spec.md or tasks.md - commit them to ${base} first`);
+      continue;
+    }
+    const branch = `feature/${slug}`;
+    const onBranch = git('rev-parse', '--verify', '--quiet', `refs/heads/${branch}`).code === 0
+      ? exec('git', ['show', `${branch}:${specPath}`], undefined, true) : null;
+    const status = parseSpec(onBranch && onBranch.code === 0 ? onBranch.out : committed.out).status || 'none';
+    const run = readRun(slug);
+    const wtPath = path.join(root, WORKTREES, slug);
+    if (status !== 'approved') { skip(`status ${status}${run && run.prUrl ? ` (${run.prUrl})` : ''}`); continue; }
+    if (isLive(findSession(sessions, slug, run, wtPath))) { skip('a session is still running on it'); continue; }
+    if (run && run.status === 'blocked' && !(wanted && wanted.has(slug))) {
+      skip(`blocked last time: ${String(run.details || '').split('\n')[0]} - fix it, then start it by name`);
+      continue;
+    }
+    const hasWorktree = fs.existsSync(wtPath);
+    if (hasWorktree && exec('git', ['-C', wtPath, 'status', '--porcelain', '--untracked-files=no'], undefined, true).out.trim()) {
+      skip(`${WORKTREES}/${slug} has uncommitted changes - commit or discard them first`);
+      continue;
+    }
+    runnable.push({ slug, resume: hasWorktree || !!onBranch, lastRun: run ? run.status : null });
+  }
+  return { base, runnable, skipped };
+}
+
+/** Creates (or reuses) .claude/worktrees/<slug> on branch feature/<slug>. Input: {slug}. */
+function worktree(inp) {
+  const slug = checkSlug(inp.slug);
+  const root = mainRoot();
+  // Kept out of `git status` in the main checkout and out of every commit, without touching .gitignore.
+  const exclude = path.join(commonDir(), 'info', 'exclude');
+  const ex = read(exclude) || '';
+  const add = [`/${WORKTREES}/`, `/${STATE}`].filter((l) => !ex.split('\n').includes(l));
+  if (add.length) { fs.mkdirSync(path.dirname(exclude), { recursive: true }); fs.appendFileSync(exclude, (ex && !ex.endsWith('\n') ? '\n' : '') + add.join('\n') + '\n'); }
+  const rel = `${WORKTREES}/${slug}`;
+  const abs = path.join(root, rel);
+  const branch = `feature/${slug}`;
+  const listed = gitOut('worktree', 'list', '--porcelain').split('\n').some((l) => l.startsWith('worktree ') && realpath(l.slice(9)) === abs);
+  if (listed) return { path: abs, branch, created: false };
+  if (fs.existsSync(abs)) throw new Error(`${rel} exists but is not a git worktree`);
+  const hasBranch = git('rev-parse', '--verify', '--quiet', `refs/heads/${branch}`).code === 0;
+  const r = hasBranch ? git('worktree', 'add', rel, branch) : git('worktree', 'add', '-b', branch, rel, baseBranch());
+  if (r.code !== 0) throw new Error(`git worktree add ${rel} failed: ${r.err || r.out}`);
+  return { path: abs, branch, created: true };
+}
+
+/** Records a run result. Input: {slug, status: running|done|blocked, session?, prUrl?, details?}. */
+function runReport(inp) {
+  const slug = checkSlug(inp.slug);
+  if (!['running', ...RUN_FINAL].includes(inp.status)) throw new Error(`status must be running, done or blocked, not "${inp.status}"`);
+  const run = { slug, status: inp.status, at: new Date().toISOString() };
+  for (const k of ['session', 'prUrl', 'details']) if (inp[k]) run[k] = String(inp[k]);
+  writeRun(slug, run);
+  return run;
+}
+
+/**
+ * Waits until at least one of the given runs has finished. A run is finished when its file says done or blocked,
+ * or "stalled" when its session is idle or gone without a report (it asked a question or stopped early).
+ * Input: {slugs: [...], maxMinutes?: 240}. Meant for a background Bash call, so it blocks without "again".
+ */
+async function runsWait(inp) {
+  const slugs = (inp.slugs || []).map(checkSlug);
+  if (!slugs.length) throw new Error('no slugs to wait for');
+  const root = mainRoot();
+  const end = Date.now() + (inp.maxMinutes || 240) * 60000;
+  for (;;) {
+    const sessions = claudeSessions();
+    const finished = [];
+    const running = [];
+    for (const slug of slugs) {
+      const run = readRun(slug) || { slug, status: 'unknown' };
+      const s = findSession(sessions, slug, run, path.join(root, WORKTREES, slug));
+      const attach = s && s.id ? `claude attach ${s.id}` : '';
+      // A session that has just been started may not be listed as working yet.
+      const starting = run.status === 'running' && Date.now() - Date.parse(run.at) < START_GRACE_MS && !(s && s.state === 'done');
+      if (RUN_FINAL.includes(run.status)) finished.push({ ...run, ...(attach ? { attach } : {}) });
+      else if (!isLive(s) && !starting) finished.push({ slug, status: 'stalled', details: s ? `session is ${s.state || s.status} without a report` : 'no session found', ...(attach ? { attach } : {}) });
+      else running.push({ slug, ...(attach ? { attach } : {}) });
+    }
+    if (finished.length) return { finished, running };
+    if (Date.now() > end) return { finished: [], running, timedOut: true };
+    await sleep(Math.min(RUN_POLL_MS, Math.max(0, end - Date.now()) + 50));
+  }
+}
+
 const COMMANDS = {
   plan, branch, block, commit, 'close-out': closeOut, 'add-secret-scan': addSecretScan, preflight,
-  'ci-watch': ciWatch, 'ci-rerun': ciRerun, context,
+  'ci-watch': ciWatch, 'ci-rerun': ciRerun, context, specs, worktree, 'run-report': runReport, 'runs-wait': runsWait,
 };
 
 async function main(argv) {
@@ -602,4 +784,4 @@ async function main(argv) {
 
 if (require.main === module) main(process.argv.slice(2)).then((code) => { process.exitCode = code; });
 
-module.exports = { main, parseSpec, parseTasks, parseTaskTable, readStack, compact, kebab, onMergeSummary, taskLine, COMMANDS };
+module.exports = { main, parseSpec, parseTasks, parseTaskTable, readStack, compact, kebab, onMergeSummary, taskLine, setSpecStatus, COMMANDS };

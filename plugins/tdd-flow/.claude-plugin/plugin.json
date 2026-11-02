@@ -1,6 +1,6 @@
 {
   "name": "tdd-flow",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "description": "Personal end-to-end dev pipeline for Claude Code: requirements analysis, test-driven implementation, documentation and CI/CD-based deployment, driven by dynamic workflows and specialist subagents.",
   "author": { "name": "Marek Duciuc" },
   "license": "MIT",

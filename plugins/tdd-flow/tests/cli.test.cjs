@@ -8,7 +8,7 @@ const path = require('path');
 const { execFileSync, spawnSync } = require('child_process');
 
 const CLI = path.join(__dirname, '..', 'bin', 'tdd-flow');
-const { parseSpec, parseTasks, parseTaskTable, compact, kebab, onMergeSummary } = require(CLI);
+const { parseSpec, parseTasks, parseTaskTable, compact, kebab, onMergeSummary, setSpecStatus } = require(CLI);
 
 const SPEC = `- Source: https://github.com/o/r/issues/12
 - Slug: 12-csv
@@ -56,12 +56,28 @@ function repo() {
   fs.writeFileSync(path.join(f, 'tasks.md'), TASKS);
   fs.writeFileSync(path.join(dir, '.tdd-flow/stack.md'), 'test command (all): `node -e 0`\ntest command (single file / filter): `node --test <file>`\ndefault branch: main\n');
   fs.writeFileSync(path.join(dir, '.tdd-flow/state.json'), '{"feature":"12-csv","phase":"IDLE","task":"T-1"}\n');
-  return { dir, g, read: (p) => fs.readFileSync(path.join(dir, p), 'utf8'), write: (p, s) => fs.writeFileSync(path.join(dir, p), s) };
+  return { dir, g, read: (p) => fs.readFileSync(path.join(dir, p), 'utf8'), write: (p, s) => { fs.mkdirSync(path.dirname(path.join(dir, p)), { recursive: true }); fs.writeFileSync(path.join(dir, p), s); } };
 }
 
-function run(dir, cmd, input) {
-  const r = spawnSync(process.execPath, [CLI, cmd], { cwd: dir, input: JSON.stringify(input || {}), encoding: 'utf8' });
+function run(dir, cmd, input, env) {
+  const r = spawnSync(process.execPath, [CLI, cmd], { cwd: dir, input: JSON.stringify(input || {}), encoding: 'utf8', env: { ...process.env, ...env } });
   return JSON.parse(r.stdout.trim());
+}
+
+/** A repo whose .tdd-flow/ is committed on main (state.json stays ignored), as the autopilot requires. */
+function trackedRepo() {
+  const r = repo();
+  r.write('.gitignore', '.tdd-flow/state.json\n');
+  r.g('add', '.gitignore', '.tdd-flow');
+  r.g('commit', '-qm', 'specs');
+  return r;
+}
+
+/** Fake `claude` CLI printing the given `claude agents --json --all` sessions. */
+function fakeClaude(sessions) {
+  const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'tdd-flow-claude-')), 'claude');
+  fs.writeFileSync(f, `#!/bin/sh\necho '${JSON.stringify(sessions)}'\n`, { mode: 0o755 });
+  return { TDD_FLOW_CLAUDE_BIN: f };
 }
 
 test('parseSpec reads status, criteria text, verify lines and edge cases', () => {
@@ -190,4 +206,110 @@ test('onMergeSummary lists workflows with a push trigger on the base branch', ()
   const cwd = process.cwd();
   process.chdir(dir);
   try { assert.strictEqual(onMergeSummary('main'), 'Merging into main runs: CI (push triggers in .github/workflows)'); } finally { process.chdir(cwd); }
+});
+
+test('setSpecStatus replaces only the status word', () => {
+  const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'tdd-flow-spec-')), 'spec.md');
+  fs.writeFileSync(f, SPEC);
+  assert.strictEqual(setSpecStatus(f, 'implemented'), true);
+  assert.strictEqual(parseSpec(fs.readFileSync(f, 'utf8')).status, 'implemented');
+  assert.strictEqual(fs.readFileSync(f, 'utf8'), SPEC.replace('Status: approved', 'Status: implemented'));
+  fs.writeFileSync(f, '# no status\n');
+  assert.strictEqual(setSpecStatus(f, 'done'), false);
+});
+
+test('commit with specStatus marks the spec implemented in the same commit', () => {
+  const { dir, g, read, write } = trackedRepo();
+  g('switch', '-q', '-c', 'feature/12-csv');
+  write('a.js', 'x\n');
+  const spec = '.tdd-flow/features/12-csv/spec.md';
+  const r = run(dir, 'commit', { message: 'feat(12-csv): T-20 Later', files: ['a.js', spec], specStatus: { file: spec, value: 'implemented' } });
+  assert.strictEqual(r.result.committed, true);
+  assert.strictEqual(r.result.specStatus, 'implemented');
+  assert.match(read(spec), /Status: implemented/);
+  assert.match(g('show', '--name-only', '--format=', 'HEAD').toString(), /spec\.md/);
+});
+
+test('plan treats an implemented spec as approved and reports its status', () => {
+  const { dir, write } = repo();
+  write('.tdd-flow/features/12-csv/spec.md', SPEC.replace('Status: approved', 'Status: implemented'));
+  const r = run(dir, 'plan', { baseline: false });
+  assert.strictEqual(r.result.approved, true);
+  assert.strictEqual(r.result.status, 'implemented');
+});
+
+test('specs refuses a git-ignored .tdd-flow/ and a tracked state.json', () => {
+  assert.match(run(repo().dir, 'specs', {}, fakeClaude([])).error, /\.tdd-flow\/ is git-ignored/);
+  const { dir, g, write } = repo();
+  write('.gitignore', '');
+  g('add', '.gitignore', '.tdd-flow');
+  g('commit', '-qm', 'all');
+  assert.match(run(dir, 'specs', {}, fakeClaude([])).error, /state\.json is tracked on main/);
+});
+
+test('specs selects approved specs and says why it skips the others', () => {
+  const { dir, g, write } = trackedRepo();
+  const add = (slug, status) => {
+    write(`.tdd-flow/features/${slug}/spec.md`, SPEC.replace('Status: approved', `Status: ${status}`));
+    write(`.tdd-flow/features/${slug}/tasks.md`, TASKS);
+  };
+  add('a-draft', 'draft');
+  add('b-done-on-branch', 'approved');
+  add('c-uncommitted', 'approved');
+  g('add', '.tdd-flow/features/a-draft', '.tdd-flow/features/b-done-on-branch');
+  g('commit', '-qm', 'more specs');
+  g('switch', '-q', '-c', 'feature/b-done-on-branch');
+  write('.tdd-flow/features/b-done-on-branch/spec.md', SPEC.replace('Status: approved', 'Status: implemented'));
+  g('commit', '-qam', 'implemented');
+  g('switch', '-q', 'main');
+  const r = run(dir, 'specs', {}, fakeClaude([]));
+  assert.strictEqual(r.ok, true, r.error);
+  assert.deepStrictEqual(r.result.runnable, [{ slug: '12-csv', resume: false, lastRun: null }]);
+  assert.deepStrictEqual(Object.fromEntries(r.result.skipped.map((s) => [s.slug, s.why.split(' ').slice(0, 3).join(' ')])), {
+    'a-draft': 'status draft', 'b-done-on-branch': 'status implemented', 'c-uncommitted': 'spec is not',
+  });
+});
+
+test('specs skips a running session and a blocked run unless named', () => {
+  const { dir } = trackedRepo();
+  const busy = fakeClaude([{ id: 'ab12', kind: 'background', name: 'tdd-12-csv', cwd: '/x', state: 'working' }]);
+  assert.match(run(dir, 'specs', {}, busy).result.skipped[0].why, /still running/);
+  run(dir, 'run-report', { slug: '12-csv', status: 'blocked', details: 'GREEN AC-1\nmore' });
+  assert.match(run(dir, 'specs', {}, fakeClaude([])).result.skipped[0].why, /blocked last time: GREEN AC-1 -/);
+  assert.deepStrictEqual(run(dir, 'specs', { slugs: ['12-csv'] }, fakeClaude([])).result.runnable, [{ slug: '12-csv', resume: false, lastRun: 'blocked' }]);
+});
+
+test('worktree creates .claude/worktrees/<slug> on feature/<slug>, excludes it, and is reused', () => {
+  const { dir, g } = trackedRepo();
+  const r = run(dir, 'worktree', { slug: '12-csv' });
+  assert.strictEqual(r.ok, true, r.error);
+  assert.strictEqual(r.result.created, true);
+  assert.strictEqual(r.result.branch, 'feature/12-csv');
+  assert.strictEqual(fs.realpathSync(r.result.path), fs.realpathSync(path.join(dir, '.claude/worktrees/12-csv')));
+  assert.ok(fs.existsSync(path.join(r.result.path, '.tdd-flow/features/12-csv/spec.md')));
+  assert.match(fs.readFileSync(path.join(dir, '.git/info/exclude'), 'utf8'), /^\/\.claude\/worktrees\/\n\/\.tdd-flow\/state\.json\n$/m);
+  assert.strictEqual(g('status', '--porcelain').toString(), '');
+  assert.strictEqual(run(dir, 'worktree', { slug: '12-csv' }).result.created, false);
+  assert.match(run(r.result.path, 'worktree', { slug: '12-csv' }).error, /main checkout/);
+  assert.match(run(dir, 'worktree', { slug: '../x' }).error, /invalid feature slug/);
+});
+
+test('runs-wait returns finished runs and stalled sessions, waits for starting ones, and times out', () => {
+  const { dir } = trackedRepo();
+  run(dir, 'run-report', { slug: 'a', status: 'done', prUrl: 'https://github.com/o/r/pull/1' });
+  run(dir, 'run-report', { slug: 'b', status: 'running', session: 's-b' });
+  run(dir, 'run-report', { slug: 'c', status: 'running', session: 's-c' });
+  run(dir, 'run-report', { slug: 'd', status: 'running', session: 's-d' }); // just started, not listed yet
+  const sessions = fakeClaude([
+    { id: 's-b', kind: 'background', name: 'tdd-b', state: 'working' },
+    { id: 's-c', kind: 'background', name: 'tdd-c', state: 'done', status: 'idle' },
+  ]);
+  const r = run(dir, 'runs-wait', { slugs: ['a', 'b', 'c', 'd'] }, sessions).result;
+  assert.deepStrictEqual(r.finished.map((f) => [f.slug, f.status, f.prUrl || f.details]), [
+    ['a', 'done', 'https://github.com/o/r/pull/1'], ['c', 'stalled', 'session is done without a report'],
+  ]);
+  assert.deepStrictEqual(r.running, [{ slug: 'b', attach: 'claude attach s-b' }, { slug: 'd' }]);
+  const t = run(dir, 'runs-wait', { slugs: ['b'], maxMinutes: 0.005 }, sessions).result;
+  assert.deepStrictEqual(t, { finished: [], running: [{ slug: 'b', attach: 'claude attach s-b' }], timedOut: true });
+  assert.match(run(dir, 'run-report', { slug: 'a', status: 'merged' }).error, /running, done or blocked/);
 });
