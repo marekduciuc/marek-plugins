@@ -2,3 +2,7 @@
 .tdd-flow/
 *.plugin
 node_modules/
+
+# Local reports from the testing and coding rules
+testreport.md
+update[0-9][0-9].[0-9][0-9].[0-9][0-9][0-9][0-9]_[0-9][0-9]-[0-9][0-9].md
