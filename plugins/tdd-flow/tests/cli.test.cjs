@@ -317,3 +317,41 @@ test('runs-wait returns finished runs and stalled sessions, waits for starting o
   assert.deepStrictEqual(t, { finished: [], running: [{ slug: 'b', attach: 'claude attach invite-reset-flow' }], timedOut: true });
   assert.match(run(dir, 'run-report', { slug: 'a', status: 'merged' }).error, /running, done or blocked/);
 });
+
+// Shapes taken from real specs: suffixed ids, a note after a verify command, a verify list under one "Verify" line.
+const SUFFIXED_SPEC = `- Status: approved
+
+### AC-1 Mailpit in compose (setup task)
+- **Given** compose
+- **When** mailpit is added
+- **Then** it is valid
+- **Verify:** \`t=$(sed -n 1p compose.yaml) && [ -n "$t" ]\` (passes only after T-2)
+
+### AC-2a Migration tables
+- **Given** the schema
+- **When** migrated
+- **Then** tables exist
+- **Verify** (from the repo root, each exits 0):
+  - \`cd apps/backend && ./mvnw -B -q compile\`
+  - \`grep -q '^springdoc:' application.yml\`
+
+### AC-8b Unique ICO per tenant
+- **Given** two customers
+- **When** the same ICO is used
+- **Then** the second is rejected
+`;
+
+test('parseSpec reads suffixed ids, drops notes after verify commands and reads verify lists', () => {
+  const s = parseSpec(SUFFIXED_SPEC);
+  assert.deepStrictEqual(Object.keys(s.crit), ['AC-1', 'AC-2a', 'AC-8b']);
+  assert.deepStrictEqual(s.crit['AC-1'].verify, [{ command: 't=$(sed -n 1p compose.yaml) && [ -n "$t" ]', manual: false }]);
+  assert.deepStrictEqual(s.crit['AC-2a'].verify.map((v) => v.command), ['cd apps/backend && ./mvnw -B -q compile', "grep -q '^springdoc:' application.yml"]);
+  assert.strictEqual(s.text(s.crit['AC-2a']), 'Migration tables: Given the schema When migrated Then tables exist');
+  assert.strictEqual(s.text(s.crit['AC-8b']), 'Unique ICO per tenant: Given two customers When the same ICO is used Then the second is rejected');
+});
+
+test('parseTasks and parseTaskTable read suffixed ids and do not split AC-2 from AC-2a', () => {
+  const t = parseTasks('- [ ] T-2 Migration V5 (AC-2a, AC-8b)\n- [ ] T-3 Other (AC-2)\n');
+  assert.deepStrictEqual(t.map((x) => [x.id, x.title, x.refs.join(',')]), [['T-2', 'Migration V5', 'AC-2a,AC-8b'], ['T-3', 'Other', 'AC-2']]);
+  assert.deepStrictEqual(parseTaskTable('| ID | Task | Kind | ACs |\n|---|---|---|---|\n| T-2 | M | tdd | AC-2a, EC-3b |\n')['T-2'].refs, ['AC-2a', 'EC-3b']);
+});

@@ -159,23 +159,42 @@ function setSpecStatus(file, value) {
   return true;
 }
 
+// A criterion id: AC-12 or EC-3, optionally with a letter suffix (AC-2a, EC-19c).
+const CRIT_ID = String.raw`(?:AC|EC)-\d+[a-z]*(?![A-Za-z0-9])`;
+const CRIT_IDS = new RegExp(String.raw`\b${CRIT_ID}`, 'g');
+
 function parseSpec(spec) {
   const status = ((spec.match(STATUS_LINE) || [])[2] || '').toLowerCase();
   const source = ((spec.match(/^[ \t]*[-*]?[ \t]*\**Source\**[ \t]*:[ \t]*\**[ \t]*(.+)$/mi) || [])[1] || '').trim();
   const crit = {};
   let cur = null;
+  // Set while reading the indented items under a "Verify (...):" line that has no command of its own.
+  let verifyList = null;
+  const headingRe = new RegExp(String.raw`^#{2,4}\s+(${CRIT_ID})[\s:.\-–—]*(.*)$`);
   for (const line of spec.split(/\r?\n/)) {
-    const h = line.match(/^#{2,4}\s+((?:AC|EC)-\d+)\b[\s:.\-–—]*(.*)$/);
+    if (verifyList) {
+      const item = line.match(/^\s+[-*]\s+(.*\S)\s*$/);
+      if (item) {
+        const bt = item[1].match(/`([^`]+)`/);
+        cur.verify.push({ command: (verifyList.manual || !bt ? item[1] : bt[1]).trim(), manual: verifyList.manual });
+        continue;
+      }
+      verifyList = null;
+    }
+    const h = line.match(headingRe);
     if (h) { cur = crit[h[1]] = { name: h[2].trim(), parts: [], verify: [] }; continue; }
     if (/^#{1,4}\s/.test(line)) { cur = null; }
-    const ec = !cur && line.match(/^\s*[-*]\s+\**(EC-\d+)\**\b[\s:.\-–—]*(.*)$/);
+    const ec = !cur && line.match(/^\s*[-*]\s+\**(EC-\d+[a-z]*)\**(?![A-Za-z0-9])[\s:.\-–—]*(.*)$/);
     if (ec) { if (!crit[ec[1]]) crit[ec[1]] = { name: '', parts: [ec[2].trim()], verify: [] }; continue; }
     if (!cur) continue;
-    const v = line.match(/^\s*[-*]\s*\*{0,2}Verify(\s*\(manual\))?\s*:?\s*\*{0,2}\s*:?\s*(.+)$/i);
+    const v = line.match(/^\s*[-*]\s*\*{0,2}Verify(\s*\(manual\))?\s*:?\s*\*{0,2}\s*:?\s*(.*)$/i);
     if (v) {
       const manual = !!v[1];
-      const bt = v[2].match(/`([^`]+)`/);
-      cur.verify.push({ command: (manual ? v[2] : bt ? bt[1] : v[2]).trim(), manual });
+      const text = v[2].trim();
+      const bt = text.match(/`([^`]+)`/);
+      // "- **Verify** (from the repo root, each exits 0):" introduces a list of commands on the following lines.
+      if (!bt && (!text || text.endsWith(':'))) { verifyList = { manual }; continue; }
+      cur.verify.push({ command: (manual ? text : bt ? bt[1] : text).trim(), manual });
       continue;
     }
     const g = line.match(/^\s*[-*]\s+(.*\S)\s*$/) || line.match(/^\s*(\**(?:Given|When|Then|And|But)\b.*\S)\s*$/i);
@@ -196,7 +215,7 @@ function parseTaskTable(spec) {
     const id = (cells[0] || '').match(/^T-\d+$/);
     if (!cols || !id) continue;
     const at = (name) => cells[cols.findIndex((c) => c.startsWith(name))] || '';
-    rows[id[0]] = { kind: /setup/i.test(at('kind')) ? 'setup' : 'tdd', refs: at('ac').match(/\b(?:AC|EC)-\d+\b/g) || [] };
+    rows[id[0]] = { kind: /setup/i.test(at('kind')) ? 'setup' : 'tdd', refs: at('ac').match(CRIT_IDS) || [] };
   }
   return rows;
 }
@@ -209,8 +228,8 @@ function parseTasks(md) {
     let rest = m[3].trim();
     const setup = /\[setup\]/i.test(rest);
     rest = rest.replace(/\s*\[setup\]\s*/gi, ' ').trim();
-    const refs = [...new Set(rest.match(/\b(?:AC|EC)-\d+\b/g) || [])];
-    const title = rest.replace(/\s*\([^()]*\b(?:AC|EC)-\d+\b[^()]*\)\s*/g, ' ').trim();
+    const refs = [...new Set(rest.match(CRIT_IDS) || [])];
+    const title = rest.replace(new RegExp(String.raw`\s*\([^()]*\b${CRIT_ID}[^()]*\)\s*`, 'g'), ' ').trim();
     out.push({ id: m[2], title, done: m[1] !== ' ', kind: setup ? 'setup' : 'tdd', refs });
   }
   return out;

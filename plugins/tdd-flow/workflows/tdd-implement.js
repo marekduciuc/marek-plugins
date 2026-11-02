@@ -198,6 +198,9 @@ async function escalate(name, run, ok, feedback) {
   return { ok: false, result: last, attempts }
 }
 const changedFiles = (attempts) => attempts.flatMap(a => a.filesChanged || [])
+// Agents may label a behaviour differently ("AC-8b" for "AC-8b (schema part)"): refs match by their id.
+const refKey = (ref) => String(ref || '').trim().split(/[\s(:]/)[0]
+const sameRef = (a, b) => refKey(a) === refKey(b)
 
 // RED then GREEN for a list of behaviours, in batches of BATCH. A separate test-writer writes every failing test of
 // the batch before the implementer changes production code. `structural` review findings go into the last GREEN call.
@@ -208,13 +211,14 @@ async function tddStep(task, items, structural = []) {
   for (let i = 0; i < items.length; i += BATCH) {
     const batch = items.slice(i, i + BATCH)
     const refs = batch.map(b => b.ref)
+    const reportFor = (r, ref) => r.tests.find(t => sameRef(t.ref, ref))
     const isLastBatch = i + BATCH >= items.length
     const tag = `${task.id} ${refs.length > 1 ? refs[0] + '..' + refs[refs.length - 1] : refs[0]}`
 
     // RED succeeds only if every requested ref is reported and none errored.
     const redProblems = (r) => [
-      ...refs.filter(ref => !r.tests.some(t => t.ref === ref)).map(ref => `${ref}: no test reported`),
-      ...r.tests.filter(t => refs.includes(t.ref) && t.result === 'ERROR').map(t => `${t.ref}: ${t.reason}`),
+      ...refs.filter(ref => !reportFor(r, ref)).map(ref => `${ref}: no test reported`),
+      ...refs.map(ref => reportFor(r, ref)).filter(t => t && t.result === 'ERROR').map(t => `${t.ref}: ${t.reason}`),
     ]
     const red = await escalate(`${tag} RED`,
       (model, extra, label) => run(
@@ -226,7 +230,8 @@ async function tddStep(task, items, structural = []) {
         'Fix or write only the tests listed here so each fails on the behaviour itself, then report every behaviour of the batch again.')
     red.attempts.forEach(a => a.tests.forEach(t => t.testFile && files.push(t.testFile)))
     if (!red.ok) return { ok: false, step: `RED ${refs.join(', ')}`, details: red.result ? redProblems(red.result).join('\n') : 'agent failed' }
-    const reported = refs.map(ref => red.result.tests.find(t => t.ref === ref))
+    // Each report carries the plan's ref from here on, whatever exact label the test-writer used.
+    const reported = refs.map(ref => ({ ...reportFor(red.result, ref), ref }))
     reported.filter(t => t.result === 'PASS').forEach(t => log(`${task.id} ${t.ref}: test passed immediately - behaviour already exists`))
     const failing = reported.filter(t => t.result === 'FAIL')
     if (!failing.length) continue
@@ -234,7 +239,7 @@ async function tddStep(task, items, structural = []) {
     // GREEN succeeds only if every listed test is reported passing and the full suite is green.
     const withStructural = isLastBatch && structural.length > 0
     const greenProblems = (r) => [
-      ...failing.filter(t => !r.tests.some(x => x.ref === t.ref && x.pass)).map(t => `${t.ref}: ${t.testFile} :: ${t.testName} is not passing`),
+      ...failing.filter(t => !r.tests.some(x => sameRef(x.ref, t.ref) && x.pass)).map(t => `${t.ref}: ${t.testFile} :: ${t.testName} is not passing`),
       ...(r.suitePass ? [] : ['the full suite is failing']),
     ]
     const green = await escalate(`${tag} GREEN`,
@@ -259,7 +264,8 @@ async function tddStep(task, items, structural = []) {
 // Success is computed here: every automatic verify command reported and none failed. "skipped" (tool missing) is
 // allowed and collected in `unverified`. Returns {ok:true, files} | {ok:false, step, details}
 const unverified = new Map()
-const norm = (c) => String(c || '').replace(/`/g, '').replace(/\s+/g, ' ').trim()
+// Commands compare without backticks, extra whitespace or a trailing note in parentheses ("... (passes after T-2)").
+const norm = (c) => String(c || '').replace(/`/g, '').replace(/\s+/g, ' ').trim().replace(/\s+\([^()]*\)$/, '')
 async function setupStep(task, findings = null) {
   const checks = (task.verify || []).filter(v => !v.manual)
   const manual = (task.verify || []).filter(v => v.manual)
