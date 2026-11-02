@@ -43,6 +43,7 @@ const PLAN = {
     slug: str, status: str, approved: { type: 'boolean' },
     testAll: str, testSingle: str, lint: str, testPattern: str,
     baselinePass: { type: 'boolean' }, baselineSummary: str, noTestSuite: { type: 'boolean' },
+    taskCount: { type: 'integer' }, openIds: strs,
     tasks: { type: 'array', items: { type: 'object', required: ['id', 'title', 'done', 'behaviours'], properties: {
       id: str, title: str, done: { type: 'boolean' }, kind: { type: 'string', enum: ['tdd', 'setup'] },
       behaviours: { type: 'array', items: { type: 'object', required: ['ref', 'text'], properties: { ref: str, text: str } } },
@@ -73,6 +74,7 @@ const GREEN = {
   properties: {
     tests: { type: 'array', items: { type: 'object', required: ['ref', 'pass'], properties: { ref: str, pass: { type: 'boolean' } } } },
     suitePass: { type: 'boolean' }, filesChanged: strs, summary: str, failures: str, concerns: str,
+    testDefects: { type: 'array', items: { type: 'object', required: ['ref', 'reason'], properties: { ref: str, reason: str } } },
   },
 }
 const CODE = {
@@ -92,7 +94,7 @@ const REVIEW = {
   },
 }
 const BRANCH = { type: 'object', required: ['branch'], properties: { branch: str } }
-const COMMIT = { type: 'object', required: ['committed'], properties: { committed: { type: 'boolean' }, nothingToCommit: { type: 'boolean' }, ticked: { type: 'boolean' }, specStatus: str, sha: str, reason: str, unexpected: strs } }
+const COMMIT = { type: 'object', required: ['committed'], properties: { committed: { type: 'boolean' }, nothingToCommit: { type: 'boolean' }, ticked: { type: 'boolean' }, specStatus: str, specStatusSkipped: str, sha: str, reason: str, unexpected: strs } }
 const BLOCK = { type: 'object', required: ['logged'], properties: { logged: { type: 'boolean' }, unticked: { type: 'boolean' } } }
 
 // Deterministic steps run in the plugin's CLI (bin/tdd-flow) through the script-runner agent (haiku, Bash only)
@@ -105,7 +107,7 @@ async function cli(cmd, input, schema, o = {}) {
     `Run with the Bash tool (timeout 600000):\n\ntdd-flow ${cmd} <<'TDD_FLOW_JSON'\n${JSON.stringify(input)}\nTDD_FLOW_JSON\n\n` +
     (o.repeat ? `While the printed JSON has "again": true, run the identical command again (at most ${o.repeat} runs).\n` : '') +
     'Return the printed JSON object as your structured output.',
-    { agentType: A('script-runner'), model: M.light, effort: 'low', schema: cliSchema(schema), label: o.label || cmd, phase: o.phase, ...(o.stallMs ? { stallMs: o.stallMs } : {}) },
+    { agentType: A('script-runner'), model: o.model || M.light, effort: 'low', schema: cliSchema(schema), label: o.label || cmd, phase: o.phase, ...(o.stallMs ? { stallMs: o.stallMs } : {}) },
     o.final)
   if (!r) return { ok: false, error: 'script-runner agent failed' }
   return r.ok && !r.result ? { ok: false, error: 'the command returned no result' } : r
@@ -115,7 +117,23 @@ async function cli(cmd, input, schema, o = {}) {
 phase('Plan')
 // The CLI parses spec.md/tasks.md and runs the baseline. For a spec it cannot parse it reports fallback, and the
 // planning agent does the same work.
-const planned = await cli('plan', { feature: opt.feature || null }, PLAN, { label: 'plan' })
+const planInput = { feature: opt.feature || null, maxTasks: opt.maxTasks || null, fromTask: opt.fromTask || null }
+// The relay must hand over every task: a dropped task would look done (and could mark the spec implemented).
+const relayProblem = (p) => {
+  if (!Number.isInteger(p.taskCount) || !Array.isArray(p.openIds)) return 'no taskCount/openIds in the plan'
+  if (p.tasks.length !== p.taskCount) return `${p.tasks.length} of ${p.taskCount} tasks relayed`
+  const open = p.tasks.filter(t => !t.done).map(t => t.id).join(',')
+  return open === p.openIds.join(',') ? '' : `open tasks relayed as [${open}], the CLI found [${p.openIds.join(',')}]`
+}
+let planned = await cli('plan', planInput, PLAN, { label: 'plan' })
+if (planned.ok && relayProblem(planned.result)) {
+  log(`plan: ${relayProblem(planned.result)} - relaying again on ${M.worker}`)
+  const first = planned.result
+  // The baseline already ran in the first call: keep its result instead of running the suite again.
+  planned = await cli('plan', { ...planInput, baseline: false }, PLAN, { label: 'plan (relay retry)', model: M.worker })
+  if (planned.ok) Object.assign(planned.result, { baselinePass: first.baselinePass, baselineSummary: first.baselineSummary })
+  if (planned.ok && relayProblem(planned.result)) throw new Error(`tdd-flow: the plan was not relayed completely (${relayProblem(planned.result)}). Rerun, or pass {models: {light: "sonnet"}}.`)
+}
 if (!planned.ok && !planned.fallback) throw new Error(`tdd-flow: planning failed. ${planned.error}`)
 if (!planned.ok) log(`plan: ${planned.error} - using the planning agent`)
 const plan = planned.ok ? planned.result : await run(
@@ -152,6 +170,9 @@ if (opt.findings && opt.findings.length) {
     behaviours: opt.findings.map((f, i) => ({ ref: `F-${i + 1}`, text: typeof f === 'string' ? f : JSON.stringify(f) })) })
 }
 if (opt.maxTasks && tasks.length > opt.maxTasks) { log(`Limiting this run to ${opt.maxTasks} of ${tasks.length} open tasks`); tasks = tasks.slice(0, opt.maxTasks) }
+// A task this run implements must come with its criteria; with none, the cycle would do nothing and tick it.
+const empty = tasks.filter(t => t.id !== 'FIX' && !(t.behaviours && t.behaviours.length))
+if (empty.length) throw new Error(`tdd-flow: the plan has no criteria for ${empty.map(t => t.id).join(', ')}. Rerun; if it repeats, check the AC/EC ids of these tasks in tasks.md and spec.md.`)
 if (!tasks.length) {
   // Every task is ticked but the spec was never marked (e.g. finished before the status existed): mark it now.
   let specStatus = plan.status || null
@@ -159,7 +180,7 @@ if (!tasks.length) {
     const marked = await cli('commit', { message: `chore(${plan.slug}): mark spec implemented`, files: [`${dir}/spec.md`],
       specStatus: { file: `${dir}/spec.md`, value: 'implemented' } }, COMMIT, { label: 'mark implemented', phase: 'Review' })
     if (marked.ok && marked.result.specStatus === 'implemented') specStatus = 'implemented'
-    else log(`spec status not set to implemented - ${marked.ok ? marked.result.reason || 'nothing committed' : marked.error}`)
+    else log(`spec status not set to implemented - ${marked.ok ? marked.result.specStatusSkipped || marked.result.reason || 'nothing committed' : marked.error}`)
   }
   return { status: 'nothing_to_do', slug: plan.slug, branch: br.branch, specStatus, next: 'All tasks are ticked. Run /tdd-flow:document.' }
 }
@@ -178,7 +199,8 @@ async function blocked(task, step, details, untick = false, next = '') {
 // Only steps that fail twice reach the strong model. `attempts` holds every result, because an attempt that
 // did not succeed may still have changed files that belong to the task.
 let escalations = 0
-async function escalate(name, run, ok, feedback) {
+// `stop(r)`: a result that ends the ladder early without success (a further attempt would not help).
+async function escalate(name, run, ok, feedback, stop = null) {
   const ladder = [
     { model: M.worker, suffix: '' },
     { model: M.worker, suffix: ' retry' },
@@ -193,6 +215,7 @@ async function escalate(name, run, ok, feedback) {
     const r = await run(step.model, extra, name + step.suffix)
     if (r) attempts.push(r)
     if (r && ok(r)) return { ok: true, result: r, attempts, escalated: i === 2 }
+    if (r && stop && stop(r)) return { ok: false, result: r, attempts, stopped: true }
     if (r) last = r
   }
   return { ok: false, result: last, attempts }
@@ -204,9 +227,9 @@ const sameRef = (a, b) => refKey(a) === refKey(b)
 
 // RED then GREEN for a list of behaviours, in batches of BATCH. A separate test-writer writes every failing test of
 // the batch before the implementer changes production code. `structural` review findings go into the last GREEN call.
-// Returns {ok:true, files, greenRan, structuralDone} | {ok:false, step, details}
+// Returns {ok:true, files, greenRan, structuralDone, testFixes} | {ok:false, step, details}
 async function tddStep(task, items, structural = []) {
-  const files = []
+  const files = [], testFixes = []
   let greenRan = false, structuralDone = false
   for (let i = 0; i < items.length; i += BATCH) {
     const batch = items.slice(i, i + BATCH)
@@ -233,31 +256,64 @@ async function tddStep(task, items, structural = []) {
     // Each report carries the plan's ref from here on, whatever exact label the test-writer used.
     const reported = refs.map(ref => ({ ...reportFor(red.result, ref), ref }))
     reported.filter(t => t.result === 'PASS').forEach(t => log(`${task.id} ${t.ref}: test passed immediately - behaviour already exists`))
-    const failing = reported.filter(t => t.result === 'FAIL')
-    if (!failing.length) continue
+    if (!reported.some(t => t.result === 'FAIL')) continue
 
     // GREEN succeeds only if every listed test is reported passing and the full suite is green.
     const withStructural = isLastBatch && structural.length > 0
+    let failing = reported.filter(t => t.result === 'FAIL')
     const greenProblems = (r) => [
       ...failing.filter(t => !r.tests.some(x => sameRef(x.ref, t.ref) && x.pass)).map(t => `${t.ref}: ${t.testFile} :: ${t.testName} is not passing`),
       ...(r.suitePass ? [] : ['the full suite is failing']),
     ]
-    const green = await escalate(`${tag} GREEN`,
+    // The implementer reports a test it believes is wrong instead of editing it or bending production code to it.
+    const defectsIn = (r) => (r.testDefects || []).filter(d => failing.some(t => sameRef(t.ref, d.ref)))
+    const greenRun = (verdicts, stop) => escalate(`${tag} GREEN${verdicts ? ' (after test fix)' : ''}`,
       (model, extra, label) => run(
         `GREEN step. ${ctx}\nTask ${task.id}: ${task.title}\nFailing tests, in order:\n` +
-        failing.map(t => `- ${t.ref}: ${t.testFile} :: ${t.testName}\n  Failure: ${t.reason}\n  Behaviour: ${batch.find(b => b.ref === t.ref).text}`).join('\n') + '\n' +
+        failing.map(t => `- ${t.ref}: ${t.testFile} :: ${t.testName}\n  Failure: ${t.reason}\n  Behaviour: ${batch.find(b => sameRef(b.ref, t.ref)).text}`).join('\n') + '\n' +
         'Make them pass one at a time, in this order, with minimal code, running each single test as you go. Then refactor the code changed in this step and run the full suite.\n' +
         (withStructural ? `Also address these non-behavioural review findings without changing behaviour:\n${JSON.stringify(structural, null, 1)}\n` : '') +
+        (verdicts ? `The test-writer has reviewed the tests you reported as wrong; the tests on disk are now authoritative:\n${verdicts}\n`
+          : 'If a test itself is wrong (it contradicts the behaviour, a test helper is broken, it reads the wrong field), do not edit it and do not bend production code to it: report it in testDefects with its ref and the reason (file:line, what is wrong, what the behaviour says), and stop.\n') +
         `Append one entry per behaviour (RED + GREEN lines) and one REFACTOR line for ${task.id} to ${dir}/tdd-log.md. Report each test by ref.` + extra,
         { agentType: A('implementer'), model, schema: GREEN, label, phase: 'Implement' }),
       r => !greenProblems(r).length,
-      r => `Not done yet:\n${greenProblems(r).join('\n')}\n${r.failures || r.summary}\nThe work already done is on disk: inspect the current code first. Fix production code, never the tests.`)
+      r => `Not done yet:\n${greenProblems(r).join('\n')}\n${r.failures || r.summary}\nThe work already done is on disk: inspect the current code first. Fix production code, never the tests.`,
+      stop)
+    let green = await greenRun('', r => defectsIn(r).length > 0)
     files.push(...changedFiles(green.attempts))
-    if (!green.ok) return { ok: false, step: `GREEN ${refs.join(', ')}`, details: green.result ? greenProblems(green.result).join('\n') + '\n' + (green.result.failures || green.result.summary) : 'agent failed' }
+    if (green.stopped) {
+      // One test-fix round per batch: the test-writer fixes the named tests or confirms them, then GREEN runs again.
+      const defects = defectsIn(green.result).map(d => ({ ...d, test: failing.find(t => sameRef(t.ref, d.ref)) }))
+      log(`${tag}: implementer reports ${defects.length} wrong test(s) - ${defects.map(d => d.test.ref).join(', ')} back to the test-writer`)
+      const fixRefs = defects.map(d => d.test.ref)
+      const fixProblems = (r) => [
+        ...fixRefs.filter(ref => !reportFor(r, ref)).map(ref => `${ref}: no test reported`),
+        ...fixRefs.map(ref => reportFor(r, ref)).filter(t => t && t.result === 'ERROR').map(t => `${t.ref}: ${t.reason}`),
+      ]
+      const fix = await escalate(`${tag} TEST FIX`,
+        (model, extra, label) => run(
+          `TEST FIX step. ${ctx}\nTask ${task.id}: ${task.title}\nThe implementer reports these tests as wrong. Production code for them is already (partly) written; do not touch it.\n` +
+          defects.map(d => `- ${d.test.ref}: ${d.test.testFile} :: ${d.test.testName}\n  Reported defect: ${d.reason}\n  Behaviour: ${batch.find(b => sameRef(b.ref, d.test.ref)).text}`).join('\n') + '\n' +
+          'For each test, check the report against the behaviour and the code base. If the test (or a test helper it uses) is wrong, fix only that test code. Never weaken what the test asserts about the behaviour. ' +
+          'If the test is right, leave it unchanged. Run each test and report it (PASS or FAIL; ERROR only if it cannot run). Start each reason with "fixed: <what changed>" or "unchanged: <why the test is right>". ' +
+          `Append a "TEST FIX" entry per test to ${dir}/tdd-log.md: the reported defect, your verdict and the change.` + extra,
+          { agentType: A('test-writer'), model, schema: REDS, label, phase: 'Implement' }),
+        r => !fixProblems(r).length,
+        r => `Not done:\n${fixProblems(r).join('\n')}`)
+      fix.attempts.forEach(a => a.tests.forEach(t => t.testFile && files.push(t.testFile)))
+      if (!fix.ok) return { ok: false, step: `TEST FIX ${fixRefs.join(', ')}`, details: fix.result ? fixProblems(fix.result).join('\n') : 'agent failed' }
+      // The rewritten tests replace the old entries (names may have changed); a fixed test may already pass.
+      failing = failing.map(t => { const n = reportFor(fix.result, t.ref); return n && fixRefs.includes(t.ref) ? { ...t, ...n, ref: t.ref } : t })
+      fixRefs.forEach(ref => { const n = reportFor(fix.result, ref); testFixes.push(`${ref}: ${n.testFile} :: ${n.testName} - ${n.reason}`) })
+      green = await greenRun(fixRefs.map(ref => `- ${ref}: ${reportFor(fix.result, ref).reason}`).join('\n'))
+      files.push(...changedFiles(green.attempts))
+    }
+    if (!green.ok) return { ok: false, step: `GREEN ${refs.join(', ')}`, details: green.result ? [...greenProblems(green.result), ...defectsIn(green.result).map(d => `${d.ref}: reported as a wrong test - ${d.reason}`)].join('\n') + '\n' + (green.result.failures || green.result.summary) : 'agent failed' }
     greenRan = true
     if (withStructural) structuralDone = true
   }
-  return { ok: true, files, greenRan, structuralDone }
+  return { ok: true, files, greenRan, structuralDone, testFixes }
 }
 
 // Setup task (config/infrastructure, no red-green cycle): write the files, run the spec's verify commands.
@@ -327,6 +383,7 @@ try {
     current = task
     log(`${task.id}: ${task.title} (${isSetup ? 'setup task' : task.behaviours.length + ' behaviour(s)'})`)
     const taskFiles = new Set()
+    const testFixes = []
     if (isSetup) {
       const s = await setupStep(task)
       if (!s.ok) return await blocked(task, s.step, s.details)
@@ -335,6 +392,7 @@ try {
       const t = await tddStep(task, task.behaviours)
       if (!t.ok) return await blocked(task, t.step, t.details)
       t.files.forEach(f => taskFiles.add(f))
+      testFixes.push(...t.testFixes)
     }
 
     const scope = isSetup
@@ -348,6 +406,7 @@ try {
     for (let round = 1; round <= MAX_REVIEW_ROUNDS + 1; round++) {
       review = await run(
         `Review task ${task.id} (${task.title}). ${ctx}\nScope: uncommitted changes (\`git diff HEAD\` plus untracked files). ${scope}\n` +
+        (testFixes.length ? `These tests were changed by the test-writer after the implementer reported them as wrong, so they were never seen failing in that form. Check each still asserts its behaviour fully (no weakened or removed assertion); a weakened one is a blocker with behavioural=true:\n${testFixes.map(f => '- ' + f).join('\n')}\n` : '') +
         `Write your review to ${dir}/review.md (append a "## ${task.id} round ${round}" section). Mark each finding behavioural=true if fixing it changes observable behaviour (needs a test), false for structure/naming/style.`,
         { agentType: A('code-reviewer'), model: M.worker, schema: REVIEW, label: `${task.id} review ${round}`, phase: 'Review' })
       if (!review) return await blocked(task, 'REVIEW', 'reviewer agent failed')
@@ -375,6 +434,7 @@ try {
       const t = await tddStep(task, fixes, structural)
       if (!t.ok) return await blocked(task, t.step, t.details)
       t.files.forEach(f => taskFiles.add(f))
+      testFixes.push(...t.testFixes)
       // Structural findings not handled by a GREEN call, or failing tests that no GREEN call fixed, go to a REFACTOR fix.
       if ((structural.length && !t.structuralDone) || (!review.testsPass && !t.greenRan)) {
         const fx = await escalate(`${task.id} fix ${round}`,
@@ -414,7 +474,7 @@ try {
         `Tick ${task.id} in ${dir}/tasks.md by hand, then rerun /tdd-flow:tdd-implement to continue with the next task.`)
     }
     if (commit.unexpected && commit.unexpected.length) log(`${task.id}: not committed (unexpected): ${commit.unexpected.join(', ')}`)
-    if (finishesSpec && commit.specStatus !== 'implemented') log(`${task.id}: spec status not set to implemented - ${commit.reason || 'no "Status:" line in spec.md'}`)
+    if (finishesSpec && commit.specStatus !== 'implemented') log(`${task.id}: spec status not set to implemented - ${commit.specStatusSkipped || commit.reason || 'no "Status:" line in spec.md'}`)
     if (finishesSpec && commit.specStatus === 'implemented') specStatus = 'implemented'
     done.push({ task: task.id, title: task.title, commit: commit.sha || '' })
   }

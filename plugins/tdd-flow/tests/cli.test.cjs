@@ -223,7 +223,10 @@ test('commit with specStatus marks the spec implemented in the same commit', () 
   g('switch', '-q', '-c', 'feature/12-csv');
   write('a.js', 'x\n');
   const spec = '.tdd-flow/features/12-csv/spec.md';
-  const r = run(dir, 'commit', { message: 'feat(12-csv): T-20 Later', files: ['a.js', spec], specStatus: { file: spec, value: 'implemented' } });
+  const tasks = '.tdd-flow/features/12-csv/tasks.md';
+  write(tasks, TASKS.replace(/\[ \] T-(1|2) /g, '[x] T-$1 '));
+  const r = run(dir, 'commit', { message: 'feat(12-csv): T-20 Later', files: ['a.js', spec, tasks], tick: { file: tasks, task: 'T-20' },
+    specStatus: { file: spec, value: 'implemented' } });
   assert.strictEqual(r.result.committed, true);
   assert.strictEqual(r.result.specStatus, 'implemented');
   assert.match(read(spec), /Status: implemented/);
@@ -354,4 +357,32 @@ test('parseTasks and parseTaskTable read suffixed ids and do not split AC-2 from
   const t = parseTasks('- [ ] T-2 Migration V5 (AC-2a, AC-8b)\n- [ ] T-3 Other (AC-2)\n');
   assert.deepStrictEqual(t.map((x) => [x.id, x.title, x.refs.join(',')]), [['T-2', 'Migration V5', 'AC-2a,AC-8b'], ['T-3', 'Other', 'AC-2']]);
   assert.deepStrictEqual(parseTaskTable('| ID | Task | Kind | ACs |\n|---|---|---|---|\n| T-2 | M | tdd | AC-2a, EC-3b |\n')['T-2'].refs, ['AC-2a', 'EC-3b']);
+});
+
+test('commit does not mark the spec implemented while tasks.md has open tasks, but still commits', () => {
+  const { dir, g, read, write } = trackedRepo();
+  g('switch', '-q', '-c', 'feature/12-csv');
+  write('a.js', 'x\n');
+  const spec = '.tdd-flow/features/12-csv/spec.md';
+  const tasks = '.tdd-flow/features/12-csv/tasks.md';
+  const r = run(dir, 'commit', { message: 'feat(12-csv): T-1', files: ['a.js', spec, tasks], tick: { file: tasks, task: 'T-1' },
+    specStatus: { file: spec, value: 'implemented' } });
+  assert.strictEqual(r.result.committed, true);
+  assert.strictEqual(r.result.specStatus, undefined);
+  assert.match(r.result.specStatusSkipped, /2 task\(s\) still open in tasks.md \(T-2, T-20\)/);
+  assert.match(read(spec), /Status: approved/);
+});
+
+test('plan gives criteria only to the tasks the run reaches and reports taskCount and openIds', () => {
+  const { dir, write } = repo();
+  write('.tdd-flow/features/12-csv/tasks.md', TASKS.replace('[ ] T-1 ', '[x] T-1 '));
+  const one = run(dir, 'plan', { maxTasks: 1 }).result;
+  assert.strictEqual(one.taskCount, 3);
+  assert.deepStrictEqual(one.openIds, ['T-2', 'T-20']);
+  assert.deepStrictEqual(one.tasks.map((t) => t.behaviours.length), [0, 2, 0]);
+  assert.strictEqual(one.tasks[0].verify, undefined);
+  const from = run(dir, 'plan', { maxTasks: 1, fromTask: 'T-20' }).result;
+  assert.deepStrictEqual(from.tasks.map((t) => t.behaviours.length), [0, 0, 1]);
+  const all = run(dir, 'plan', {}).result;
+  assert.deepStrictEqual(all.tasks.map((t) => t.behaviours.length), [0, 2, 1]);
 });

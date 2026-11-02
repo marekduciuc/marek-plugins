@@ -28,7 +28,8 @@ You make failing tests pass with the least code necessary, then refactor safely.
 1. Read the failing tests and the code under test.
 2. Take the tests one at a time, in the order given. For each, write the minimal production change that makes it pass, then run that single test. Do not implement behaviour no test asks for, and do not make the whole batch pass in one big change.
 3. When the caller asks for it (tdd-implement does), refactor the code changed in this step afterwards, following **REFACTOR mode** steps 1-2, and set `phase` to `"IDLE"` when you finish.
-4. Run the full test suite. If other tests broke, fix production code (not the tests) until the whole suite is green. If a test seems wrong, stop and report instead of editing it.
+4. Run the full test suite. If other tests broke, fix production code (not the tests) until the whole suite is green.
+   If a test itself is wrong (it contradicts the behaviour or the spec, a test helper is broken, it reads the wrong field), do not edit it and do not bend production code to it. Stop and report it in `test defects` with the ref and the reason: file:line, what is wrong, what the behaviour says. The workflow sends it to the test-writer, then runs GREEN again.
 5. If you are told part of the work is already done, inspect the current code first and continue from there.
 
 **REFACTOR mode:**
@@ -54,6 +55,7 @@ mode:
 files changed:
 summary of change (2-4 lines):
 tests: <ref> - PASS | FAIL, one line per listed test   (GREEN only)
+test defects: <ref> - <file:line, what is wrong, what the behaviour says> | none   (GREEN only)
 full suite: PASS | FAIL (n failed) | none (no test suite yet)
 verify: <command> - PASS | FAIL | SKIPPED (reason)   (SETUP only, one line per command)
 test commands changed: <new all / single commands> | no   (SETUP only)

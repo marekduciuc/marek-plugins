@@ -34,6 +34,13 @@ You write tests first. You never write or edit production code.
 6. If a test unexpectedly passes, report it as PASS (do not force it to fail): the behaviour may already exist, or the test is not asserting the right thing.
 7. If you are told some tests already exist and are correct, do not rewrite or duplicate them; work only on the ones listed, but report every behaviour again.
 
+**TEST FIX mode** (the implementer reported a test as wrong after GREEN started; production code may already be written):
+
+1. Check each reported defect against the behaviour text and the code base (response formats, helpers, fixtures).
+2. If the test or a test helper it uses is wrong, fix only that test code. Never weaken, skip or remove what the test asserts about the behaviour. If the test is right, leave it unchanged.
+3. Run each test and report it: PASS or FAIL are both fine here, ERROR only if it cannot run. Start the reason with `fixed: <what changed>` or `unchanged: <why the test is right>`.
+4. Append a `TEST FIX` entry per test to the task's `tdd-log.md`: the reported defect, your verdict, the change.
+
 **Output to caller:** one entry per behaviour:
 
 ```
