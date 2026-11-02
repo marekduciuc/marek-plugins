@@ -40,7 +40,7 @@ const PLAN = {
   type: 'object',
   required: ['slug', 'approved', 'testAll', 'testSingle', 'baselinePass', 'tasks'],
   properties: {
-    slug: str, approved: { type: 'boolean' },
+    slug: str, status: str, approved: { type: 'boolean' },
     testAll: str, testSingle: str, lint: str, testPattern: str,
     baselinePass: { type: 'boolean' }, baselineSummary: str, noTestSuite: { type: 'boolean' },
     tasks: { type: 'array', items: { type: 'object', required: ['id', 'title', 'done', 'behaviours'], properties: {
@@ -92,7 +92,7 @@ const REVIEW = {
   },
 }
 const BRANCH = { type: 'object', required: ['branch'], properties: { branch: str } }
-const COMMIT = { type: 'object', required: ['committed'], properties: { committed: { type: 'boolean' }, nothingToCommit: { type: 'boolean' }, ticked: { type: 'boolean' }, sha: str, reason: str, unexpected: strs } }
+const COMMIT = { type: 'object', required: ['committed'], properties: { committed: { type: 'boolean' }, nothingToCommit: { type: 'boolean' }, ticked: { type: 'boolean' }, specStatus: str, sha: str, reason: str, unexpected: strs } }
 const BLOCK = { type: 'object', required: ['logged'], properties: { logged: { type: 'boolean' }, unticked: { type: 'boolean' } } }
 
 // Deterministic steps run in the plugin's CLI (bin/tdd-flow) through the script-runner agent (haiku, Bash only)
@@ -152,7 +152,17 @@ if (opt.findings && opt.findings.length) {
     behaviours: opt.findings.map((f, i) => ({ ref: `F-${i + 1}`, text: typeof f === 'string' ? f : JSON.stringify(f) })) })
 }
 if (opt.maxTasks && tasks.length > opt.maxTasks) { log(`Limiting this run to ${opt.maxTasks} of ${tasks.length} open tasks`); tasks = tasks.slice(0, opt.maxTasks) }
-if (!tasks.length) return { status: 'nothing_to_do', slug: plan.slug, next: 'All tasks are ticked. Run /tdd-flow:document.' }
+if (!tasks.length) {
+  // Every task is ticked but the spec was never marked (e.g. finished before the status existed): mark it now.
+  let specStatus = plan.status || null
+  if (plan.status === 'approved' && !allOpen.length) {
+    const marked = await cli('commit', { message: `chore(${plan.slug}): mark spec implemented`, files: [`${dir}/spec.md`],
+      specStatus: { file: `${dir}/spec.md`, value: 'implemented' } }, COMMIT, { label: 'mark implemented', phase: 'Review' })
+    if (marked.ok && marked.result.specStatus === 'implemented') specStatus = 'implemented'
+    else log(`spec status not set to implemented - ${marked.ok ? marked.result.reason || 'nothing committed' : marked.error}`)
+  }
+  return { status: 'nothing_to_do', slug: plan.slug, branch: br.branch, specStatus, next: 'All tasks are ticked. Run /tdd-flow:document.' }
+}
 log(`${tasks.length} task(s) to implement on ${br.branch}`)
 
 // ---------- helpers ----------
@@ -291,6 +301,7 @@ async function setupStep(task, findings = null) {
 // ---------- Implement + Review, task by task (sequential: one working tree) ----------
 const done = []
 let current = null
+let specStatus = plan.status || null
 try {
   for (const task of tasks) {
     const isSetup = task.kind === 'setup'
@@ -375,15 +386,18 @@ try {
     // Closing the task (tick + state) is bookkeeping done by the commit agent before staging, so it lands in the same commit.
     const next = task.id === 'FIX' ? allOpen[0] : allOpen[allOpen.findIndex(t => t.id === task.id) + 1]
     const needsTick = task.id !== 'FIX'
+    // The commit that closes the last open task of the spec (not only of this run) also sets "Status: implemented".
+    const finishesSpec = needsTick && allOpen.every(t => t.id === task.id || done.some(d => d.task === t.id))
     const state = { feature: plan.slug, phase: 'IDLE', task: next ? next.id : 'DONE' }
     const commitFiles = [...new Set([...taskFiles, `${dir}/tasks.md`, `${dir}/tdd-log.md`, `${dir}/review.md`, '.tdd-flow/state.json',
-      ...(isSetup ? ['.tdd-flow/stack.md'] : [])])]
+      ...(isSetup ? ['.tdd-flow/stack.md'] : []), ...(finishesSpec ? [`${dir}/spec.md`] : [])])]
     const type = task.id === 'FIX' ? 'fix' : isSetup ? 'chore' : 'feat'
     // The CLI ticks the task line (T-1 never matches T-10), writes state.json, stages only these files, refuses
     // secrets and files over 5 MB, and commits. It never pushes.
     const committed = await cli('commit', {
       message: `${type}(${plan.slug}): ${task.id} ${task.title}`, files: commitFiles, state,
       tick: needsTick ? { file: `${dir}/tasks.md`, task: task.id } : null,
+      specStatus: finishesSpec ? { file: `${dir}/spec.md`, value: 'implemented' } : null,
     }, COMMIT, { label: `${task.id} commit`, phase: 'Review' })
     const commit = committed.ok ? committed.result : null
     if (!commit || (!commit.committed && !commit.nothingToCommit)) {
@@ -394,6 +408,8 @@ try {
         `Tick ${task.id} in ${dir}/tasks.md by hand, then rerun /tdd-flow:tdd-implement to continue with the next task.`)
     }
     if (commit.unexpected && commit.unexpected.length) log(`${task.id}: not committed (unexpected): ${commit.unexpected.join(', ')}`)
+    if (finishesSpec && commit.specStatus !== 'implemented') log(`${task.id}: spec status not set to implemented - ${commit.reason || 'no "Status:" line in spec.md'}`)
+    if (finishesSpec && commit.specStatus === 'implemented') specStatus = 'implemented'
     done.push({ task: task.id, title: task.title, commit: commit.sha || '' })
   }
 } catch (e) {
@@ -407,6 +423,7 @@ return {
   status: 'implemented',
   slug: plan.slug,
   branch: br.branch,
+  specStatus,
   tasksCompleted: done,
   escalationsToStrongModel: escalations,
   unverified: [...unverified.values()],
