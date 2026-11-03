@@ -26,7 +26,7 @@ Personal Claude Code plugin: an end-to-end dev pipeline built on **dynamic workf
 
 ### Spec status
 
-`spec.md` has a `Status:` line: `draft` → `approved` (you, at Gate 1) → `implemented` (tdd-implement, in the commit that closes the last open task) → `done` (`deploy` merge mode, at close-out). tdd-implement also accepts an `implemented` spec, so a review-fix run (`{findings}`) works after the spec is finished. If every task is ticked but the spec still says `approved`, tdd-implement marks it `implemented` in a separate commit. Without the merge mode of `deploy`, the base branch keeps `implemented` after the PR is merged.
+`spec.md` has a `Status:` line: `draft` → `approved` (you, at Gate 1) → `implemented` (tdd-implement, in the commit that closes the last open task; the CLI sets it only when `tasks.md` really has no open task left) → `done` (`deploy` merge mode, at close-out). tdd-implement also accepts an `implemented` spec, so a review-fix run (`{findings}`) works after the spec is finished. If every task is ticked but the spec still says `approved`, tdd-implement marks it `implemented` in a separate commit. Without the merge mode of `deploy`, the base branch keeps `implemented` after the PR is merged.
 
 ### Setup tasks (no TDD)
 
@@ -57,7 +57,7 @@ Each workflow returns `{status, ..., next}`. If a coding step still fails after 
 | Command | Used by | Does |
 |---|---|---|
 | `context` | analyze-requirements | Reads an existing `.tdd-flow/stack.md`; fetches a GitHub issue (`gh issue view`) or reads a spec file. Text input needs no fetch. |
-| `plan` | tdd-implement | Parses `spec.md` and `tasks.md` (tasks, behaviours, verify commands, approval) and runs the baseline suite |
+| `plan` | tdd-implement | Parses `spec.md` and `tasks.md` (tasks, behaviours, verify commands, approval) and runs the baseline suite. Criteria text only for the tasks the run reaches (`maxTasks`, `fromTask`); returns `taskCount` and `openIds`, which the workflow checks against the relayed plan (one retry on Sonnet, then it stops) |
 | `branch` | tdd-implement | Switches to or creates `feature/<slug>` |
 | `commit` | tdd-implement, document | Optionally sets the spec status (`specStatus`), ticks the task line (`T-1` never matches `T-10`), writes `state.json`, stages only the listed files, refuses secret-looking content, secret files and files over 5 MB (plus gitleaks on the staged changes when installed), commits. Never pushes. |
 | `block` | tdd-implement | Records a stop: `state.json` phase `IDLE`, an entry in `tdd-log.md`, optional untick |
@@ -80,7 +80,7 @@ Self-check: `node --test plugins/tdd-flow/tests/` from the repo root.
 
 1. `tdd-flow specs` selects the specs (see the CLI table) and shows why the others are skipped.
 2. For each spec, at most N at a time (`--parallel N`, default 3): `tdd-flow worktree` creates `.claude/worktrees/<slug>` on `feature/<slug>`, and `claude --bg -n <name> "/tdd-flow:implement-spec <slug> <base>"` starts a background session there. `<name>` is a 3-word kebab-case summary of the spec (e.g. `invitation-password-reset`), so you watch it with `claude attach invitation-password-reset`.
-3. `implement-spec`, in that session: one `tdd-implement {maxTasks: 1}` run per task, in `tasks.md` order (a task that hits `agent_limit` gets one more run) → `superpowers:requesting-code-review` over the branch (falls back to the `code-reviewer` agent without superpowers) → Critical and Important findings go through one `tdd-implement {findings}` run, with no second review → `git push` (push-gate runs the checks) → `gh pr create` with goal, ACs, tasks, review findings (Minor ones listed) and unverified checks. It ends with `tdd-flow run-report`.
+3. `implement-spec`, in that session: installs JavaScript dependencies the fresh worktree lacks (frozen install per tracked lockfile: `npm ci`, `pnpm install --frozen-lockfile`, `yarn install --immutable`/`--frozen-lockfile`, `bun install --frozen-lockfile`) → one `tdd-implement {maxTasks: 1}` run per task, in `tasks.md` order (a task that hits `agent_limit` gets one more run) → `superpowers:requesting-code-review` over the branch (falls back to the `code-reviewer` agent without superpowers) → Critical and Important findings go through one `tdd-implement {findings}` run, with no second review → `git push` (push-gate runs the checks) → `gh pr create` with goal, ACs, tasks, review findings (Minor ones listed) and unverified checks. It ends with `tdd-flow run-report`.
 4. `tdd-flow runs-wait`, in a background Bash call, waits for results. The autopilot then starts the next queued spec and finally prints a table: PR URL, or why a spec is blocked or stalled, and `claude attach <name>` for those.
 
 **Requirements**
@@ -138,7 +138,9 @@ Workflows set the model on each call, so each step uses the cheapest model that 
 | CLI steps through `script-runner` (spec parsing, branch, commits, preflight, CI polling, close-out), stack detection, fetching non-GitHub issues | **Haiku** (light) |
 | Classifying a failed CI check from its log | **Sonnet** (worker), low effort |
 
-**Escalation ladder** for every coding step: Sonnet, then Sonnet again with the failure output, then Opus with the failure output. Only if all three fail does the workflow stop with `status: "blocked"`. `tdd-implement` reports `escalationsToStrongModel`, so you can see how often Opus was needed.
+**Escalation ladder** for every coding step: Sonnet, then Sonnet again with the failure output, then Opus with the failure output. Only if all three fail does the workflow stop with `status: "blocked"`.
+
+**Wrong tests:** if the implementer finds that a test itself is wrong (a broken helper, a wrong field), it reports `testDefects` instead of bending production code. The ladder stops, the test-writer fixes the test or confirms it (once per batch, logged in `tdd-log.md`), GREEN runs again, and the task review checks that the changed tests were not weakened. `tdd-implement` reports `escalationsToStrongModel`, so you can see how often Opus was needed.
 
 Override per run with `args.models`, e.g. `{feature: "x", models: {worker: "opus"}}` for a hard feature, or `{models: {strong: "sonnet"}}` for the cheapest run.
 

@@ -24,6 +24,17 @@ TDD_FLOW_JSON
 
 `git branch --show-current` must be `feature/<slug>` and the current directory must be a worktree (`git rev-parse --git-dir` differs from `git rev-parse --git-common-dir`). Otherwise report blocked ("not in the spec's worktree") and stop.
 
+A new worktree has no installed dependencies. For JavaScript, install them for each directory that has a tracked lockfile (`git ls-files '*package-lock.json' '*pnpm-lock.yaml' '*yarn.lock' '*bun.lock' '*bun.lockb'`) and no `node_modules`, using the frozen command for its lockfile:
+
+| Lockfile | Command |
+|---|---|
+| `package-lock.json` | `npm ci` |
+| `pnpm-lock.yaml` | `pnpm install --frozen-lockfile` |
+| `yarn.lock` | `yarn install --immutable` if the repo has `.yarnrc.yml` (Yarn 2+), else `yarn install --frozen-lockfile` |
+| `bun.lock` / `bun.lockb` | `bun install --frozen-lockfile` |
+
+In a workspace monorepo, run it once at the root that holds the lockfile. If a frozen install fails, report blocked with its output; never fall back to a command that rewrites the lockfile (`npm install`). Other stacks: if `.tdd-flow/stack.md` or the README names a setup step that creates a local environment (a Python virtualenv, `bundle install`), run it the same way. Build tools that fetch dependencies themselves (Maven, Gradle, Cargo, Go) need nothing.
+
 ## 1. Implement the tasks, one workflow run per task
 
 Tasks run in order, each in its own `tdd-implement` run, so each task gets the full agent budget and a failure stops at that task. Loop:

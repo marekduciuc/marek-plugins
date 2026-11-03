@@ -67,7 +67,7 @@ async function cli(cmd, input, schema, o = {}) {
     `Run with the Bash tool (timeout 600000):\n\ntdd-flow ${cmd} <<'TDD_FLOW_JSON'\n${JSON.stringify(input)}\nTDD_FLOW_JSON\n\n` +
     (o.repeat ? `While the printed JSON has "again": true, run the identical command again (at most ${o.repeat} runs).\n` : '') +
     'Return the printed JSON object as your structured output.',
-    { agentType: A('script-runner'), model: M.light, effort: 'low', schema: cliSchema(schema), label: o.label || cmd, phase: o.phase, ...(o.stallMs ? { stallMs: o.stallMs } : {}) },
+    { agentType: A('script-runner'), model: o.model || M.light, effort: 'low', schema: cliSchema(schema), label: o.label || cmd, phase: o.phase, ...(o.stallMs ? { stallMs: o.stallMs } : {}) },
     o.final)
   if (!r) return { ok: false, error: 'script-runner agent failed' }
   return r.ok && !r.result ? { ok: false, error: 'the command returned no result' } : r

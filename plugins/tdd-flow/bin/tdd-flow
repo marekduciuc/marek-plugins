@@ -235,6 +235,13 @@ function parseTasks(md) {
   return out;
 }
 
+/** Ids of the unticked tasks in the tasks.md next to a spec file; a missing tasks.md counts as one open entry. */
+function openTasksNextTo(specFile) {
+  const md = read(path.join(path.dirname(specFile), 'tasks.md'));
+  if (md == null) return ['tasks.md missing'];
+  return parseTasks(md).filter((t) => !t.done).map((t) => t.id);
+}
+
 const taskLine = (id) => new RegExp(`^([ \\t]*[-*][ \\t]*\\[)([ xX])(\\][ \\t]*\\**${esc(id)}(?![0-9]))`, 'm');
 
 // ---------- commands ----------
@@ -249,7 +256,16 @@ async function plan(inp) {
   const s = parseSpec(spec);
   const table = parseTaskTable(spec);
   const problems = [];
-  const tasks = parseTasks(tasksMd).map((t) => {
+  const parsed = parseTasks(tasksMd);
+  // Only the tasks this run can reach get their criteria text (same selection as tdd-implement, never fewer): a
+  // full plan of a long spec is too big to relay reliably. Other tasks keep id, title, done and kind.
+  const open = parsed.filter((t) => !t.done);
+  const from = inp.fromTask ? open.findIndex((t) => t.id === inp.fromTask) : -1;
+  let reach = from > 0 ? open.slice(from) : open;
+  const max = Number.isInteger(inp.maxTasks) && inp.maxTasks > 0 ? inp.maxTasks : 0;
+  if (max) reach = reach.slice(0, max);
+  const detailed = new Set(reach.map((t) => t.id));
+  const tasks = parsed.map((t) => {
     const row = table[t.id];
     const refs = t.refs.length ? t.refs : row ? row.refs : [];
     const kind = t.kind === 'setup' || (row && row.kind === 'setup') ? 'setup' : 'tdd';
@@ -259,8 +275,8 @@ async function plan(inp) {
       return { ref, text: s.crit[ref] ? s.text(s.crit[ref]) : '' };
     });
     refs.filter((ref) => s.crit[ref] && !s.crit[ref].parts.length).forEach((ref) => problems.push(`${t.id}: ${ref} has no Given/When/Then lines`));
-    const task = { id: t.id, title: t.title, done: t.done, kind, behaviours };
-    if (kind === 'setup') task.verify = refs.flatMap((ref) => (s.crit[ref] ? s.crit[ref].verify : []).map((v) => ({ ref, ...v })));
+    const task = { id: t.id, title: t.title, done: t.done, kind, behaviours: detailed.has(t.id) ? behaviours : [] };
+    if (kind === 'setup' && detailed.has(t.id)) task.verify = refs.flatMap((ref) => (s.crit[ref] ? s.crit[ref].verify : []).map((v) => ({ ref, ...v })));
     return task;
   });
   if (!tasks.length) problems.push('no "- [ ] T-n ..." lines in tasks.md');
@@ -272,6 +288,8 @@ async function plan(inp) {
     slug, status: s.status, approved: s.status === 'approved' || s.status === 'implemented', testAll: noTestSuite ? 'none' : stack.testAll,
     testSingle: noTestSuite || none(stack.testSingle) ? 'none' : stack.testSingle, noTestSuite,
     baselinePass: true, baselineSummary: noTestSuite ? 'no test suite' : 'not run', tasks,
+    // Integrity check for the relay: the workflow compares these with the task list it received.
+    taskCount: tasks.length, openIds: open.map((t) => t.id),
   };
   if (!none(stack.lint)) res.lint = stack.lint;
   if (!noTestSuite && inp.baseline !== false && res.approved && tasks.some((t) => !t.done)) {
@@ -359,8 +377,11 @@ async function commit(inp) {
     }
   }
   if (inp.state) writeJSON(inp.state.file || STATE, inp.state.json || inp.state);
-  let specStatus;
-  if (inp.specStatus) {
+  let specStatus, specStatusSkipped;
+  // "implemented" only when tasks.md (next to spec.md) really has no open task left, whatever the caller believes.
+  const openLeft = inp.specStatus && inp.specStatus.value === 'implemented' ? openTasksNextTo(inp.specStatus.file) : null;
+  if (openLeft && openLeft.length) specStatusSkipped = `not set to implemented: ${openLeft.length} task(s) still open in tasks.md (${openLeft.slice(0, 5).join(', ')})`;
+  if (inp.specStatus && !specStatusSkipped) {
     if (!setSpecStatus(inp.specStatus.file, inp.specStatus.value)) return { committed: false, ticked, reason: `no "Status:" line in ${inp.specStatus.file}` };
     specStatus = inp.specStatus.value;
   }
@@ -386,7 +407,8 @@ async function commit(inp) {
     .map((l) => l.slice(3).replace(/^.* -> /, '').replace(/^"|"$/g, ''))
     .filter((p) => !staged.includes(p) && !stage.includes(p));
   // An ignored .tdd-flow/ is never staged: the spec status then lives only in the file, which is still reported.
-  if (!staged.length) return { committed: false, nothingToCommit: true, ticked, unexpected, ...(specStatus ? { specStatus } : {}) };
+  const status = { ...(specStatus ? { specStatus } : {}), ...(specStatusSkipped ? { specStatusSkipped } : {}) };
+  if (!staged.length) return { committed: false, nothingToCommit: true, ticked, unexpected, ...status };
   const bad = riskyStaged(staged);
   if (bad.length) {
     const own = bad.map((b) => b.path).filter((p) => staged.includes(p));
@@ -395,9 +417,7 @@ async function commit(inp) {
   }
   const c = exec('git', ['commit', '-F', '-', '--', ...staged], inp.message + '\n');
   if (c.code !== 0) return { committed: false, ticked, unexpected, reason: `git commit failed: ${(c.err || c.out).split('\n').slice(-15).join('\n')}` };
-  const res = { committed: true, ticked, sha: gitOut('rev-parse', '--short', 'HEAD'), unexpected };
-  if (specStatus) res.specStatus = specStatus;
-  return res;
+  return { committed: true, ticked, sha: gitOut('rev-parse', '--short', 'HEAD'), unexpected, ...status };
 }
 
 function closeOut(inp) {
