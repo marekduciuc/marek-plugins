@@ -57,7 +57,7 @@ Each workflow returns `{status, ..., next}`. If a coding step still fails after 
 | Command | Used by | Does |
 |---|---|---|
 | `context` | analyze-requirements | Reads an existing `.tdd-flow/stack.md`; fetches a GitHub issue (`gh issue view`) or reads a spec file. Text input needs no fetch. |
-| `plan` | tdd-implement | Parses `spec.md` and `tasks.md` (tasks, behaviours, verify commands, approval) and runs the baseline suite. Criteria text only for the tasks the run reaches (`maxTasks`, `fromTask`); returns `taskCount` and `openIds`, which the workflow checks against the relayed plan (one retry on Sonnet, then it stops) |
+| `plan` | tdd-implement | Parses `spec.md` and `tasks.md` (tasks, behaviours, verify commands, approval) and runs the baseline suite. Criteria text only for the tasks the run reaches (`maxTasks`, `fromTask`); returns `taskCount` and `openIds`, which the workflow checks against the relayed plan |
 | `branch` | tdd-implement | Switches to or creates `feature/<slug>` |
 | `commit` | tdd-implement, document | Optionally sets the spec status (`specStatus`), ticks the task line (`T-1` never matches `T-10`), writes `state.json`, stages only the listed files, refuses secret-looking content, secret files and files over 5 MB (plus gitleaks on the staged changes when installed), commits. Never pushes. |
 | `block` | tdd-implement | Records a stop: `state.json` phase `IDLE`, an entry in `tdd-log.md`, optional untick |
@@ -66,6 +66,7 @@ Each workflow returns `{status, ..., next}`. If a coding step still fails after 
 | `ci-rerun`, `add-secret-scan`, `close-out` | deploy | Rerun failed jobs; add the gitleaks workflow; mark the spec done and reset `state.json` |
 | `specs` | autopilot | Checks that `.tdd-flow/` is in git and `state.json` is not; lists the specs to start, with their title (status `approved` on `feature/<slug>` or, without that branch, on the base; committed, no local changes, no session running, not blocked last time unless named) and why the others are skipped |
 | `worktree` | autopilot | Creates or reuses `.claude/worktrees/<slug>` on `feature/<slug>`; adds `/.claude/worktrees/` and `/.tdd-flow/state.json` to `.git/info/exclude` |
+| `replay` | every workflow | Prints the saved output of an earlier call again (see the relay check below), without running the command a second time |
 | `run-report` | autopilot, implement-spec | Writes a run result (`running` / `done` / `blocked`, session id, PR URL, details) to `<git common dir>/tdd-flow/runs/<slug>.json`, shared by all worktrees and never committed |
 | `runs-wait` | autopilot | Blocks until one of the given runs is `done` or `blocked`, or its session is idle or gone without a report (`stalled`); reads `claude agents --json --all` |
 | `test [-- <command>]` | test-writer, implementer, code-reviewer | Runs the suite from `stack.md` (or the given command) and prints PASS/FAIL, the exit code and only the tail of a failure |
@@ -140,7 +141,9 @@ Workflows set the model on each call, so each step uses the cheapest model that 
 
 **Escalation ladder** for every coding step: Sonnet, then Sonnet again with the failure output, then Opus with the failure output. Only if all three fail does the workflow stop with `status: "blocked"`.
 
-**Wrong tests:** if the implementer finds that a test itself is wrong (a broken helper, a wrong field), it reports `testDefects` instead of bending production code. The ladder stops, the test-writer fixes the test or confirms it (once per batch, logged in `tdd-log.md`), GREEN runs again, and the task review checks that the changed tests were not weakened. `tdd-implement` reports `escalationsToStrongModel`, so you can see how often Opus was needed.
+**Wrong tests:** if the implementer finds that a test itself is wrong (a broken helper, a wrong field), it reports `testDefects` instead of bending production code. The ladder stops, and the test-writer fixes the test or keeps it (once per batch, logged in `tdd-log.md`). A test it keeps goes to an arbiter (the code-reviewer on Opus, read-only), with the behaviour text as the authority. If the arbiter finds the test wrong, the test-writer fixes it on Opus as described; if it confirms the test, the implementer is told so. GREEN then runs again, and the task review checks that the changed tests were not weakened.
+
+**Relay check:** the script-runner retypes the CLI's JSON and can drop array items. Every CLI output carries `shape` (the size of each array in the result). The workflow recomputes it from what it received, over the paths of the step's schema (`plan` also checks `taskCount` and `openIds`). On a mismatch, Sonnet relays the saved output again (`tdd-flow replay`; the command does not run twice); if it is still wrong, the step fails. The saved outputs are in `<git dir>/tdd-flow/relay/`, per worktree. `tdd-implement` reports `escalationsToStrongModel`, so you can see how often Opus was needed.
 
 Override per run with `args.models`, e.g. `{feature: "x", models: {worker: "opus"}}` for a hard feature, or `{models: {strong: "sonnet"}}` for the cheapest run.
 
