@@ -8,6 +8,7 @@
 //   tdd-flow <command> <<'TDD_FLOW_JSON'      JSON input on stdin, prints {"ok":true,"result":{...}}
 //   {...}                                     or {"ok":false,"error":"...","fallback":true?}
 //   TDD_FLOW_JSON
+//   tdd-flow replay <<< '{"id":"..."}'      prints the saved output of an earlier call with "_relay": "<id>" again
 //   tdd-flow test [-- <command>]              runs the tests (default: stack.md "test command (all)")
 //                                             and prints only the exit code and the failure tail
 //
@@ -788,6 +789,34 @@ async function runsWait(inp) {
   }
 }
 
+// ---------- relay check ----------
+// The workflows relay this JSON through an agent, which can drop array items. Every output carries `shape`, the
+// size of each non-empty array in the result ("tasks=3 tasks.1.behaviours=2"); the workflow's cli() helper
+// recomputes it from what it received (same function there) and replays the saved output on a mismatch.
+function shapeOf(v, p = '', out = []) {
+  if (Array.isArray(v)) {
+    if (v.length) out.push(`${p}=${v.length}`);
+    v.forEach((x, i) => shapeOf(x, p ? `${p}.${i}` : `${i}`, out));
+  } else if (v && typeof v === 'object') {
+    for (const k of Object.keys(v)) shapeOf(v[k], p ? `${p}.${k}` : k, out);
+  }
+  return out;
+}
+const relayFile = (id) => {
+  if (!/^[\w.-]{1,80}$/.test(String(id || ''))) return null;
+  const r = git('rev-parse', '--absolute-git-dir');
+  return r.code === 0 && r.out.trim() ? path.join(r.out.trim(), 'tdd-flow', 'relay', `${id}.json`) : null;
+};
+/** Saves a printed output for `replay`; best effort, a failure never fails the command. */
+function saveRelay(id, text) {
+  try {
+    const f = relayFile(id);
+    if (!f) return;
+    fs.mkdirSync(path.dirname(f), { recursive: true });
+    fs.writeFileSync(f, text);
+  } catch { /* replay then reports that nothing was saved */ }
+}
+
 const COMMANDS = {
   plan, branch, block, commit, 'close-out': closeOut, 'add-secret-scan': addSecretScan, preflight,
   'ci-watch': ciWatch, 'ci-rerun': ciRerun, context, specs, worktree, 'run-report': runReport, 'runs-wait': runsWait,
@@ -806,26 +835,37 @@ async function main(argv) {
     process.stdout.write(`${t.pass ? 'PASS' : 'FAIL'} (exit ${t.timedOut ? 'timeout' : t.exitCode}) \`${command}\`\n${t.summary}\n`);
     return t.pass ? 0 : 1;
   }
-  const fn = COMMANDS[cmd];
   const print = (o) => process.stdout.write(JSON.stringify(o) + '\n');
-  if (!fn) { print({ ok: false, error: `unknown command "${cmd}". Commands: test, ${Object.keys(COMMANDS).join(', ')}` }); return 2; }
   let input = {};
   try {
     const raw = process.stdin.isTTY ? '' : fs.readFileSync(0, 'utf8').trim();
     if (raw) input = JSON.parse(raw);
-  } catch (e) { print({ ok: false, error: `input is not valid JSON: ${e.message}` }); return 2; }
+  } catch (e) { print({ ok: false, shape: '', error: `input is not valid JSON: ${e.message}` }); return 2; }
+  if (cmd === 'replay') {
+    const f = relayFile(input.id);
+    const saved = f && read(f);
+    if (saved == null) { print({ ok: false, shape: '', error: `no saved output for "${input.id}"` }); return 1; }
+    process.stdout.write(saved);
+    return 0;
+  }
+  const relay = input._relay;
+  delete input._relay;
+  const fn = COMMANDS[cmd];
+  const out = (o) => { const text = JSON.stringify(o) + '\n'; process.stdout.write(text); if (relay) saveRelay(relay, text); };
+  if (!fn) { out({ ok: false, shape: '', error: `unknown command "${cmd}". Commands: test, replay, ${Object.keys(COMMANDS).join(', ')}` }); return 2; }
   try {
     const result = await fn(input);
     const again = result && result.again;
     if (again) delete result.again;
-    print(again ? { ok: true, again: true, result } : { ok: true, result });
+    const shape = shapeOf(result).join(' ');
+    out(again ? { ok: true, again: true, shape, result } : { ok: true, shape, result });
     return 0;
   } catch (e) {
-    print(e instanceof Fallback ? { ok: false, fallback: true, error: e.message } : { ok: false, error: e.message });
+    out(e instanceof Fallback ? { ok: false, fallback: true, shape: '', error: e.message } : { ok: false, shape: '', error: e.message });
     return 1;
   }
 }
 
 if (require.main === module) main(process.argv.slice(2)).then((code) => { process.exitCode = code; });
 
-module.exports = { main, parseSpec, parseTasks, parseTaskTable, readStack, compact, kebab, onMergeSummary, taskLine, setSpecStatus, COMMANDS };
+module.exports = { main, shapeOf, parseSpec, parseTasks, parseTaskTable, readStack, compact, kebab, onMergeSummary, taskLine, setSpecStatus, COMMANDS };

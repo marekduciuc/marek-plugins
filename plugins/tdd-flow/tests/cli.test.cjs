@@ -8,7 +8,7 @@ const path = require('path');
 const { execFileSync, spawnSync } = require('child_process');
 
 const CLI = path.join(__dirname, '..', 'bin', 'tdd-flow');
-const { parseSpec, parseTasks, parseTaskTable, compact, kebab, onMergeSummary, setSpecStatus } = require(CLI);
+const { parseSpec, parseTasks, parseTaskTable, compact, kebab, onMergeSummary, setSpecStatus, shapeOf } = require(CLI);
 
 const SPEC = `- Source: https://github.com/o/r/issues/12
 - Slug: 12-csv
@@ -385,4 +385,39 @@ test('plan gives criteria only to the tasks the run reaches and reports taskCoun
   assert.deepStrictEqual(from.tasks.map((t) => t.behaviours.length), [0, 0, 1]);
   const all = run(dir, 'plan', {}).result;
   assert.deepStrictEqual(all.tasks.map((t) => t.behaviours.length), [0, 2, 1]);
+});
+
+/** The relay-check helpers of the shared cli() block in a workflow (identical in all of them). */
+function relayHelpers() {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'workflows', 'tdd-implement.js'), 'utf8');
+  const block = src.match(/\/\/ Deterministic steps[\s\S]*?\nasync function cli\([\s\S]*?\n}\n/)[0];
+  return new Function('str', `${block}\nreturn { shapeOf, relayProblem };`)({ type: 'string' });
+}
+
+test('every output carries the shape of its result, and replay prints a saved output again', () => {
+  const { dir } = repo();
+  const first = run(dir, 'plan', { _relay: 'plan-1' });
+  assert.strictEqual(first.shape, 'tasks=3 tasks.0.behaviours=1 tasks.0.verify=2 tasks.1.behaviours=2 tasks.2.behaviours=1 openIds=3');
+  assert.deepStrictEqual(run(dir, 'replay', { id: 'plan-1' }), first);
+  const none = run(dir, 'replay', { id: 'plan-2' });
+  assert.strictEqual(none.ok, false);
+  assert.match(none.error, /no saved output for "plan-2"/);
+  assert.strictEqual(run(dir, 'nope', {}).shape, '');
+});
+
+test('the workflow copy of shapeOf matches the CLI copy', () => {
+  const fixture = { a: [1, [2, 3], { b: [] }], c: { d: [{ e: [4] }] }, f: 'x' };
+  assert.deepStrictEqual(relayHelpers().shapeOf(fixture), shapeOf(fixture));
+});
+
+test('relayProblem catches dropped items and fields, ignores paths outside the schema', () => {
+  const { shapeOf: wfShape, relayProblem } = relayHelpers();
+  const schema = { type: 'object', properties: { tasks: { type: 'array', items: { type: 'object', properties: { behaviours: { type: 'array' } } } } } };
+  const cli = { tasks: [{ behaviours: [1, 2] }, { behaviours: [] }], extra: [1] };
+  const shape = wfShape(cli).join(' ');
+  assert.strictEqual(relayProblem({ ok: true, shape, result: { tasks: cli.tasks } }, schema), '');
+  assert.match(relayProblem({ ok: true, shape, result: { tasks: [cli.tasks[0]] } }, schema), /CLI: tasks=2; relayed: tasks=1/);
+  assert.match(relayProblem({ ok: true, shape, result: { tasks: [{ behaviours: [] }, { behaviours: [] }] } }, schema), /tasks\.0\.behaviours=2/);
+  assert.match(relayProblem({ ok: true, result: cli }, schema), /no shape/);
+  assert.strictEqual(relayProblem({ ok: true, shape, result: { tasks: cli.tasks } }, schema, () => 'custom'), 'custom');
 });

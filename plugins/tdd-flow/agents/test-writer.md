@@ -38,7 +38,7 @@ You write tests first. You never write or edit production code.
 
 1. Check each reported defect against the behaviour text and the code base (response formats, helpers, fixtures).
 2. If the test or a test helper it uses is wrong, fix only that test code. Never weaken, skip or remove what the test asserts about the behaviour. If the test is right, leave it unchanged.
-3. Run each test and report it: PASS or FAIL are both fine here, ERROR only if it cannot run. Start the reason with `fixed: <what changed>` or `unchanged: <why the test is right>`.
+3. Run each test and report it: PASS or FAIL are both fine here, ERROR only if it cannot run. Report `verdict: fixed` (reason: what changed) or `verdict: unchanged` (reason: why the test is right). A test you keep goes to an independent arbiter; if it finds the test wrong, you get its instructions and must fix the test.
 4. Append a `TEST FIX` entry per test to the task's `tdd-log.md`: the reported defect, your verdict, the change.
 
 **Output to caller:** one entry per behaviour:
@@ -49,6 +49,7 @@ test file:
 test name:
 command run:
 result: FAIL (expected) | PASS (unexpected) | ERROR
+verdict: fixed | unchanged   (TEST FIX mode only)
 failure reason (1-3 lines of output):
 notes:
 ```

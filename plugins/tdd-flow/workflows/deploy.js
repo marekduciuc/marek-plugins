@@ -76,16 +76,47 @@ const CAUSE = { type: 'object', required: ['category', 'rootCause'], properties:
 // Deterministic steps run in the plugin's CLI (bin/tdd-flow) through the script-runner agent (haiku, Bash only)
 // instead of a reasoning agent. Returns {ok, result} or {ok: false, error, fallback}. Identical in every workflow
 // (scripts cannot import; tests/cli.test.cjs checks the copies match).
-const cliSchema = (schema) => ({ type: 'object', required: ['ok'], properties: {
-  ok: { type: 'boolean' }, error: str, fallback: { type: 'boolean' }, again: { type: 'boolean' }, result: schema } })
+// The relay agent retypes the JSON and can drop array items: the CLI prints `shape` (sizes of the result's arrays),
+// cli() recomputes it over the schema's paths, plus an optional o.check(result) -> problem, and on a mismatch has the
+// worker model relay the saved output again (`tdd-flow replay`, the command does not run twice).
+const cliSchema = (schema) => ({ type: 'object', required: ['ok', 'shape'], properties: {
+  ok: { type: 'boolean' }, shape: str, error: str, fallback: { type: 'boolean' }, again: { type: 'boolean' }, result: schema } })
+function shapeOf(v, p = '', out = []) {
+  if (Array.isArray(v)) {
+    if (v.length) out.push(`${p}=${v.length}`)
+    v.forEach((x, i) => shapeOf(x, p ? `${p}.${i}` : `${i}`, out))
+  } else if (v && typeof v === 'object') {
+    for (const k of Object.keys(v)) shapeOf(v[k], p ? `${p}.${k}` : k, out)
+  }
+  return out
+}
+const inSchema = (schema, p) => !!p.split('.').reduce((s, seg) => s && (/^\d+$/.test(seg) ? s.items : s.properties && s.properties[seg]), schema)
+function relayProblem(r, schema, check) {
+  if (typeof r.shape !== 'string') return 'no shape in the relayed output'
+  const pick = (entries) => entries.filter(e => inSchema(schema, e.slice(0, e.lastIndexOf('='))))
+  const want = pick(r.shape.split(' ').filter(Boolean)), got = pick(shapeOf(r.result || {}))
+  const missing = want.filter(e => !got.includes(e)), extra = got.filter(e => !want.includes(e))
+  if (missing.length || extra.length) return `array sizes differ (CLI: ${missing.join(' ') || '-'}; relayed: ${extra.join(' ') || '-'})`
+  return r.ok && r.result && check ? check(r.result) : ''
+}
+let relays = 0
 async function cli(cmd, input, schema, o = {}) {
-  const r = await run(
-    `Run with the Bash tool (timeout 600000):\n\ntdd-flow ${cmd} <<'TDD_FLOW_JSON'\n${JSON.stringify(input)}\nTDD_FLOW_JSON\n\n` +
-    (o.repeat ? `While the printed JSON has "again": true, run the identical command again (at most ${o.repeat} runs).\n` : '') +
-    'Return the printed JSON object as your structured output.',
-    { agentType: A('script-runner'), model: o.model || M.light, effort: 'low', schema: cliSchema(schema), label: o.label || cmd, phase: o.phase, ...(o.stallMs ? { stallMs: o.stallMs } : {}) },
+  const id = `${cmd}-${++relays}`, label = o.label || cmd
+  const relay = (command, stdin, model, lbl) => run(
+    `Run with the Bash tool (timeout 600000):\n\ntdd-flow ${command} <<'TDD_FLOW_JSON'\n${JSON.stringify(stdin)}\nTDD_FLOW_JSON\n\n` +
+    (o.repeat && command === cmd ? `While the printed JSON has "again": true, run the identical command again (at most ${o.repeat} runs).\n` : '') +
+    'Return the printed JSON object as your structured output, every field and array item exactly as printed.',
+    { agentType: A('script-runner'), model, effort: 'low', schema: cliSchema(schema), label: lbl, phase: o.phase, ...(o.stallMs ? { stallMs: o.stallMs } : {}) },
     o.final)
+  let r = await relay(cmd, { ...input, _relay: id }, o.model || M.light, label)
   if (!r) return { ok: false, error: 'script-runner agent failed' }
+  let problem = relayProblem(r, schema, o.check)
+  if (problem) {
+    log(`${label}: ${problem} - relaying the saved output again on ${M.worker}`)
+    r = await relay('replay', { id }, M.worker, `${label} (relay retry)`)
+    problem = r ? relayProblem(r, schema, o.check) : 'script-runner agent failed'
+    if (problem) return { ok: false, error: `the output of tdd-flow ${cmd} was not relayed completely: ${problem}` }
+  }
   return r.ok && !r.result ? { ok: false, error: 'the command returned no result' } : r
 }
 

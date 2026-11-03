@@ -66,6 +66,14 @@ const REDS = {
   required: ['tests'],
   properties: { tests: { type: 'array', items: { type: 'object', required: ['ref', 'result', 'testFile', 'testName', 'reason'], properties: {
     ref: str, result: { type: 'string', enum: ['FAIL', 'PASS', 'ERROR'] }, testFile: str, testName: str, command: str, reason: str,
+    verdict: { type: 'string', enum: ['fixed', 'unchanged'] },
+  } } } },
+}
+const ARBITER = {
+  type: 'object',
+  required: ['verdicts'],
+  properties: { verdicts: { type: 'array', items: { type: 'object', required: ['ref', 'testWrong', 'reason'], properties: {
+    ref: str, testWrong: { type: 'boolean' }, reason: str, fix: str,
   } } } },
 }
 const GREEN = {
@@ -100,16 +108,47 @@ const BLOCK = { type: 'object', required: ['logged'], properties: { logged: { ty
 // Deterministic steps run in the plugin's CLI (bin/tdd-flow) through the script-runner agent (haiku, Bash only)
 // instead of a reasoning agent. Returns {ok, result} or {ok: false, error, fallback}. Identical in every workflow
 // (scripts cannot import; tests/cli.test.cjs checks the copies match).
-const cliSchema = (schema) => ({ type: 'object', required: ['ok'], properties: {
-  ok: { type: 'boolean' }, error: str, fallback: { type: 'boolean' }, again: { type: 'boolean' }, result: schema } })
+// The relay agent retypes the JSON and can drop array items: the CLI prints `shape` (sizes of the result's arrays),
+// cli() recomputes it over the schema's paths, plus an optional o.check(result) -> problem, and on a mismatch has the
+// worker model relay the saved output again (`tdd-flow replay`, the command does not run twice).
+const cliSchema = (schema) => ({ type: 'object', required: ['ok', 'shape'], properties: {
+  ok: { type: 'boolean' }, shape: str, error: str, fallback: { type: 'boolean' }, again: { type: 'boolean' }, result: schema } })
+function shapeOf(v, p = '', out = []) {
+  if (Array.isArray(v)) {
+    if (v.length) out.push(`${p}=${v.length}`)
+    v.forEach((x, i) => shapeOf(x, p ? `${p}.${i}` : `${i}`, out))
+  } else if (v && typeof v === 'object') {
+    for (const k of Object.keys(v)) shapeOf(v[k], p ? `${p}.${k}` : k, out)
+  }
+  return out
+}
+const inSchema = (schema, p) => !!p.split('.').reduce((s, seg) => s && (/^\d+$/.test(seg) ? s.items : s.properties && s.properties[seg]), schema)
+function relayProblem(r, schema, check) {
+  if (typeof r.shape !== 'string') return 'no shape in the relayed output'
+  const pick = (entries) => entries.filter(e => inSchema(schema, e.slice(0, e.lastIndexOf('='))))
+  const want = pick(r.shape.split(' ').filter(Boolean)), got = pick(shapeOf(r.result || {}))
+  const missing = want.filter(e => !got.includes(e)), extra = got.filter(e => !want.includes(e))
+  if (missing.length || extra.length) return `array sizes differ (CLI: ${missing.join(' ') || '-'}; relayed: ${extra.join(' ') || '-'})`
+  return r.ok && r.result && check ? check(r.result) : ''
+}
+let relays = 0
 async function cli(cmd, input, schema, o = {}) {
-  const r = await run(
-    `Run with the Bash tool (timeout 600000):\n\ntdd-flow ${cmd} <<'TDD_FLOW_JSON'\n${JSON.stringify(input)}\nTDD_FLOW_JSON\n\n` +
-    (o.repeat ? `While the printed JSON has "again": true, run the identical command again (at most ${o.repeat} runs).\n` : '') +
-    'Return the printed JSON object as your structured output.',
-    { agentType: A('script-runner'), model: o.model || M.light, effort: 'low', schema: cliSchema(schema), label: o.label || cmd, phase: o.phase, ...(o.stallMs ? { stallMs: o.stallMs } : {}) },
+  const id = `${cmd}-${++relays}`, label = o.label || cmd
+  const relay = (command, stdin, model, lbl) => run(
+    `Run with the Bash tool (timeout 600000):\n\ntdd-flow ${command} <<'TDD_FLOW_JSON'\n${JSON.stringify(stdin)}\nTDD_FLOW_JSON\n\n` +
+    (o.repeat && command === cmd ? `While the printed JSON has "again": true, run the identical command again (at most ${o.repeat} runs).\n` : '') +
+    'Return the printed JSON object as your structured output, every field and array item exactly as printed.',
+    { agentType: A('script-runner'), model, effort: 'low', schema: cliSchema(schema), label: lbl, phase: o.phase, ...(o.stallMs ? { stallMs: o.stallMs } : {}) },
     o.final)
+  let r = await relay(cmd, { ...input, _relay: id }, o.model || M.light, label)
   if (!r) return { ok: false, error: 'script-runner agent failed' }
+  let problem = relayProblem(r, schema, o.check)
+  if (problem) {
+    log(`${label}: ${problem} - relaying the saved output again on ${M.worker}`)
+    r = await relay('replay', { id }, M.worker, `${label} (relay retry)`)
+    problem = r ? relayProblem(r, schema, o.check) : 'script-runner agent failed'
+    if (problem) return { ok: false, error: `the output of tdd-flow ${cmd} was not relayed completely: ${problem}` }
+  }
   return r.ok && !r.result ? { ok: false, error: 'the command returned no result' } : r
 }
 
@@ -117,23 +156,15 @@ async function cli(cmd, input, schema, o = {}) {
 phase('Plan')
 // The CLI parses spec.md/tasks.md and runs the baseline. For a spec it cannot parse it reports fallback, and the
 // planning agent does the same work.
-const planInput = { feature: opt.feature || null, maxTasks: opt.maxTasks || null, fromTask: opt.fromTask || null }
 // The relay must hand over every task: a dropped task would look done (and could mark the spec implemented).
-const relayProblem = (p) => {
+// cli() checks the array sizes; this also checks the task count and which tasks are open.
+const planProblem = (p) => {
   if (!Number.isInteger(p.taskCount) || !Array.isArray(p.openIds)) return 'no taskCount/openIds in the plan'
   if (p.tasks.length !== p.taskCount) return `${p.tasks.length} of ${p.taskCount} tasks relayed`
   const open = p.tasks.filter(t => !t.done).map(t => t.id).join(',')
   return open === p.openIds.join(',') ? '' : `open tasks relayed as [${open}], the CLI found [${p.openIds.join(',')}]`
 }
-let planned = await cli('plan', planInput, PLAN, { label: 'plan' })
-if (planned.ok && relayProblem(planned.result)) {
-  log(`plan: ${relayProblem(planned.result)} - relaying again on ${M.worker}`)
-  const first = planned.result
-  // The baseline already ran in the first call: keep its result instead of running the suite again.
-  planned = await cli('plan', { ...planInput, baseline: false }, PLAN, { label: 'plan (relay retry)', model: M.worker })
-  if (planned.ok) Object.assign(planned.result, { baselinePass: first.baselinePass, baselineSummary: first.baselineSummary })
-  if (planned.ok && relayProblem(planned.result)) throw new Error(`tdd-flow: the plan was not relayed completely (${relayProblem(planned.result)}). Rerun, or pass {models: {light: "sonnet"}}.`)
-}
+const planned = await cli('plan', { feature: opt.feature || null, maxTasks: opt.maxTasks || null, fromTask: opt.fromTask || null }, PLAN, { label: 'plan', check: planProblem })
 if (!planned.ok && !planned.fallback) throw new Error(`tdd-flow: planning failed. ${planned.error}`)
 if (!planned.ok) log(`plan: ${planned.error} - using the planning agent`)
 const plan = planned.ok ? planned.result : await run(
@@ -283,30 +314,67 @@ async function tddStep(task, items, structural = []) {
     let green = await greenRun('', r => defectsIn(r).length > 0)
     files.push(...changedFiles(green.attempts))
     if (green.stopped) {
-      // One test-fix round per batch: the test-writer fixes the named tests or confirms them, then GREEN runs again.
+      // One test-fix round per batch: the test-writer fixes the named tests or confirms them. A test it leaves
+      // unchanged goes to an arbiter (strong model, read-only); a test the arbiter finds wrong is fixed on the strong
+      // model. GREEN then runs again with every verdict.
       const defects = defectsIn(green.result).map(d => ({ ...d, test: failing.find(t => sameRef(t.ref, d.ref)) }))
       log(`${tag}: implementer reports ${defects.length} wrong test(s) - ${defects.map(d => d.test.ref).join(', ')} back to the test-writer`)
-      const fixRefs = defects.map(d => d.test.ref)
-      const fixProblems = (r) => [
+      const behaviourOf = (ref) => batch.find(b => sameRef(b.ref, ref)).text
+      const fixProblems = (fixRefs, mustFix) => (r) => [
         ...fixRefs.filter(ref => !reportFor(r, ref)).map(ref => `${ref}: no test reported`),
         ...fixRefs.map(ref => reportFor(r, ref)).filter(t => t && t.result === 'ERROR').map(t => `${t.ref}: ${t.reason}`),
+        ...(mustFix ? fixRefs.map(ref => reportFor(r, ref)).filter(t => t && t.verdict !== 'fixed').map(t => `${t.ref}: the test was not fixed`) : []),
       ]
+      const fixPrompt = (items, intro, rules) => `TEST FIX step. ${ctx}\nTask ${task.id}: ${task.title}\n${intro} Production code for them is already (partly) written; do not touch it.\n` +
+        items.map(d => `- ${d.test.ref}: ${d.test.testFile} :: ${d.test.testName}\n  ${d.note}\n  Behaviour: ${behaviourOf(d.test.ref)}`).join('\n') + '\n' + rules +
+        ' Never weaken what the test asserts about the behaviour. Run each test and report it (PASS or FAIL; ERROR only if it cannot run), with verdict "fixed" or "unchanged" and the reason. ' +
+        `Append a "TEST FIX" entry per test to ${dir}/tdd-log.md: the reported defect, your verdict and the change.`
+      const fixRefs = defects.map(d => d.test.ref)
+      const firstProblems = fixProblems(fixRefs, false)
       const fix = await escalate(`${tag} TEST FIX`,
         (model, extra, label) => run(
-          `TEST FIX step. ${ctx}\nTask ${task.id}: ${task.title}\nThe implementer reports these tests as wrong. Production code for them is already (partly) written; do not touch it.\n` +
-          defects.map(d => `- ${d.test.ref}: ${d.test.testFile} :: ${d.test.testName}\n  Reported defect: ${d.reason}\n  Behaviour: ${batch.find(b => sameRef(b.ref, d.test.ref)).text}`).join('\n') + '\n' +
-          'For each test, check the report against the behaviour and the code base. If the test (or a test helper it uses) is wrong, fix only that test code. Never weaken what the test asserts about the behaviour. ' +
-          'If the test is right, leave it unchanged. Run each test and report it (PASS or FAIL; ERROR only if it cannot run). Start each reason with "fixed: <what changed>" or "unchanged: <why the test is right>". ' +
-          `Append a "TEST FIX" entry per test to ${dir}/tdd-log.md: the reported defect, your verdict and the change.` + extra,
+          fixPrompt(defects.map(d => ({ ...d, note: `Reported defect: ${d.reason}` })), 'The implementer reports these tests as wrong.',
+            'For each test, check the report against the behaviour and the code base. If the test (or a test helper it uses) is wrong, fix only that test code; if it is right, leave it unchanged.') + extra,
           { agentType: A('test-writer'), model, schema: REDS, label, phase: 'Implement' }),
-        r => !fixProblems(r).length,
-        r => `Not done:\n${fixProblems(r).join('\n')}`)
+        r => !firstProblems(r).length,
+        r => `Not done:\n${firstProblems(r).join('\n')}`)
       fix.attempts.forEach(a => a.tests.forEach(t => t.testFile && files.push(t.testFile)))
-      if (!fix.ok) return { ok: false, step: `TEST FIX ${fixRefs.join(', ')}`, details: fix.result ? fixProblems(fix.result).join('\n') : 'agent failed' }
+      if (!fix.ok) return { ok: false, step: `TEST FIX ${fixRefs.join(', ')}`, details: fix.result ? firstProblems(fix.result).join('\n') : 'agent failed' }
+      const reports = new Map(fixRefs.map(ref => [ref, reportFor(fix.result, ref)]))
+      const verdicts = new Map(fixRefs.map(ref => [ref, `${reports.get(ref).verdict || 'reviewed'}: ${reports.get(ref).reason}`]))
+
+      // Disputed: the implementer says the test is wrong, the test-writer says it is right.
+      const disputed = defects.filter(d => reports.get(d.test.ref).verdict === 'unchanged')
+      if (disputed.length) {
+        log(`${tag}: test-writer kept ${disputed.map(d => d.test.ref).join(', ')} - asking an arbiter on ${M.strong}`)
+        const arb = await run(
+          `Arbitrate disputed tests. ${ctx}\nTask ${task.id}: ${task.title}\nThe implementer says these tests are wrong; the test-writer says they are right. ` +
+          'The behaviour text (and the spec) is the authority, not the partly written production code. Read the test, its helpers and the code base conventions (response formats, fixtures); run the test if it helps. Do not edit files.\n' +
+          disputed.map(d => `- ${d.test.ref}: ${reports.get(d.test.ref).testFile || d.test.testFile} :: ${reports.get(d.test.ref).testName || d.test.testName}\n  Implementer: ${d.reason}\n  Test-writer: ${reports.get(d.test.ref).reason}\n  Behaviour: ${behaviourOf(d.test.ref)}`).join('\n') + '\n' +
+          'For each ref: testWrong = true only if the test contradicts the behaviour or is broken (helper, fixture, wrong field). Give the reason; if testWrong, `fix` says exactly what to change in the test, without weakening what it asserts about the behaviour.',
+          { agentType: A('code-reviewer'), model: M.strong, schema: ARBITER, label: `${tag} test arbiter`, phase: 'Implement' })
+        const ruling = (ref) => arb && arb.verdicts.find(v => sameRef(v.ref, ref))
+        // A ref the arbiter left out keeps the test-writer's verdict.
+        disputed.filter(d => ruling(d.test.ref) && !ruling(d.test.ref).testWrong)
+          .forEach(d => verdicts.set(d.test.ref, `confirmed by an independent review: ${ruling(d.test.ref).reason}. Make production code satisfy this test.`))
+        const wrong = disputed.filter(d => ruling(d.test.ref) && ruling(d.test.ref).testWrong)
+        if (wrong.length) {
+          const wrongRefs = wrong.map(d => d.test.ref), mustFix = fixProblems(wrongRefs, true)
+          const refix = await run(
+            fixPrompt(wrong.map(d => ({ ...d, test: { ...d.test, ...reports.get(d.test.ref), ref: d.test.ref }, note: `An independent review found this test wrong: ${ruling(d.test.ref).reason}\n  Change: ${ruling(d.test.ref).fix || 'see the reason'}` })),
+              'An independent review found these tests wrong.', 'Fix each test (or the test helper it uses) as described.'),
+            { agentType: A('test-writer'), model: M.strong, schema: REDS, label: `${tag} TEST FIX (arbiter)`, phase: 'Implement' })
+          if (refix) refix.tests.forEach(t => t.testFile && files.push(t.testFile))
+          if (!refix || mustFix(refix).length) return { ok: false, step: `TEST FIX ${wrongRefs.join(', ')}`,
+            details: `An independent review found the test(s) wrong, but they were not fixed:\n${refix ? mustFix(refix).join('\n') : 'agent failed'}\n` + wrong.map(d => `${d.test.ref}: ${ruling(d.test.ref).reason}`).join('\n') }
+          wrongRefs.forEach(ref => { reports.set(ref, reportFor(refix, ref)); verdicts.set(ref, `fixed after an independent review: ${reportFor(refix, ref).reason}`) })
+        }
+      }
       // The rewritten tests replace the old entries (names may have changed); a fixed test may already pass.
-      failing = failing.map(t => { const n = reportFor(fix.result, t.ref); return n && fixRefs.includes(t.ref) ? { ...t, ...n, ref: t.ref } : t })
-      fixRefs.forEach(ref => { const n = reportFor(fix.result, ref); testFixes.push(`${ref}: ${n.testFile} :: ${n.testName} - ${n.reason}`) })
-      green = await greenRun(fixRefs.map(ref => `- ${ref}: ${reportFor(fix.result, ref).reason}`).join('\n'))
+      failing = failing.map(t => { const n = reports.get(t.ref); return n ? { ...t, ...n, ref: t.ref } : t })
+      fixRefs.filter(ref => reports.get(ref).verdict !== 'unchanged')
+        .forEach(ref => { const n = reports.get(ref); testFixes.push(`${ref}: ${n.testFile} :: ${n.testName} - ${n.reason}`) })
+      green = await greenRun(fixRefs.map(ref => `- ${ref}: ${verdicts.get(ref)}`).join('\n'))
       files.push(...changedFiles(green.attempts))
     }
     if (!green.ok) return { ok: false, step: `GREEN ${refs.join(', ')}`, details: green.result ? [...greenProblems(green.result), ...defectsIn(green.result).map(d => `${d.ref}: reported as a wrong test - ${d.reason}`)].join('\n') + '\n' + (green.result.failures || green.result.summary) : 'agent failed' }
