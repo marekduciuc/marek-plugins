@@ -12,6 +12,22 @@ Each spec runs in its own background session (`claude --bg`) in `.claude/worktre
 
 `tdd-flow` is the plugin CLI (on the Bash `PATH`); it takes JSON on stdin and prints `{"ok": ..., "result": ...}`. Run it from the main checkout's root.
 
+## 0. Clean up merged specs
+
+```bash
+tdd-flow cleanup <<'TDD_FLOW_JSON'
+{}
+TDD_FLOW_JSON
+```
+
+It removes the worktree, background session, run file and (with `git branch -d`) branch of every spec whose PR is merged with nothing after it. It never forces. A worktree is kept, with the reason, while:
+- a PR is open or the branch has newer commits;
+- a session there is still open;
+- it has uncommitted or untracked changes;
+- it has ignored files other than build output, dependencies and IDE metadata (a `.env`, a local database).
+
+Show one line per removed spec (slug, PR, MB freed), one per kept one (slug - why), and the `notes`. On `skipped`, show it as a warning and go on. An error here does not stop the autopilot.
+
 ## 1. Select specs
 
 ```bash
@@ -77,7 +93,7 @@ A table: spec, result (`done` / `blocked` / `stalled` / skipped), PR URL or reas
 
 - A blocked spec: fix the cause (in its worktree), then run `/tdd-flow:autopilot <slug>`; it resumes from `tasks.md` on the same branch.
 - A stalled spec: `claude attach <name>` and answer the session.
-- Worktrees stay until the PR is merged (fixes after PR review go there). Afterwards: `claude rm <id>` (it takes the id from `claude agents`, not the name) or `git worktree remove .claude/worktrees/<slug>`, and `/tdd-flow:deploy {feature, mode: "merge", approved: true}` sets the spec to `done` if you want that.
+- Worktrees stay until the PR is merged (fixes after PR review go there). The next autopilot start then removes them (step 0). A worktree with uncommitted changes, or with ignored files that are not build output (`.env`, a local database), stays: deal with them first. `/tdd-flow:deploy {feature, mode: "merge", approved: true}` sets the spec to `done` if you want that.
 
 ## Notes
 
