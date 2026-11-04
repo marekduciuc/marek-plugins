@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 'use strict';
 // tdd-flow CLI: the deterministic steps of the tdd-flow workflows (parsing the spec, git bookkeeping, commits,
-// preflight, CI polling) and of the autopilot skill (spec selection, worktrees, run results). Workflow scripts
+// preflight, CI polling) and of the autopilot skill (spec selection, worktrees, run results, cleanup). Workflow scripts
 // cannot run commands, so they call this through the cheap script-runner agent instead of a reasoning agent.
 // Claude Code puts the plugin's bin/ on the Bash PATH.
 //
@@ -56,7 +56,7 @@ function exec(cmd, args, input, raw = false) {
 }
 const git = (...args) => exec('git', args);
 const gitOut = (...args) => { const r = git(...args); return r.code === 0 ? r.out : ''; };
-const gh = (...args) => exec('gh', args);
+const gh = (...args) => exec(process.env.TDD_FLOW_GH_BIN || 'gh', args);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** Shell command in its own process group; on timeout the whole group is killed. Resolves {code, out, timedOut}. */
@@ -656,11 +656,12 @@ function mainRoot() {
   return realpath(top);
 }
 
-/** Background and interactive Claude sessions (`claude agents --json --all`); [] when the CLI is unavailable. */
-function claudeSessions() {
-  const r = exec(process.env.TDD_FLOW_CLAUDE_BIN || 'claude', ['agents', '--json', '--all']);
-  if (r.code !== 0) return [];
-  try { return JSON.parse(r.out); } catch { return []; }
+const claudeBin = () => process.env.TDD_FLOW_CLAUDE_BIN || 'claude';
+/** Background and interactive Claude sessions (`claude agents --json --all`); [] (or null if `strict`) when the CLI is unavailable. */
+function claudeSessions(strict = false) {
+  const r = exec(claudeBin(), ['agents', '--json', '--all']);
+  if (r.code !== 0) return strict ? null : [];
+  try { const list = JSON.parse(r.out); return Array.isArray(list) ? list : strict ? null : []; } catch { return strict ? null : []; }
 }
 
 /** The session of a run: by the id the autopilot recorded, else by the worktree it runs in. */
@@ -817,9 +818,82 @@ function saveRelay(id, text) {
   } catch { /* replay then reports that nothing was saved */ }
 }
 
+// ---------- cleanup: remove the worktrees of merged specs ----------
+// Ignored paths that are rebuilt by an install or a build; any other ignored file (.env, a local database) keeps the
+// worktree, because `git worktree remove` would delete it silently.
+const REGENERABLE = new Set(['node_modules', 'target', 'build', 'dist', 'out', '.gradle', '.next', '.nuxt', '.turbo', '.cache',
+  '.parcel-cache', 'coverage', '__pycache__', '.pytest_cache', '.mypy_cache', '.ruff_cache', '.venv', 'venv', '.tox', 'bin', 'obj', '.DS_Store',
+  // IDE / language-server metadata (Eclipse JDT, IntelliJ) and the test report the test runs rewrite.
+  '.classpath', '.project', '.settings', '.factorypath', '.idea', 'testreport.md']);
+const ENDED = ['done', 'stopped'];
+
+/** Registered worktrees as [{path, branch}] from `git worktree list --porcelain` (branch '' when detached). */
+function worktreeList() {
+  return git('worktree', 'list', '--porcelain').out.split(/\n\n+/).map((block) => {
+    const wt = (block.match(/^worktree (.+)$/m) || [])[1];
+    const br = (block.match(/^branch refs\/heads\/(.+)$/m) || [])[1] || '';
+    return wt ? { path: realpath(wt), branch: br } : null;
+  }).filter(Boolean);
+}
+
+/**
+ * Removes the worktrees under .claude/worktrees/ whose spec PR is merged, nothing came after it, no session uses
+ * them, and git can remove them without --force. Never deletes unmerged work: everything else is kept with a reason.
+ */
+function cleanup() {
+  const root = mainRoot();
+  const sessions = claudeSessions(true);
+  if (!sessions) return { skipped: 'claude agents is not available, so running sessions cannot be checked', removed: [], kept: [], notes: [] };
+  const dirOf = path.join(root, WORKTREES);
+  const removed = [], kept = [], notes = [];
+  for (const wt of worktreeList().filter((w) => path.dirname(w.path) === realpath(dirOf))) {
+    const slug = path.basename(wt.path);
+    const keep = (why) => kept.push({ slug, why });
+    const branch = `feature/${slug}`;
+    if (!SLUG.test(slug)) { keep('folder name is not a valid slug'); continue; }
+    if (wt.branch !== branch) { keep(wt.branch ? `on branch ${wt.branch}, not ${branch}` : 'detached HEAD'); continue; }
+    const prs = gh('pr', 'list', '--head', branch, '--state', 'all', '--json', 'number,state,url,headRefOid', '--limit', '20');
+    if (prs.code !== 0) return { skipped: `gh: ${(prs.err || prs.out).split('\n')[0]}`, removed, kept, notes };
+    let list;
+    try { list = JSON.parse(prs.out || '[]'); } catch { return { skipped: 'gh returned no JSON', removed, kept, notes }; }
+    const open = list.find((p) => p.state === 'OPEN');
+    if (open) { keep(`PR #${open.number} is open`); continue; }
+    const tip = gitOut('rev-parse', `refs/heads/${branch}`);
+    const merged = list.find((p) => p.state === 'MERGED' && p.headRefOid === tip);
+    if (!merged) {
+      const any = list.find((p) => p.state === 'MERGED');
+      keep(any ? `${branch} has commits after the merged PR #${any.number}` : list.length ? `PR #${list[0].number} is ${list[0].state.toLowerCase()}, not merged` : 'no PR');
+      continue;
+    }
+    const run = readRun(slug);
+    const inside = (s) => s.cwd && (realpath(s.cwd) === wt.path || realpath(s.cwd).startsWith(wt.path + path.sep));
+    const own = sessions.filter((s) => inside(s) || (run && run.session && (s.id === run.session || s.sessionId === run.session)));
+    const active = own.find((s) => !ENDED.includes(s.state));
+    if (active) { keep(`session ${attachRef(sessions, active)} is still open (${active.state || 'unknown state'})`); continue; }
+    const precious = exec('git', ['-C', wt.path, 'status', '--porcelain', '--ignored'], undefined, true).out.split('\n')
+      .filter((l) => l.startsWith('!! ')).map((l) => l.slice(3).replace(/^"|"$/g, '').replace(/\/$/, ''))
+      .filter((p) => p !== STATE && !p.split('/').some((seg) => REGENERABLE.has(seg) || seg.endsWith('.iml')));
+    if (precious.length) { keep(`ignored files would be deleted: ${precious.slice(0, 5).join(', ')}${precious.length > 5 ? ', ...' : ''}`); continue; }
+    const du = exec('du', ['-sk', wt.path]);
+    const freedMb = du.code === 0 ? Math.round(parseInt(du.out, 10) / 1024) : null;
+    const rm = git('worktree', 'remove', wt.path);
+    if (rm.code !== 0) { keep(`git worktree remove refused: ${(rm.err || rm.out).split('\n')[0]}`); continue; }
+    for (const s of own.filter((x) => x.kind === 'background')) {
+      const r = exec(claudeBin(), ['rm', s.id]);
+      if (r.code !== 0) notes.push(`${slug}: claude rm ${s.id} failed: ${(r.err || r.out).split('\n')[0]}`);
+    }
+    try { fs.rmSync(runFile(slug), { force: true }); } catch (e) { notes.push(`${slug}: run file not deleted: ${e.message}`); }
+    const bd = git('branch', '-d', branch);
+    if (bd.code !== 0) notes.push(`${slug}: ${branch} kept (git branch -d refused; delete it yourself if you no longer need it)`);
+    removed.push({ slug, pr: merged.url || `#${merged.number}`, freedMb, sessions: own.filter((x) => x.kind === 'background').map((x) => x.id), branchDeleted: bd.code === 0 });
+  }
+  git('worktree', 'prune');
+  return { removed, kept, notes };
+}
+
 const COMMANDS = {
   plan, branch, block, commit, 'close-out': closeOut, 'add-secret-scan': addSecretScan, preflight,
-  'ci-watch': ciWatch, 'ci-rerun': ciRerun, context, specs, worktree, 'run-report': runReport, 'runs-wait': runsWait,
+  'ci-watch': ciWatch, 'ci-rerun': ciRerun, context, specs, worktree, cleanup, 'run-report': runReport, 'runs-wait': runsWait,
 };
 
 async function main(argv) {

@@ -421,3 +421,71 @@ test('relayProblem catches dropped items and fields, ignores paths outside the s
   assert.match(relayProblem({ ok: true, result: cli }, schema), /no shape/);
   assert.strictEqual(relayProblem({ ok: true, shape, result: { tasks: cli.tasks } }, schema, () => 'custom'), 'custom');
 });
+
+/** Fake `gh` printing the given PR list; `exit 1` when prs is null. */
+function fakeGh(prs) {
+  const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'tdd-flow-gh-')), 'gh');
+  fs.writeFileSync(f, prs ? `#!/bin/sh\necho '${JSON.stringify(prs)}'\n` : '#!/bin/sh\necho "gh: not logged in" >&2\nexit 1\n', { mode: 0o755 });
+  return { TDD_FLOW_GH_BIN: f };
+}
+/** Fake `claude` that prints sessions for `agents` and logs `rm` calls. */
+function loggingClaude(sessions) {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'tdd-flow-claude-'));
+  const f = path.join(d, 'claude');
+  fs.writeFileSync(f, `#!/bin/sh\nif [ "$1" = rm ]; then echo "$@" >> "${d}/log"; else echo '${JSON.stringify(sessions)}'; fi\n`, { mode: 0o755 });
+  return { env: { TDD_FLOW_CLAUDE_BIN: f }, log: () => (fs.existsSync(path.join(d, 'log')) ? fs.readFileSync(path.join(d, 'log'), 'utf8') : '') };
+}
+/** Main checkout with the worktree of 12-csv; returns the worktree path and its branch tip. */
+function withWorktree() {
+  const r = trackedRepo();
+  const wt = run(r.dir, 'worktree', { slug: '12-csv' }).result.path;
+  const tip = () => execFileSync('git', ['rev-parse', 'feature/12-csv'], { cwd: r.dir }).toString().trim();
+  return { ...r, wt: fs.realpathSync(wt), tip };
+}
+const merged = (oid) => [{ number: 7, state: 'MERGED', url: 'https://example.test/pr/7', headRefOid: oid }];
+
+test('cleanup removes a merged, clean worktree with its session, run file and branch', () => {
+  const { dir, wt, tip } = withWorktree();
+  fs.appendFileSync(path.join(dir, '.git/info/exclude'), 'node_modules/\n.classpath\ntestreport.md\n');
+  fs.writeFileSync(path.join(wt, '.classpath'), '<classpath/>');
+  fs.writeFileSync(path.join(wt, 'testreport.md'), '# report');
+  fs.mkdirSync(path.join(wt, 'node_modules/x'), { recursive: true });
+  fs.writeFileSync(path.join(wt, 'node_modules/x/i.js'), '1');
+  run(dir, 'run-report', { slug: '12-csv', status: 'done', session: 'ab12' });
+  const claude = loggingClaude([{ id: 'ab12', kind: 'background', cwd: wt, state: 'done' }]);
+  const r = run(dir, 'cleanup', {}, { ...claude.env, ...fakeGh(merged(tip())) });
+  assert.strictEqual(r.ok, true, r.error);
+  assert.deepStrictEqual(r.result.kept, []);
+  assert.strictEqual(r.result.removed[0].slug, '12-csv');
+  assert.strictEqual(r.result.removed[0].branchDeleted, true);
+  assert.ok(!fs.existsSync(wt));
+  assert.match(claude.log(), /^rm ab12$/m);
+  assert.ok(!fs.existsSync(path.join(dir, '.git/tdd-flow/runs/12-csv.json')));
+});
+
+test('cleanup keeps worktrees with open PRs, later commits, changes, open sessions or precious ignored files', () => {
+  const { dir, wt, tip, g } = withWorktree();
+  const none = loggingClaude([]).env;
+  const why = (env) => { const r = run(dir, 'cleanup', {}, env); assert.strictEqual(r.ok, true, r.error); assert.deepStrictEqual(r.result.removed, []); return r.result.kept[0].why; };
+  assert.match(why({ ...none, ...fakeGh([{ number: 8, state: 'OPEN', headRefOid: tip() }, ...merged(tip())]) }), /PR #8 is open/);
+  assert.match(why({ ...none, ...fakeGh([]) }), /no PR/);
+  assert.match(why({ ...loggingClaude([{ id: 'cd34', kind: 'interactive', cwd: path.join(wt, '.tdd-flow'), state: 'idle' }]).env, ...fakeGh(merged(tip())) }), /session cd34 is still open \(idle\)/);
+  fs.appendFileSync(path.join(dir, '.git/info/exclude'), '*.local\n');
+  fs.writeFileSync(path.join(wt, 'db.local'), 'data');
+  assert.match(why({ ...none, ...fakeGh(merged(tip())) }), /ignored files would be deleted: db\.local/);
+  fs.rmSync(path.join(wt, 'db.local'));
+  fs.appendFileSync(path.join(wt, '.gitignore'), '# changed\n');
+  assert.match(why({ ...none, ...fakeGh(merged(tip())) }), /git worktree remove refused/);
+  const mergedOid = tip();
+  execFileSync('git', ['commit', '-qam', 'follow-up'], { cwd: wt });
+  assert.match(why({ ...none, ...fakeGh(merged(mergedOid)) }), /commits after the merged PR #7/);
+  assert.ok(fs.existsSync(wt));
+  assert.match(g('branch', '--list', 'feature/12-csv').toString(), /feature\/12-csv/);
+});
+
+test('cleanup is skipped when gh or the session list is unavailable', () => {
+  const { dir, tip } = withWorktree();
+  assert.match(run(dir, 'cleanup', {}, { ...loggingClaude([]).env, ...fakeGh(null) }).result.skipped, /gh: gh: not logged in/);
+  const noClaude = { TDD_FLOW_CLAUDE_BIN: '/nonexistent/claude', ...fakeGh(merged(tip())) };
+  assert.match(run(dir, 'cleanup', {}, noClaude).result.skipped, /claude agents is not available/);
+});
