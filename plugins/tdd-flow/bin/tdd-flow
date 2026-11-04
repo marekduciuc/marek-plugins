@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 'use strict';
 // tdd-flow CLI: the deterministic steps of the tdd-flow workflows (parsing the spec, git bookkeeping, commits,
-// preflight, CI polling) and of the autopilot skill (spec selection, worktrees, run results, cleanup). Workflow scripts
+// preflight, CI polling), of the autopilot skill (spec selection, worktrees, run results, cleanup) and of the simplify
+// workflow and skill (scan areas, draft refactor specs, approving a spec on its branch, setting a failed step aside). Workflow scripts
 // cannot run commands, so they call this through the cheap script-runner agent instead of a reasoning agent.
 // Claude Code puts the plugin's bin/ on the Bash PATH.
 //
@@ -205,6 +206,9 @@ function parseSpec(spec) {
   return { status, source, crit, text };
 }
 
+// Task kinds: tdd (red-green-refactor), setup (verify commands), refactor (characterize, then behaviour-preserving change).
+const kindOf = (s) => (/refactor/i.test(s) ? 'refactor' : /setup/i.test(s) ? 'setup' : 'tdd');
+
 /** "| T-1 | title | tdd | AC-1, AC-2 | notes |" rows of the spec's task table: {id: {kind, refs}}. */
 function parseTaskTable(spec) {
   const rows = {};
@@ -216,7 +220,7 @@ function parseTaskTable(spec) {
     const id = (cells[0] || '').match(/^T-\d+$/);
     if (!cols || !id) continue;
     const at = (name) => cells[cols.findIndex((c) => c.startsWith(name))] || '';
-    rows[id[0]] = { kind: /setup/i.test(at('kind')) ? 'setup' : 'tdd', refs: at('ac').match(CRIT_IDS) || [] };
+    rows[id[0]] = { kind: kindOf(at('kind')), refs: at('ac').match(CRIT_IDS) || [] };
   }
   return rows;
 }
@@ -227,11 +231,11 @@ function parseTasks(md) {
     const m = line.match(/^\s*[-*]\s*\[([ xX])\]\s*\**(T-\d+)\**(?![0-9])[\s:.\-–—]*(.*)$/);
     if (!m) continue;
     let rest = m[3].trim();
-    const setup = /\[setup\]/i.test(rest);
-    rest = rest.replace(/\s*\[setup\]\s*/gi, ' ').trim();
+    const marker = (rest.match(/\[(setup|refactor)\]/i) || [])[1] || '';
+    rest = rest.replace(/\s*\[(setup|refactor)\]\s*/gi, ' ').trim();
     const refs = [...new Set(rest.match(CRIT_IDS) || [])];
     const title = rest.replace(new RegExp(String.raw`\s*\([^()]*\b${CRIT_ID}[^()]*\)\s*`, 'g'), ' ').trim();
-    out.push({ id: m[2], title, done: m[1] !== ' ', kind: setup ? 'setup' : 'tdd', refs });
+    out.push({ id: m[2], title, done: m[1] !== ' ', kind: kindOf(marker), refs });
   }
   return out;
 }
@@ -269,7 +273,7 @@ async function plan(inp) {
   const tasks = parsed.map((t) => {
     const row = table[t.id];
     const refs = t.refs.length ? t.refs : row ? row.refs : [];
-    const kind = t.kind === 'setup' || (row && row.kind === 'setup') ? 'setup' : 'tdd';
+    const kind = t.kind !== 'tdd' ? t.kind : row ? row.kind : 'tdd';
     if (!refs.length) problems.push(`${t.id}: no AC/EC ids in tasks.md or the spec task table`);
     const behaviours = refs.map((ref) => {
       if (!s.crit[ref]) problems.push(`${t.id}: ${ref} not found in spec.md`);
@@ -293,7 +297,8 @@ async function plan(inp) {
     taskCount: tasks.length, openIds: open.map((t) => t.id),
   };
   if (!none(stack.lint)) res.lint = stack.lint;
-  if (!noTestSuite && inp.baseline !== false && res.approved && tasks.some((t) => !t.done)) {
+  // A run with only synthetic refactor tasks ({refactors}) on a finished spec needs the baseline too.
+  if (!noTestSuite && inp.baseline !== false && res.approved && (tasks.some((t) => !t.done) || inp.refactors)) {
     const t = await runTests(stack.testAll);
     res.baselinePass = t.pass;
     res.baselineSummary = t.summary;
@@ -366,7 +371,9 @@ async function commit(inp) {
   // Git runs inside this one Bash call, so hooks that guard `git commit` on the default branch never see it: check here.
   const current = gitOut('branch', '--show-current');
   if (current && current === baseBranch()) return { committed: false, reason: `on the default branch ${current}: tdd-flow commits only on a feature branch` };
-  const files = [...new Set(inp.files || [])].filter(Boolean);
+  // includeDeletions: a refactor may delete or rename files the agent forgot to list; stage every tracked deletion too.
+  const deleted = inp.includeDeletions ? gitOut('ls-files', '--deleted').split('\n') : [];
+  const files = [...new Set([...(inp.files || []), ...deleted])].filter(Boolean);
   let ticked = false;
   if (inp.tick) {
     const md = read(inp.tick.file);
@@ -403,7 +410,7 @@ async function commit(inp) {
     const a = git('add', '--', ...stage);
     if (a.code !== 0) return { committed: false, ticked, reason: `git add failed: ${a.err}` };
   }
-  const staged = stage.length ? gitOut('diff', '--cached', '--name-only', '--', ...stage).split('\n').filter(Boolean) : [];
+  const staged = stage.length ? gitOut('diff', '--cached', '--name-only', '--no-renames', '--', ...stage).split('\n').filter(Boolean) : [];
   const unexpected = exec('git', ['status', '--porcelain'], undefined, true).out.split('\n').filter(Boolean)
     .map((l) => l.slice(3).replace(/^.* -> /, '').replace(/^"|"$/g, ''))
     .filter((p) => !staged.includes(p) && !stage.includes(p));
@@ -675,43 +682,53 @@ const isLive = (s) => !!s && s.state === 'working';
 const attachRef = (sessions, s) => (s.name && !/\s/.test(s.name) && sessions.filter((x) => x.name === s.name).length === 1 ? s.name : s.id);
 
 /** Specs the autopilot can start, and why the others are skipped. Input: {slugs?: [...]} to limit the selection. */
-function specs(inp) {
-  const root = mainRoot();
-  const probe = '.tdd-flow/features/x/spec.md';
-  if (git('check-ignore', '-q', '--no-index', '--', probe).code === 0) {
+/** The autopilot needs specs in git, and no tracked state.json (parallel PRs would conflict on it). */
+function checkSpecsInGit(base) {
+  if (git('check-ignore', '-q', '--no-index', '--', '.tdd-flow/features/x/spec.md').code === 0) {
     throw new Error('.tdd-flow/ is git-ignored. The autopilot needs specs in git: remove .tdd-flow/ from .gitignore and commit the specs.');
   }
-  const base = baseBranch();
   if (git('cat-file', '-e', `${base}:${STATE}`).code === 0) {
     throw new Error(`${STATE} is tracked on ${base}; parallel PRs would conflict on it. Run \`git rm --cached ${STATE}\`, add it to .gitignore and commit.`);
   }
+}
+const showFile = (ref, file) => exec('git', ['show', `${ref}:${file}`], undefined, true);
+
+function specs(inp) {
+  const root = mainRoot();
+  const base = baseBranch();
+  checkSpecsInGit(base);
   let slugs;
   try { slugs = fs.readdirSync('.tdd-flow/features', { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name).sort(); } catch { slugs = []; }
   const wanted = (inp.slugs || []).length ? new Set(inp.slugs) : null;
-  const unknown = wanted ? [...wanted].filter((s) => !slugs.includes(s)) : [];
+  // A named spec with no folder here can live only on its branch (simplify-codebase --implement commits it there).
+  // Only named ones: a feature/* branch of an interactive run must not be picked up on its own.
+  const branchOnly = new Set(wanted ? [...wanted].filter((s) => !slugs.includes(s) && SLUG.test(s)
+    && git('cat-file', '-e', `refs/heads/feature/${s}:${featureDir(s)}/spec.md`).code === 0) : []);
+  const unknown = wanted ? [...wanted].filter((s) => !slugs.includes(s) && !branchOnly.has(s)) : [];
   if (unknown.length) throw new Error(`no spec folder for: ${unknown.map((s) => `.tdd-flow/features/${s}`).join(', ')}`);
   const sessions = claudeSessions();
   const runnable = [];
   const skipped = [];
-  for (const slug of slugs) {
+  for (const slug of [...slugs, ...branchOnly]) {
     if (wanted && !wanted.has(slug)) continue;
     const skip = (why) => skipped.push({ slug, why });
     if (!SLUG.test(slug)) { skip('folder name is not a valid slug'); continue; }
     const specPath = `${featureDir(slug)}/spec.md`;
-    const committed = exec('git', ['show', `${base}:${specPath}`], undefined, true);
-    if (committed.code !== 0) { skip(`spec is not committed on ${base} - commit it to ${base} first`); continue; }
-    if (gitOut('status', '--porcelain', '--', specPath, `${featureDir(slug)}/tasks.md`)) {
-      skip(`uncommitted changes in spec.md or tasks.md - commit them to ${base} first`);
-      continue;
-    }
     const branch = `feature/${slug}`;
-    const onBranch = git('rev-parse', '--verify', '--quiet', `refs/heads/${branch}`).code === 0
-      ? exec('git', ['show', `${branch}:${specPath}`], undefined, true) : null;
-    const specText = onBranch && onBranch.code === 0 ? onBranch.out : committed.out;
+    const onBranch = git('rev-parse', '--verify', '--quiet', `refs/heads/${branch}`).code === 0 ? showFile(branch, specPath) : null;
+    const committed = branchOnly.has(slug) ? null : showFile(base, specPath);
+    const specText = onBranch && onBranch.code === 0 ? onBranch.out : committed && committed.code === 0 ? committed.out : read(specPath) || '';
     const status = parseSpec(specText).status || 'none';
     const run = readRun(slug);
     const wtPath = path.join(root, WORKTREES, slug);
     if (status !== 'approved') { skip(`status ${status}${run && run.prUrl ? ` (${run.prUrl})` : ''}`); continue; }
+    if (committed) {
+      if (committed.code !== 0) { skip(`spec is not committed on ${base} - commit it to ${base} first`); continue; }
+      if (gitOut('status', '--porcelain', '--', specPath, `${featureDir(slug)}/tasks.md`)) {
+        skip(`uncommitted changes in spec.md or tasks.md - commit them to ${base} first`);
+        continue;
+      }
+    }
     if (isLive(findSession(sessions, run, wtPath))) { skip('a session is still running on it'); continue; }
     if (run && run.status === 'blocked' && !(wanted && wanted.has(slug))) {
       skip(`blocked last time: ${String(run.details || '').split('\n')[0]} - fix it, then start it by name`);
@@ -891,9 +908,214 @@ function cleanup() {
   return { removed, kept, notes };
 }
 
+// ---------- simplify ----------
+const posInt = (v, d) => (Number.isInteger(v) && v > 0 ? v : d);
+// Scan targets for the simplifier: tracked source files, no tests (they are read as context), no generated, vendored
+// or migration code. A separate list from REGENERABLE, which names ignored directories such as bin/ and build/.
+const SOURCE_EXT = /\.(cs|vb|fs|ts|tsx|js|jsx|mjs|cjs|vue|svelte|py|go|rs|java|kt|rb|php|c|cc|cpp|h|hpp|swift|scala)$/i;
+const NOT_SOURCE = /(^|\/)(\.tdd-flow|\.claude|\.github|node_modules|vendor|third_party|dist|build|target|out|generated|__generated__|migrations?)\/|\.min\.[a-z]+$|\.d\.ts$|\.generated\.|\.g\.cs$|\.pb\.go$|_pb2\.py$/i;
+const TEST_FILE = /(^|\/)(tests?|__tests__|spec)\/|(^|\/)(test_[^/]*|[^/]*_test\.[^/]+|[^/]*\.(test|spec)\.[^/]+|[^/]*_spec\.[^/]+|[^/]*Tests?\.(java|kt|cs)|conftest\.py)$/;
+const sizeOf = (p) => { try { return fs.statSync(p).size; } catch { return 0; } };
+
+/**
+ * Splits the tracked source files into scan areas of at most maxFiles files and maxBytes bytes: a directory that fits
+ * is one area, small sibling directories are packed together, larger ones are split further. Deterministic.
+ * Input: {paths?, maxFiles?, maxBytes?}. Output: {areas: [{area, include, files, bytes}], files, noTestSuite}.
+ */
+function areas(inp) {
+  const maxFiles = posInt(inp.maxFiles, 40);
+  const maxBytes = posInt(inp.maxBytes, 400000);
+  const paths = (inp.paths || []).filter(Boolean);
+  const listed = exec('git', ['ls-files', '-z', '--', ...(paths.length ? paths : ['.'])], undefined, true);
+  if (listed.code !== 0) throw new Error(`git ls-files failed: ${listed.err}`);
+  const files = listed.out.split('\0').filter((f) => f && SOURCE_EXT.test(f) && !NOT_SOURCE.test(f) && !TEST_FILE.test(f))
+    .sort().map((p) => ({ p, size: sizeOf(p) })).filter((f) => f.size > 0);
+  const bytes = (g) => g.reduce((n, f) => n + f.size, 0);
+  const fits = (g) => g.length <= maxFiles && bytes(g) <= maxBytes;
+  const out = [];
+  const add = (area, include, g) => out.push({ area, include, files: g.length, bytes: bytes(g) });
+  function split(prefix, group) {
+    if (fits(group)) { add(prefix || '.', [prefix || '.'], group); return; }
+    const loose = [];
+    const subs = new Map();
+    for (const f of group) {
+      const rest = f.p.slice(prefix.length);
+      const i = rest.indexOf('/');
+      if (i < 0) { loose.push(f); continue; }
+      const d = prefix + rest.slice(0, i + 1);
+      if (!subs.has(d)) subs.set(d, []);
+      subs.get(d).push(f);
+    }
+    // Loose files of this directory and small subdirectories are packed together in path order; a subdirectory
+    // that does not fit on its own is split further.
+    const items = [];
+    let chunk = [];
+    const flush = () => { if (chunk.length) items.push({ name: '*', include: chunk.map((f) => f.p), g: chunk }); chunk = []; };
+    for (const f of loose) { if (chunk.length && !fits([...chunk, f])) flush(); chunk.push(f); }
+    flush();
+    for (const [d, g] of [...subs].sort((a, b) => (a[0] < b[0] ? -1 : 1))) items.push({ name: d.slice(prefix.length, -1), include: [d], g, big: !fits(g), d });
+    let pack = [];
+    const flushPack = () => {
+      if (!pack.length) return;
+      const name = pack.length === 1 ? (pack[0].d || `${prefix}*`) : `${prefix}{${pack.map((x) => x.name).join(',')}}`;
+      add(name, pack.flatMap((x) => x.include), pack.flatMap((x) => x.g));
+      pack = [];
+    };
+    for (const it of items) {
+      if (it.big) { flushPack(); split(it.d, it.g); continue; }
+      if (pack.length && !fits([...pack.flatMap((x) => x.g), ...it.g])) flushPack();
+      pack.push(it);
+    }
+    flushPack();
+  }
+  if (files.length) split('', files);
+  const stack = readStack();
+  return { areas: out, files: files.length, noTestSuite: !stack || none(stack.testAll) };
+}
+
+/** A slug is free only if nothing of it exists: folder here or on the base, local or remote branch, worktree. */
+function slugTaken(slug, base) {
+  const ref = (r) => git('rev-parse', '--verify', '--quiet', r).code === 0;
+  return fs.existsSync(featureDir(slug)) || git('cat-file', '-e', `${base}:${featureDir(slug)}/spec.md`).code === 0
+    || ref(`refs/heads/feature/${slug}`) || ref(`refs/remotes/origin/feature/${slug}`) || fs.existsSync(path.join(WORKTREES, slug));
+}
+const oneLine = (v, max = 400) => String(v == null ? '' : v).replace(/\s+/g, ' ').trim().slice(0, max);
+
+/**
+ * Writes the simplifier's findings for one area as draft specs of [refactor] tasks, at most maxPerSpec tasks each,
+ * in the format plan reads. Never overwrites: a taken slug gets the next free suffix.
+ * Input: {area, findings: [{tag, title?, where, files, issue, proposal, gain?, risk?}], maxPerSpec?}.
+ */
+function simplifySpec(inp) {
+  mainRoot();
+  const base = baseBranch();
+  const findings = Array.isArray(inp.findings) ? inp.findings : [];
+  if (!findings.length) throw new Error('no findings to write');
+  const per = posInt(inp.maxPerSpec, 8);
+  const area = oneLine(inp.area || '.', 80);
+  // The end of the path names the area best (apps/backend/src/main/java/x/{auth,cli} -> java-x-auth-cli).
+  const words = kebab(area.replace(/[{}*,.]+/g, ' ').trim() || 'root', 200).split('-');
+  let tail = words.pop();
+  while (words.length && `${words[words.length - 1]}-${tail}`.length <= 30) tail = `${words.pop()}-${tail}`;
+  const stem = `simplify-${tail.slice(0, 30)}`;
+  const parts = Math.ceil(findings.length / per);
+  const date = new Date().toISOString().slice(0, 10);
+  const specsOut = [];
+  let n = 1;
+  for (let i = 0; i < findings.length; i += per) {
+    let slug;
+    do { slug = n === 1 ? stem : `${stem}-${n}`; n++; } while (slugTaken(slug, base));
+    const chunk = findings.slice(i, i + per);
+    const part = parts > 1 ? ` (part ${i / per + 1} of ${parts})` : '';
+    // No brackets and no criterion ids in a title: parseTasks reads both from the task line.
+    const title = (f) => oneLine(f.title || `${f.tag} in ${f.where}`, 80).replace(/[()[\]]/g, '').replace(/\b(AC|EC|T)-(?=\d)/g, '$1 ');
+    const acs = chunk.map((f, k) => [
+      `### AC-${k + 1} ${oneLine(f.tag, 30)}: ${title(f)}`,
+      `- **Given** ${oneLine(f.where)}: ${oneLine(f.issue)}`,
+      `- **When** ${oneLine(f.proposal, 800)}`,
+      '- **Then** the behaviour is unchanged: the characterization tests and the full suite, lint and type check pass before and after the change',
+      ...(f.gain ? [`- **And** about ${oneLine(f.gain, 20)} lines of code are gone`] : []),
+      `- Files: ${(f.files || []).map((x) => `\`${oneLine(x, 200)}\``).join(', ') || 'see Given'}`,
+      `- Risk: ${oneLine(f.risk || 'low', 10)}`,
+      '',
+    ].join('\n'));
+    const spec = [
+      `# Simplify ${area}${part}`, '',
+      '- Source: tdd-flow simplify-codebase', `- Slug: ${slug}`, '- Status: draft', `- Date: ${date}`, '',
+      '## Goal', '',
+      `Remove unneeded code in \`${area}\` without changing behaviour: ${chunk.length} refactoring(s) found by the simplifier and confirmed by a second reviewer.`, '',
+      '## Context', '',
+      'Every task is a `[refactor]` task. tdd-implement first pins the current behaviour with characterization tests (committed on their own, run on the old code), then applies the change; the full suite, lint and type check must pass afterwards. A task whose change no longer applies is skipped, not forced.', '',
+      'Before approving: delete the task lines (and their criteria) you do not want.', '',
+      '## Acceptance criteria', '',
+      ...acs,
+      '## Out of scope', '',
+      'Behaviour changes, new features, public contracts (exported API, HTTP, database schema, CLI flags), style-only edits.', '',
+      '## Task breakdown', '',
+      '| ID | Task | Kind | ACs | Notes |', '|----|------|------|-----|-------|',
+      ...chunk.map((f, k) => `| T-${k + 1} | ${title(f).replace(/\|/g, '/')} | refactor | AC-${k + 1} | risk ${oneLine(f.risk || 'low', 10)} |`), '',
+    ].join('\n');
+    const tasks = ['# Tasks', '', ...chunk.map((f, k) => `- [ ] T-${k + 1} ${title(f)} (AC-${k + 1}) [refactor]`), ''].join('\n');
+    const dir = featureDir(slug);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(`${dir}/spec.md`, spec);
+    fs.writeFileSync(`${dir}/tasks.md`, tasks);
+    specsOut.push({ slug, dir, tasks: chunk.length, acIds: chunk.map((_, k) => `AC-${k + 1}`) });
+  }
+  return { specs: specsOut, total: findings.length };
+}
+
+/**
+ * Approves an untracked draft spec on its own branch, without touching the base branch: creates the worktree on
+ * feature/<slug>, copies the spec folder there, sets "Status: approved", commits it there, and only then removes the
+ * folder from the main checkout. On a failure the new worktree and branch are removed and the folder stays.
+ */
+function specBranch(inp) {
+  const slug = checkSlug(inp.slug);
+  const root = mainRoot();
+  const base = baseBranch();
+  checkSpecsInGit(base);
+  const stack = readStack();
+  if (!stack || none(stack.testAll)) throw new Error('no test command in .tdd-flow/stack.md: refactor tasks need a test suite');
+  const dir = featureDir(slug);
+  if (!fs.existsSync(`${dir}/spec.md`) || !fs.existsSync(`${dir}/tasks.md`)) throw new Error(`${dir}/spec.md or tasks.md is missing`);
+  if (gitOut('ls-files', '--', dir) || git('cat-file', '-e', `${base}:${dir}/spec.md`).code === 0) {
+    throw new Error(`${dir} is already in git: set "Status: approved" there, commit it to ${base} and run /tdd-flow:autopilot ${slug}`);
+  }
+  const branch = `feature/${slug}`;
+  const ref = (r) => git('rev-parse', '--verify', '--quiet', r).code === 0;
+  if (ref(`refs/heads/${branch}`) || ref(`refs/remotes/origin/${branch}`)) throw new Error(`${branch} already exists: rename the spec folder (another slug) or remove the old branch`);
+  if (fs.existsSync(path.join(root, WORKTREES, slug))) throw new Error(`${WORKTREES}/${slug} already exists`);
+  const wt = worktree({ slug });
+  const dest = path.join(wt.path, dir);
+  try {
+    fs.cpSync(dir, dest, { recursive: true });
+    if (!setSpecStatus(path.join(dest, 'spec.md'), 'approved')) throw new Error(`no "Status:" line in ${dir}/spec.md`);
+    const a = exec('git', ['-C', wt.path, 'add', '--', dir]);
+    if (a.code !== 0) throw new Error(`git add failed: ${a.err}`);
+    const c = exec('git', ['-C', wt.path, 'commit', '-m', `chore(${slug}): approve simplify spec`, '--', dir]);
+    if (c.code !== 0) throw new Error(`git commit failed: ${(c.err || c.out).split('\n').slice(-10).join('\n')}`);
+  } catch (e) {
+    fs.rmSync(dest, { recursive: true, force: true });
+    git('worktree', 'remove', wt.path);
+    git('branch', '-d', branch);
+    throw e;
+  }
+  fs.rmSync(dir, { recursive: true, force: true });
+  return { slug, path: wt.path, branch, sha: exec('git', ['-C', wt.path, 'rev-parse', '--short', 'HEAD']).out };
+}
+
+/**
+ * Sets the uncommitted changes of a failed step aside: saves them as a patch in <git common dir>/tdd-flow/runs/
+ * (shared by all worktrees, never committed) and restores the working tree to HEAD. No stash (one stash list is
+ * shared by every worktree), no reset or clean. Input: {slug, label}.
+ */
+function setAside(inp) {
+  const slug = checkSlug(inp.slug);
+  const label = kebab(String(inp.label || 'change'), 40);
+  const current = gitOut('branch', '--show-current');
+  if (!current || current === baseBranch()) throw new Error('set-aside runs only on a feature branch');
+  if (!gitOut('status', '--porcelain')) return { setAside: false, files: [] };
+  const add = git('add', '-A');
+  if (add.code !== 0) throw new Error(`git add failed: ${add.err}`);
+  const files = gitOut('diff', '--cached', '--name-only', '--no-renames', 'HEAD').split('\n').filter(Boolean);
+  const patch = exec('git', ['diff', '--cached', '--binary', 'HEAD'], undefined, true);
+  if (patch.code !== 0) throw new Error(`git diff failed: ${patch.err}`);
+  const dir = path.join(commonDir(), 'tdd-flow', 'runs');
+  fs.mkdirSync(dir, { recursive: true });
+  let f = path.join(dir, `${slug}-${label}.patch`);
+  for (let k = 2; fs.existsSync(f); k++) f = path.join(dir, `${slug}-${label}-${k}.patch`);
+  fs.writeFileSync(f, patch.out);
+  const r = git('restore', '--source=HEAD', '--staged', '--worktree', '--', '.');
+  if (r.code !== 0) throw new Error(`git restore failed (the changes are saved in ${f}): ${r.err}`);
+  const left = gitOut('status', '--porcelain');
+  return { setAside: true, patch: f, files, ...(left ? { left: left.split('\n') } : {}) };
+}
+
 const COMMANDS = {
   plan, branch, block, commit, 'close-out': closeOut, 'add-secret-scan': addSecretScan, preflight,
   'ci-watch': ciWatch, 'ci-rerun': ciRerun, context, specs, worktree, cleanup, 'run-report': runReport, 'runs-wait': runsWait,
+  areas, 'simplify-spec': simplifySpec, 'spec-branch': specBranch, 'set-aside': setAside,
 };
 
 async function main(argv) {

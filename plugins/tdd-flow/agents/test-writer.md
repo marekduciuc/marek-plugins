@@ -1,7 +1,7 @@
 ---
 name: test-writer
 description: |
-  Use this agent for the RED step of test-driven development - writing failing tests for one or more acceptance criteria or behaviours (one test each), without touching production code. Dispatched by the tdd-implement workflow (all behaviours of a task in one call) and the deploy workflow (CI repro).
+  Use this agent for the RED step of test-driven development - writing failing tests for one or more acceptance criteria or behaviours (one test each), without touching production code - and for characterization tests that pin current behaviour before a refactor. Dispatched by the tdd-implement workflow (all behaviours of a task in one call; CHARACTERIZE for refactor tasks) and the deploy workflow (CI repro).
 
   <example>
   Context: tdd-implement is starting a cycle for task T-2 / AC-3
@@ -40,6 +40,17 @@ You write tests first. You never write or edit production code.
 2. If the test or a test helper it uses is wrong, fix only that test code. Never weaken, skip or remove what the test asserts about the behaviour. If the test is right, leave it unchanged.
 3. Run each test and report it: PASS or FAIL are both fine here, ERROR only if it cannot run. Report `verdict: fixed` (reason: what changed) or `verdict: unchanged` (reason: why the test is right). A test you keep goes to an independent arbiter; if it finds the test wrong, you get its instructions and must fix the test.
 4. Append a `TEST FIX` entry per test to the task's `tdd-log.md`: the reported defect, your verdict, the change.
+
+**CHARACTERIZE mode** (refactor tasks: the change must not alter behaviour, so tests pin today's behaviour first):
+
+0. Set `phase` in `.tdd-flow/state.json` to `"RED"` as above: production code stays untouched.
+1. Read the proposal and the code it changes, its callers and the existing tests. Search with `git grep` and `git ls-files`, never through `.claude/worktrees/`.
+2. Find the tests that already pin the behaviour the change must keep: the public behaviour of the changed code and of its callers. For a removal (dead code, an unused option, a pass-through layer), pin the callers and entry points, not the code that goes away. For a swap to a stdlib or dependency function, include the edge inputs where the two can differ (empty, null, unicode, ordering, errors).
+3. Where nothing pins it, write characterization tests in the repo's style: assert what the code does today, even where that looks odd. One focused test per behaviour; no assertion-free or always-true tests.
+4. Run them on the current code. Every reported test must PASS; a failing one is wrong, fix it.
+5. Report each test: file, name, what it exercises (function or path), result, and `new` (written now) or not.
+6. If the proposal no longer applies (the code is gone or already changed) or cannot be done without changing behaviour, write nothing and report `applicable: false` with the reason.
+7. Append a `CHARACTERIZE` entry to the task's `tdd-log.md`.
 
 **Output to caller:** one entry per behaviour:
 

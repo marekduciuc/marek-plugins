@@ -8,7 +8,7 @@ argument-hint: "[slug ...] [--parallel N]"
 
 Input: $ARGUMENTS - optional feature slugs (default: every spec), optional `--parallel N` (default 3).
 
-Each spec runs in its own background session (`claude --bg`) in `.claude/worktrees/<slug>` on branch `feature/<slug>`. That session runs `/tdd-flow:implement-spec`, which implements the tasks, reviews, fixes once and opens a PR. This skill selects the specs, starts the sessions, keeps at most N running and reports. It never merges.
+Each spec runs in its own background session (`claude --bg`) in `.claude/worktrees/<slug>` on branch `feature/<slug>`. That session runs `/tdd-flow:implement-spec`, which implements the tasks, simplifies the whole PR, reviews, fixes once and opens a PR. This skill selects the specs, starts the sessions, keeps at most N running and reports. It never merges.
 
 `tdd-flow` is the plugin CLI (on the Bash `PATH`); it takes JSON on stdin and prints `{"ok": ..., "result": ...}`. Run it from the main checkout's root.
 
@@ -38,7 +38,7 @@ TDD_FLOW_JSON
 
 Pass the slugs from the input in `slugs` (naming a spec also restarts it after a `blocked` run). On `ok: false` show the error and stop; it says what to fix: `.tdd-flow/` git-ignored, `state.json` tracked, not the main checkout.
 
-Show `runnable` and `skipped` (one line each: slug - reason). Specs are runnable when their status on `feature/<slug>`, or on the base branch if that branch does not exist yet, is `approved`. They must also be committed on the base branch without local changes. If nothing is runnable, stop.
+Show `runnable` and `skipped` (one line each: slug - reason). Specs are runnable when their status on `feature/<slug>`, or on the base branch if that branch does not exist yet, is `approved`. They must also be committed on the base branch without local changes. The exception is a spec that exists only on `feature/<slug>`, which `/tdd-flow:simplify-codebase --implement` creates: it runs when it is named in the slugs. If nothing is runnable, stop.
 
 Before starting, check `gh auth status`; if it fails, tell the user to run `! gh auth login` and stop.
 
