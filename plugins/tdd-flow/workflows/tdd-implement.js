@@ -1,7 +1,7 @@
 export const meta = {
   name: 'tdd-implement',
   description: 'Implement an approved tdd-flow spec task by task: failing tests first (test-writer), then code (implementer), per-task review and commits',
-  whenToUse: 'After the spec is approved. args: feature slug (optional), or {feature, fromTask, maxTasks, findings, batchSize}',
+  whenToUse: 'After the spec is approved. args: feature slug (optional), or {feature, fromTask, maxTasks, findings, refactors, batchSize}',
   phases: [
     { title: 'Plan', detail: 'load spec and tasks, baseline test run' },
     { title: 'Implement', detail: 'per task: RED test-writer writes all failing tests -> GREEN implementer makes them pass and refactors' },
@@ -45,7 +45,7 @@ const PLAN = {
     baselinePass: { type: 'boolean' }, baselineSummary: str, noTestSuite: { type: 'boolean' },
     taskCount: { type: 'integer' }, openIds: strs,
     tasks: { type: 'array', items: { type: 'object', required: ['id', 'title', 'done', 'behaviours'], properties: {
-      id: str, title: str, done: { type: 'boolean' }, kind: { type: 'string', enum: ['tdd', 'setup'] },
+      id: str, title: str, done: { type: 'boolean' }, kind: { type: 'string', enum: ['tdd', 'setup', 'refactor'] },
       behaviours: { type: 'array', items: { type: 'object', required: ['ref', 'text'], properties: { ref: str, text: str } } },
       verify: { type: 'array', items: { type: 'object', required: ['ref', 'command'], properties: { ref: str, command: str, manual: { type: 'boolean' } } } },
     } } },
@@ -99,6 +99,25 @@ const REVIEW = {
       severity: { type: 'string', enum: ['blocker', 'major', 'minor'] }, where: str, issue: str, fix: str, behavioural: { type: 'boolean' },
     } } },
     uncoveredAcs: strs,
+  },
+}
+// Refactor tasks: CHARACTERIZE pins today's behaviour (tests that pass on the old code), REFACTOR changes the code.
+const CHAR = {
+  type: 'object',
+  required: ['applicable', 'tests'],
+  properties: {
+    applicable: { type: 'boolean' }, reason: str,
+    tests: { type: 'array', items: { type: 'object', required: ['testFile', 'testName', 'exercises', 'result', 'new'], properties: {
+      testFile: str, testName: str, exercises: str, result: { type: 'string', enum: ['PASS', 'FAIL', 'ERROR'] }, new: { type: 'boolean' },
+    } } },
+  },
+}
+const REFAC = {
+  type: 'object',
+  required: ['applicable', 'suitePass', 'filesChanged', 'summary'],
+  properties: {
+    applicable: { type: 'boolean' }, reason: str, suitePass: { type: 'boolean' }, filesChanged: strs, summary: str, failures: str,
+    testsRemoved: { type: 'array', items: { type: 'object', required: ['file', 'test', 'reason'], properties: { file: str, test: str, reason: str } } },
   },
 }
 const BRANCH = { type: 'object', required: ['branch'], properties: { branch: str } }
@@ -164,7 +183,9 @@ const planProblem = (p) => {
   const open = p.tasks.filter(t => !t.done).map(t => t.id).join(',')
   return open === p.openIds.join(',') ? '' : `open tasks relayed as [${open}], the CLI found [${p.openIds.join(',')}]`
 }
-const planned = await cli('plan', { feature: opt.feature || null, maxTasks: opt.maxTasks || null, fromTask: opt.fromTask || null }, PLAN, { label: 'plan', check: planProblem })
+const refactors = opt.refactors || []
+if (refactors.length && opt.findings && opt.findings.length) throw new Error('tdd-flow: pass either findings or refactors, not both.')
+const planned = await cli('plan', { feature: opt.feature || null, maxTasks: opt.maxTasks || null, fromTask: opt.fromTask || null, refactors: refactors.length || null }, PLAN, { label: 'plan', check: planProblem })
 if (!planned.ok && !planned.fallback) throw new Error(`tdd-flow: planning failed. ${planned.error}`)
 if (!planned.ok) log(`plan: ${planned.error} - using the planning agent`)
 const plan = planned.ok ? planned.result : await run(
@@ -173,7 +194,7 @@ const plan = planned.ok ? planned.result : await run(
   '2. approved = true only if spec.md has "Status: approved".\n' +
   '3. Run the full test suite once as a baseline; report pass/fail and a short summary. If the repo has no test framework or no tests yet (stack.md says "none", or no test command exists), do not run anything: set noTestSuite = true, baselinePass = true and testAll/testSingle = "none".\n' +
   '4. For every task in tasks.md return id, title, done (checkbox ticked) and its behaviours: one entry per acceptance criterion or edge case mapped to the task, in implementation order (simplest happy path first). ref = AC/EC id, text = the full Given/When/Then or edge-case text.\n' +
-  '   kind = "setup" if the task line ends with "[setup]" (or its Kind in the spec task table is setup), otherwise "tdd". For setup tasks also return verify: one entry per "Verify:" line of the task\'s criteria in spec.md, with ref = AC id and command = the exact command; for a "Verify (manual):" line set manual = true and command = the check text.\n' +
+  '   kind = "setup" if the task line ends with "[setup]" (or its Kind in the spec task table is setup), "refactor" for "[refactor]" (or Kind refactor), otherwise "tdd". For setup tasks also return verify: one entry per "Verify:" line of the task\'s criteria in spec.md, with ref = AC id and command = the exact command; for a "Verify (manual):" line set manual = true and command = the check text.\n' +
   'Do not modify source or test files. Do not run git commands that change anything.',
   { schema: PLAN, model: M.worker, label: 'plan (agent)', effort: 'low' })
 if (!plan) throw new Error('tdd-flow: planning failed.')
@@ -196,13 +217,22 @@ let ctx = ctxFor()
 const allOpen = plan.tasks.filter(t => !t.done)
 let tasks = allOpen.slice()
 if (opt.fromTask) { const i = tasks.findIndex(t => t.id === opt.fromTask); if (i > 0) tasks = tasks.slice(i) }
+// Synthetic tasks are not in tasks.md and are never ticked: FIX (review findings) and R-n (refactor proposals).
 if (opt.findings && opt.findings.length) {
-  tasks.unshift({ id: 'FIX', title: 'Address review findings', done: false,
+  tasks.unshift({ id: 'FIX', title: 'Address review findings', done: false, synthetic: true,
     behaviours: opt.findings.map((f, i) => ({ ref: `F-${i + 1}`, text: typeof f === 'string' ? f : JSON.stringify(f) })) })
+}
+// A refactors run does only the proposals (e.g. the PR simplification of implement-spec), not open spec tasks.
+if (refactors.length) {
+  tasks = refactors.map((r, i) => {
+    const text = typeof r === 'string' ? r : JSON.stringify(r)
+    return { id: `R-${i + 1}`, title: text.split(/\. Proposal:| - /)[0].slice(0, 70), done: false, synthetic: true, kind: 'refactor',
+      behaviours: [{ ref: `R-${i + 1}`, text }] }
+  })
 }
 if (opt.maxTasks && tasks.length > opt.maxTasks) { log(`Limiting this run to ${opt.maxTasks} of ${tasks.length} open tasks`); tasks = tasks.slice(0, opt.maxTasks) }
 // A task this run implements must come with its criteria; with none, the cycle would do nothing and tick it.
-const empty = tasks.filter(t => t.id !== 'FIX' && !(t.behaviours && t.behaviours.length))
+const empty = tasks.filter(t => !t.synthetic && !(t.behaviours && t.behaviours.length))
 if (empty.length) throw new Error(`tdd-flow: the plan has no criteria for ${empty.map(t => t.id).join(', ')}. Rerun; if it repeats, check the AC/EC ids of these tasks in tasks.md and spec.md.`)
 if (!tasks.length) {
   // Every task is ticked but the spec was never marked (e.g. finished before the status existed): mark it now.
@@ -428,20 +458,76 @@ async function setupStep(task, findings = null) {
   return { ok: true, files: changedFiles(r.attempts) }
 }
 
+// Refactor task (behaviour-preserving change, e.g. a simplify proposal). CHARACTERIZE: the test-writer names or writes
+// tests that pin today's behaviour; they are committed on their own after the CLI ran the full suite on the old code,
+// so any later edit of them shows in the review diff. REFACTOR: the implementer applies the proposal, without
+// touching those tests, until suite, lint and type check pass.
+// Returns {ok:true, files, info} | {ok:false, notApplicable:true, reason} | {ok:false, step, details}
+async function refactorStep(task) {
+  const proposal = task.behaviours.map(b => b.text).join('\n')
+  const charProblems = (r) => r.tests.length ? r.tests.filter(t => t.result !== 'PASS').map(t => `${t.testFile} :: ${t.testName}: ${t.result}`) : ['no test reported']
+  const ch = await escalate(`${task.id} CHARACTERIZE`,
+    (model, extra, label) => run(
+      `CHARACTERIZE step. ${ctx}\nTask ${task.id} (refactor - behaviour must not change): ${task.title}\nProposal:\n${proposal}\n` +
+      'Pin the current behaviour this change must keep, before any production code changes. For a removal (dead code, an unused option or layer), pin the behaviour of its callers and entry points, not of the removed code. ' +
+      'Report existing tests that already pin it (new = false) and write characterization tests where nothing does (new = true). Every reported test must PASS on the current code; give the function or path each one exercises. ' +
+      `If the proposal no longer applies to the current code (already done, code gone) or cannot be done without changing behaviour, set applicable = false with the reason and write nothing. Append a CHARACTERIZE entry for ${task.id} to ${dir}/tdd-log.md.` + extra,
+      { agentType: A('test-writer'), model, schema: CHAR, label, phase: 'Implement' }),
+    r => r.applicable !== false && !charProblems(r).length,
+    r => `Not done yet:\n${charProblems(r).join('\n')}\nA characterization test must pass on today's code: fix the test, never production code.`,
+    r => r.applicable === false)
+  if (ch.result && ch.result.applicable === false) return { ok: false, notApplicable: true, reason: ch.result.reason || 'proposal does not apply' }
+  if (!ch.ok) return { ok: false, step: `${task.id} CHARACTERIZE`, details: ch.result ? charProblems(ch.result).join('\n') : 'agent failed' }
+  const pinned = ch.result.tests
+  const newFiles = [...new Set(pinned.filter(t => t.new).map(t => t.testFile))]
+  const saved = await cli('commit', { message: `test(${plan.slug}): ${task.id} characterize ${task.title}`, files: [...newFiles, `${dir}/tdd-log.md`], runTests: true },
+    COMMIT, { label: `${task.id} characterize commit`, phase: 'Implement' })
+  const sc = saved.ok ? saved.result : null
+  if (!sc || (!sc.committed && !sc.nothingToCommit)) return { ok: false, step: `${task.id} CHARACTERIZE COMMIT`, details: sc ? sc.reason || 'commit failed' : saved.error }
+  const info = { proposal, pinned, newFiles, removed: [] }
+  const r = await refactorChange(task, info)
+  return r.ok ? { ...r, info } : r
+}
+const pinnedList = (info) => info.pinned.map(t => `- ${t.testFile} :: ${t.testName} (${t.exercises})`).join('\n')
+async function refactorChange(task, info, findings = null) {
+  const touched = (r) => (r.filesChanged || []).filter(f => info.newFiles.includes(f))
+  const name = `${task.id} REFACTOR${findings ? ' fix' : ''}`
+  const r = await escalate(name,
+    (model, extra, label) => run(
+      `REFACTOR step. ${ctx}\nTask ${task.id} (refactor - behaviour must not change): ${task.title}\nProposal:\n${info.proposal}\n` +
+      `These tests pin the current behaviour and are committed. Never edit them:\n${pinnedList(info)}\n` +
+      (findings ? `Address these review findings (a behaviour change must be undone, not tested away):\n${JSON.stringify(findings, null, 1)}\n` : 'Apply the proposal and nothing else. ') +
+      'You may delete or adapt a test only if it exercises nothing but code this change removes; list each one in testsRemoved with the reason. ' +
+      'Run the full suite, lint and the type check or build (the typecheck script or `tsc --noEmit` for TypeScript, the compile step of a compiled language); suitePass = all of them pass. ' +
+      'List every changed, created and deleted file in filesChanged, both paths of a rename. If the change cannot be made without changing behaviour, or no longer applies, set applicable = false with the reason and restore the files you changed.' + extra,
+      { agentType: A('implementer'), model, schema: REFAC, label, phase: findings ? 'Review' : 'Implement' }),
+    r => r.applicable !== false && r.suitePass && !touched(r).length,
+    r => touched(r).length
+      ? `You edited the characterization tests ${touched(r).join(', ')}: restore them (\`git checkout HEAD -- <file>\`) and change production code instead.`
+      : `Suite, lint or type check still fail:\n${r.failures || r.summary}`,
+    r => r.applicable === false)
+  if (r.result && r.result.applicable === false) return { ok: false, notApplicable: true, reason: r.result.reason || 'proposal does not apply' }
+  if (!r.ok) return { ok: false, step: name, details: r.result ? (r.result.failures || r.result.summary) : 'agent failed' }
+  r.attempts.forEach(a => (a.testsRemoved || []).forEach(t => info.removed.push(t)))
+  return { ok: true, files: changedFiles(r.attempts) }
+}
+
 // ---------- Implement + Review, task by task (sequential: one working tree) ----------
 const done = []
+const skippedTasks = []
 let current = null
 let specStatus = plan.status || null
 try {
   for (const task of tasks) {
     const isSetup = task.kind === 'setup'
+    const isRefactor = task.kind === 'refactor'
     if (!isSetup && !hasTests) {
-      return await blocked(task, 'NO TEST SUITE', `${task.id} is a tdd task, but the repo has no test command yet.`, false,
+      return await blocked(task, 'NO TEST SUITE', `${task.id} is a ${task.kind || 'tdd'} task, but the repo has no test command yet.`, false,
         `Add a [setup] task before ${task.id} that installs the test framework and updates .tdd-flow/stack.md (or set the framework up by hand), then rerun /tdd-flow:tdd-implement.`)
     }
     // Start a task only if its minimum cost fits: tdd = RED + GREEN per batch, review, commit;
-    // setup = setup step, review, commit.
-    const est = isSetup ? 3 : Math.max(1, Math.ceil(task.behaviours.length / BATCH)) * 2 + 2
+    // setup = setup step, review, commit; refactor = characterize + its commit, refactor, review, commit.
+    const est = isSetup ? 3 : isRefactor ? 5 : Math.max(1, Math.ceil(task.behaviours.length / BATCH)) * 2 + 2
     if (spawned + est + 1 > MAX_AGENTS) {
       return { status: 'agent_limit', slug: plan.slug, branch: br.branch, tasksCompleted: done, escalationsToStrongModel: escalations,
         next: done.length
@@ -449,10 +535,20 @@ try {
           : `Task ${task.id} needs at least ${est} agents, but only ${MAX_AGENTS - spawned - 1} are left. Rerun with a higher {maxAgents}.` }
     }
     current = task
-    log(`${task.id}: ${task.title} (${isSetup ? 'setup task' : task.behaviours.length + ' behaviour(s)'})`)
+    log(`${task.id}: ${task.title} (${isSetup ? 'setup task' : isRefactor ? 'refactor task' : task.behaviours.length + ' behaviour(s)'})`)
     const taskFiles = new Set()
     const testFixes = []
-    if (isSetup) {
+    let refInfo = null, skipReason = ''
+    if (isRefactor) {
+      const r = await refactorStep(task)
+      if (r.notApplicable) {
+        skipReason = r.reason
+        log(`${task.id}: skipped - ${r.reason}`)
+        skippedTasks.push({ task: task.id, title: task.title, reason: r.reason })
+        if (task.synthetic) continue
+      } else if (!r.ok) return await blocked(task, r.step, r.details)
+      else { r.files.forEach(f => taskFiles.add(f)); refInfo = r.info }
+    } else if (isSetup) {
       const s = await setupStep(task)
       if (!s.ok) return await blocked(task, s.step, s.details)
       s.files.forEach(f => taskFiles.add(f))
@@ -463,7 +559,13 @@ try {
       testFixes.push(...t.testFixes)
     }
 
-    const scope = isSetup
+    const scope = isRefactor
+      ? `Task kind: refactor (behaviour-preserving). Proposal: ${refInfo ? refInfo.proposal : ''}\n` +
+        `Tests that pinned the behaviour, committed before the change (they must be unchanged in the diff):\n${refInfo ? pinnedList(refInfo) : ''}\n` +
+        (refInfo && refInfo.removed.length ? `Tests removed or adapted because they only exercised removed code - check each one:\n${refInfo.removed.map(t => `- ${t.file} :: ${t.test}: ${t.reason}`).join('\n')}\n` : '') +
+        `Check that behaviour is unchanged (callers, edge cases, error paths), the pinned tests were not edited, the proposal is done and nothing beyond it was added. Report "proposal not done" as uncoveredAcs = ["${task.behaviours[0].ref}"]. ` +
+        'Mark a finding behavioural = true only if the change altered behaviour.'
+      : isSetup
       ? `Task kind: setup (config/infrastructure, no red-green cycle). Criteria in scope: ${task.behaviours.map(b => b.ref).join(', ')}. ` +
         `Verify commands: ${(task.verify || []).filter(v => !v.manual).map(v => `${v.ref}: \`${v.command}\``).join('; ') || 'none'}. ` +
         'The evidence is the verify commands, not tests: re-run them. A criterion whose command fails or is missing is an uncovered AC; a command that cannot run here (tool or daemon missing) is not. ' +
@@ -471,7 +573,7 @@ try {
         (hasTests ? '' : ' There is no test suite yet: report testsPass = true.')
       : `ACs in scope: ${task.behaviours.map(b => b.ref).join(', ')}.`
     let review = null
-    for (let round = 1; round <= MAX_REVIEW_ROUNDS + 1; round++) {
+    for (let round = 1; !skipReason && round <= MAX_REVIEW_ROUNDS + 1; round++) {
       review = await run(
         `Review task ${task.id} (${task.title}). ${ctx}\nScope: uncommitted changes (\`git diff HEAD\` plus untracked files). ${scope}\n` +
         (testFixes.length ? `These tests were changed by the test-writer after the implementer reported them as wrong, so they were never seen failing in that form. Check each still asserts its behaviour fully (no weakened or removed assertion); a weakened one is a blocker with behavioural=true:\n${testFixes.map(f => '- ' + f).join('\n')}\n` : '') +
@@ -483,6 +585,17 @@ try {
       if (round > MAX_REVIEW_ROUNDS) return await blocked(task, 'REVIEW', `Not approved after ${MAX_REVIEW_ROUNDS} fix rounds:\n${JSON.stringify(review, null, 1)}`)
 
       log(`${task.id}: review round ${round} requested changes (${must.length} finding(s), ${review.uncoveredAcs.length} uncovered AC(s))`)
+      if (isRefactor) {
+        // No RED for a refactor: every finding goes back to the change itself; the pinned tests stay as committed.
+        const f = await refactorChange(task, refInfo, [
+          ...review.uncoveredAcs.map(() => 'The proposal is not done yet: finish it.'),
+          ...must,
+          ...(review.testsPass ? [] : ['The reviewer reported failing tests, lint or type check - fix production code, never weaken tests.']),
+        ])
+        if (!f.ok) return await blocked(task, 'REVIEW FIX', f.notApplicable ? `cannot fix without changing behaviour: ${f.reason}` : f.details)
+        f.files.forEach(x => taskFiles.add(x))
+        continue
+      }
       if (isSetup) {
         // Setup tasks have no red-green cycle: every finding goes back to a SETUP fix step.
         const s = await setupStep(task, [
@@ -518,18 +631,19 @@ try {
     }
 
     // Closing the task (tick + state) is bookkeeping done by the commit agent before staging, so it lands in the same commit.
-    const next = task.id === 'FIX' ? allOpen[0] : allOpen[allOpen.findIndex(t => t.id === task.id) + 1]
-    const needsTick = task.id !== 'FIX'
+    const next = task.synthetic ? allOpen[0] : allOpen[allOpen.findIndex(t => t.id === task.id) + 1]
+    const needsTick = !task.synthetic
     // The commit that closes the last open task of the spec (not only of this run) also sets "Status: implemented".
     const finishesSpec = needsTick && allOpen.every(t => t.id === task.id || done.some(d => d.task === t.id))
     const state = { feature: plan.slug, phase: 'IDLE', task: next ? next.id : 'DONE' }
     const commitFiles = [...new Set([...taskFiles, `${dir}/tasks.md`, `${dir}/tdd-log.md`, `${dir}/review.md`, '.tdd-flow/state.json',
       ...(isSetup ? ['.tdd-flow/stack.md'] : []), ...(finishesSpec ? [`${dir}/spec.md`] : [])])]
-    const type = task.id === 'FIX' ? 'fix' : isSetup ? 'chore' : 'feat'
+    const type = task.id === 'FIX' ? 'fix' : isSetup || skipReason ? 'chore' : isRefactor ? 'refactor' : 'feat'
     // The CLI ticks the task line (T-1 never matches T-10), writes state.json, stages only these files, refuses
     // secrets and files over 5 MB, and commits. It never pushes.
     const committed = await cli('commit', {
-      message: `${type}(${plan.slug}): ${task.id} ${task.title}`, files: commitFiles, state,
+      message: skipReason ? `chore(${plan.slug}): ${task.id} skipped - ${skipReason.split('\n')[0].slice(0, 100)}` : `${type}(${plan.slug}): ${task.id} ${task.title}`,
+      files: commitFiles, state, includeDeletions: isRefactor && !skipReason,
       tick: needsTick ? { file: `${dir}/tasks.md`, task: task.id } : null,
       specStatus: finishesSpec ? { file: `${dir}/spec.md`, value: 'implemented' } : null,
     }, COMMIT, { label: `${task.id} commit`, phase: 'Review' })
@@ -544,13 +658,15 @@ try {
     if (commit.unexpected && commit.unexpected.length) log(`${task.id}: not committed (unexpected): ${commit.unexpected.join(', ')}`)
     if (finishesSpec && commit.specStatus !== 'implemented') log(`${task.id}: spec status not set to implemented - ${commit.specStatusSkipped || commit.reason || 'no "Status:" line in spec.md'}`)
     if (finishesSpec && commit.specStatus === 'implemented') specStatus = 'implemented'
-    done.push({ task: task.id, title: task.title, commit: commit.sha || '' })
+    done.push({ task: task.id, title: task.title, commit: commit.sha || '', ...(skipReason ? { skipped: skipReason } : {}) })
   }
 } catch (e) {
   if (!limitHit) throw e
   const r = await blocked(current, 'AGENT LIMIT', `Agent limit (${MAX_AGENTS}) reached during ${current.id}. Its uncommitted changes are still in the working tree.`)
   return { ...r, status: 'agent_limit', tasksCompleted: done,
-    next: `Stopped at the agent limit (${MAX_AGENTS}) in the middle of ${current.id}. Its uncommitted changes are still in the working tree: rerun /tdd-flow:tdd-implement to redo the task on top of them, or stash them first.` }
+    next: current.kind === 'refactor'
+      ? `Stopped at the agent limit (${MAX_AGENTS}) in the middle of refactor ${current.id}. Set its uncommitted changes aside first (\`tdd-flow set-aside\`), so the rerun starts from the committed code.`
+      : `Stopped at the agent limit (${MAX_AGENTS}) in the middle of ${current.id}. Its uncommitted changes are still in the working tree: rerun /tdd-flow:tdd-implement to redo the task on top of them, or stash them first.` }
 }
 
 return {
@@ -559,6 +675,7 @@ return {
   branch: br.branch,
   specStatus,
   tasksCompleted: done,
+  skipped: skippedTasks,
   escalationsToStrongModel: escalations,
   unverified: [...unverified.values()],
   logs: [`${dir}/tdd-log.md`, `${dir}/review.md`],

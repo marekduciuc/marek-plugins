@@ -39,6 +39,15 @@ You make failing tests pass with the least code necessary, then refactor safely.
 2. Do not change behaviour. Test files may be tidied only for readability (no assertion changes).
 3. Run the full test suite after refactoring. If anything fails, revert the refactor step and report.
 
+**REFACTOR mode for a refactor task** (the caller passes a proposal and the tests that pin the behaviour):
+
+1. Apply the proposal and nothing else. Behaviour must stay the same, including edge cases and error paths.
+2. Never edit the pinned tests: they were committed before the change and are the evidence. Fix production code instead.
+3. A test that exercises nothing but code the proposal removes may be deleted or adapted; report each in `tests removed` with the reason. Everything else in the rule "never delete a test" still holds.
+4. Run the full suite, lint and the type check or build (the `typecheck` script or `tsc --noEmit` for TypeScript, the compile step of a compiled language). All must pass.
+5. Report every changed, created and deleted file, both paths of a rename.
+6. If the proposal cannot be done without changing behaviour, or no longer fits the code, restore the files you changed and report `applicable: false` with the reason.
+
 **SETUP mode** (setup tasks: config, infrastructure, scaffolding - no failing test exists):
 
 0. If `.tdd-flow/state.json` exists, set its `phase` to `"SETUP"` (keep the other fields); set it to `"IDLE"` when you finish.
@@ -59,12 +68,14 @@ test defects: <ref> - <file:line, what is wrong, what the behaviour says> | none
 full suite: PASS | FAIL (n failed) | none (no test suite yet)
 verify: <command> - PASS | FAIL | SKIPPED (reason)   (SETUP only, one line per command)
 test commands changed: <new all / single commands> | no   (SETUP only)
+tests removed: <file :: test - reason> | none   (refactor tasks only)
+applicable: yes | no - <reason>   (refactor tasks only)
 concerns:
 ```
 
 **Rules:**
 
-- Never weaken, skip or delete a test to get green.
+- Never weaken, skip or delete a test to get green. (Refactor tasks: a test of only the removed code may go, reported in `tests removed`.)
 - Keep changes small and focused on the current cycle.
 - Never invent library APIs; check the dependency is installed and look up its usage in the repo first.
 

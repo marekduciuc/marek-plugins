@@ -8,7 +8,8 @@ Personal Claude Code plugin: an end-to-end dev pipeline built on **dynamic workf
 - **Agents** (`agents/*.md`): the specialists the workflows call (`agentType: "tdd-flow:<agent>"`). They also carry the domain knowledge: spec template, TDD rules, doc templates.
 - **CLI** `bin/tdd-flow`: the deterministic steps (parsing the spec, git bookkeeping, commits, GitHub preflight, CI polling) as plain Node code. Workflow scripts cannot run commands, so they call it through the `script-runner` agent (Haiku, Bash only, a few lines of prompt) instead of a reasoning agent. See [tdd-flow CLI](#tdd-flow-cli).
 - **Skill** `ship-feature`: chains the workflows and holds the human approval gates. Workflows can't ask questions mid-run, so the gates sit between runs.
-- **Skills** `autopilot` + `implement-spec`: implement every approved spec in parallel, one background session per spec in its own worktree, each ending with a code review and a PR. See [Autopilot](#autopilot).
+- **Skills** `autopilot` + `implement-spec`: implement every approved spec in parallel, one background session per spec in its own worktree, each ending with a simplification pass, a code review and a PR. See [Autopilot](#autopilot).
+- **Skill** `simplify-codebase`: finds code that does not need to exist across the repo and turns it into refactor specs. See [Simplification](#simplification).
 - **Hook** `tdd-guard`: blocks production-code edits while a cycle is in RED.
 - **Hook** `push-gate`: before Claude runs `git push` or `gh pr create` in any repo, runs the type check, lint and tests and a gitleaks secret scan; a failure blocks the command. See [push-gate](#push-gate).
 
@@ -17,12 +18,14 @@ Personal Claude Code plugin: an end-to-end dev pipeline built on **dynamic workf
 | Command | Shape | Agents (typical) |
 |---|---|---|
 | `/tdd-flow:analyze-requirements <issue \| file \| text>` | Context (stack + fetch, parallel) → 3 analysts from different angles (behaviour / risk / minimal scope) → synthesize spec.md + tasks.md → testability & completeness critics → revise | ~8-9 |
-| `/tdd-flow:tdd-implement {feature}` | Plan + baseline → per task, sequentially: RED (test-writer writes all of the task's failing tests) → GREEN (implementer makes them pass one at a time, then refactors) → review with up to 2 fix rounds (behavioural findings go through RED → GREEN again) → commit (also ticks the task). `[setup]` tasks: SETUP + verify commands → review → commit | ~4 per task (2 more per 5 extra behaviours); ~3 per setup task |
+| `/tdd-flow:tdd-implement {feature}` | Plan + baseline → per task, sequentially: RED (test-writer writes all of the task's failing tests) → GREEN (implementer makes them pass one at a time, then refactors) → review with up to 2 fix rounds (behavioural findings go through RED → GREEN again) → commit (also ticks the task). `[setup]` tasks: SETUP + verify commands → review → commit. `[refactor]` tasks and `{refactors}`: CHARACTERIZE → its own commit → REFACTOR → review → commit | ~4 per task (2 more per 5 extra behaviours); ~3 per setup task; ~5 per refactor task |
 | `/tdd-flow:document {feature}` | Survey diff → pipeline per target: write → adversarial fact-check → fix → commit | ~6-14 |
 | `/tdd-flow:deploy {feature}` | Preflight → 3 review lenses (spec, security, quality) → dedupe → 2 skeptics per finding → PR → CI watch with test-first fix loop (max 2) → stops at `ready_to_merge` | ~8-12 |
 | `/tdd-flow:deploy {feature, mode:"merge", approved:true}` | PR review status check → merge (+ optional release) → watch post-merge pipeline → close out | ~3 |
 | `/tdd-flow:ship-feature <input>` (skill) | Runs everything above with Gate 1 (spec approval) and Gate 2 (merge approval) | - |
-| `/tdd-flow:autopilot [slug ...] [--parallel N]` (skill) | Per approved spec, up to N at once: worktree → background session running `implement-spec` (one tdd-implement run per task → superpowers code review → one fix round → push + PR) → summary of PRs | per spec as tdd-implement, plus review and fix round |
+| `/tdd-flow:simplify {mode, ...}` | `diff` (implement-spec): simplifier on the branch diff → sceptic (Opus) refutes → at most 8 proposals. `codebase`: areas → per area simplifier → sceptic → drop findings that touch another area's files → draft refactor specs | 2 (diff); ~2 per area + 1 per spec (codebase) |
+| `/tdd-flow:autopilot [slug ...] [--parallel N]` (skill) | Per approved spec, up to N at once: worktree → background session running `implement-spec` (one tdd-implement run per task → simplify the PR → superpowers code review → one fix round → push + PR) → summary of PRs | per spec as tdd-implement, plus ~5 per simplification, review and fix round |
+| `/tdd-flow:simplify-codebase [path ...] [--implement [slug ...]]` (skill) | `simplify` in codebase mode → draft specs for you to review; with `--implement`: `spec-branch` per spec → autopilot | as `simplify`, then as autopilot |
 
 ### Spec status
 
@@ -42,6 +45,21 @@ Some work cannot be test-driven: `docker-compose.yml`, `Dockerfile`, CI pipeline
 
 A task is `setup` only if it has no logic that a test could check. Logic always goes into a tdd task, and the spec critics and the per-task reviewer flag misclassified tasks. tdd-implement builds a setup task in one SETUP step (implementer). The step runs every verify command and must not break the test suite. The task then gets the normal review, and is committed as `chore(<slug>): ...`. A verify command that cannot run in the environment (for example, the Docker daemon is not running) is reported, not treated as a failure. Such commands are listed in `unverified` in the result, together with the manual checks.
 
+### Refactor tasks
+
+A `[refactor]` task changes code without changing behaviour. The simplifier's findings become such tasks. There is no failing test to start from, so tdd-implement proves the behaviour differently:
+
+1. **CHARACTERIZE** (test-writer, phase RED, so production code is locked). It names the existing tests that pin the behaviour the change must keep. Where nothing pins it, it writes characterization tests. For a removal, it pins the callers. For a swap to a stdlib function, it pins the edge inputs. Each test must pass on today's code.
+2. The CLI commits those tests as `test(<slug>): T-n characterize ...` after running the full suite on the old code. From here on, any edit to them shows up in the review diff.
+3. **REFACTOR** (implementer):
+   - applies the proposal; suite, lint and type check must pass;
+   - an edit to a new characterization test is sent back;
+   - a test that only covered removed code may go, and is listed for the reviewer;
+   - deletions and renames are committed too (`includeDeletions`).
+4. Review checks that behaviour stayed the same and that the pinned tests did not change. Its findings go back to REFACTOR, never to a new RED. The task is committed as `refactor(<slug>): ...`.
+
+If the change no longer fits the code (an earlier task removed it) or cannot be made without changing behaviour, the task is skipped: ticked in a `chore(<slug>): T-n skipped - <reason>` commit and listed in `skipped`. `{refactors: [...]}` runs proposals as synthetic tasks `R-1..`. It runs only those, not open spec tasks; they are never ticked and get one commit each.
+
 **Bootstrapping a new project.** The repo does not need a test suite yet. The baseline counts as passing. A setup task can install the test framework and update `.tdd-flow/stack.md`, and the tdd tasks after it use the new test commands. A tdd task with no test command stops with `blocked`.
 
 Merge mode stops with `review_changes_requested` when a reviewer requested changes on the PR. Pass `requireReview: true` to also require an approving review (`review_required` otherwise). This is off by default because GitHub does not let you approve your own PR.
@@ -59,13 +77,17 @@ Each workflow returns `{status, ..., next}`. If a coding step still fails after 
 | `context` | analyze-requirements | Reads an existing `.tdd-flow/stack.md`; fetches a GitHub issue (`gh issue view`) or reads a spec file. Text input needs no fetch. |
 | `plan` | tdd-implement | Parses `spec.md` and `tasks.md` (tasks, behaviours, verify commands, approval) and runs the baseline suite. Criteria text only for the tasks the run reaches (`maxTasks`, `fromTask`); returns `taskCount` and `openIds`, which the workflow checks against the relayed plan |
 | `branch` | tdd-implement | Switches to or creates `feature/<slug>` |
-| `commit` | tdd-implement, document | Optionally sets the spec status (`specStatus`), ticks the task line (`T-1` never matches `T-10`), writes `state.json`, stages only the listed files, refuses secret-looking content, secret files and files over 5 MB (plus gitleaks on the staged changes when installed), commits. Never pushes. |
+| `commit` | tdd-implement, document | Optionally sets the spec status (`specStatus`), ticks the task line (`T-1` never matches `T-10`), writes `state.json`, stages only the listed files (plus every tracked deletion with `includeDeletions`, for refactors), optionally runs the full suite first (`runTests`), refuses secret-looking content, secret files and files over 5 MB (plus gitleaks on the staged changes when installed), commits. Never pushes. |
 | `block` | tdd-implement | Records a stop: `state.json` phase `IDLE`, an entry in `tdd-log.md`, optional untick |
 | `preflight` | deploy | Base and current branch, open tasks, CI, `gh` auth and `workflow` scope, secret scan, open PR and its review status |
 | `ci-watch` | deploy | Polls `gh pr checks` (or `gh run list --commit` after merge) for up to 30 minutes; on failure returns the failed-step log tail. Each call stops after about 8.5 minutes with `"again": true` and the runner repeats it. |
 | `ci-rerun`, `add-secret-scan`, `close-out` | deploy | Rerun failed jobs; add the gitleaks workflow; mark the spec done and reset `state.json` |
-| `specs` | autopilot | Checks that `.tdd-flow/` is in git and `state.json` is not; lists the specs to start, with their title (status `approved` on `feature/<slug>` or, without that branch, on the base; committed, no local changes, no session running, not blocked last time unless named) and why the others are skipped |
+| `specs` | autopilot | Checks that `.tdd-flow/` is in git and `state.json` is not; lists the specs to start, with their title (status `approved` on `feature/<slug>` or, without that branch, on the base; committed, no local changes, no session running, not blocked last time unless named) and why the others are skipped. A spec that exists only on `feature/<slug>` (from `spec-branch`) is taken only when named |
 | `worktree` | autopilot | Creates or reuses `.claude/worktrees/<slug>` on `feature/<slug>`; adds `/.claude/worktrees/` and `/.tdd-flow/state.json` to `.git/info/exclude` |
+| `areas` | simplify | Splits the tracked source files (no tests, generated, vendored or migration code) into scan areas: a directory that fits (40 files, 400 KB) is one area, small siblings are packed together, larger ones are split. Deterministic |
+| `simplify-spec` | simplify | Writes one area's findings as draft specs of `[refactor]` tasks, at most 8 per spec (`simplify-<area>`, `-2`, ...). A slug is taken if its folder, its spec on the base, a local or remote `feature/<slug>` or its worktree exists |
+| `spec-branch` | simplify-codebase | Approves an uncommitted draft on its own branch: creates the worktree, copies the spec there, sets `approved`, commits it on `feature/<slug>`, then removes the folder from the main checkout. Never touches the base branch; refuses without a test command, for a spec already in git, or for an existing branch |
+| `set-aside` | implement-spec | Saves the uncommitted changes of a failed step as a patch in `<git common dir>/tdd-flow/runs/<slug>-<label>.patch` and restores the working tree to `HEAD` (no stash: one stash list is shared by all worktrees). Only on a feature branch |
 | `replay` | every workflow | Prints the saved output of an earlier call again (see the relay check below), without running the command a second time |
 | `cleanup` | autopilot (at start) | Removes the worktree, background session, run file and branch (`-d`) of each spec whose PR is merged at the branch tip. Keeps, with the reason: an open PR, later commits, an open session, uncommitted or untracked changes, or ignored files other than build output, dependencies and IDE metadata. Never forces |
 | `run-report` | autopilot, implement-spec | Writes a run result (`running` / `done` / `blocked`, session id, PR URL, details) to `<git common dir>/tdd-flow/runs/<slug>.json`, shared by all worktrees and never committed |
@@ -83,12 +105,12 @@ Self-check: `node --test plugins/tdd-flow/tests/` from the repo root.
 0. `tdd-flow cleanup` removes the worktrees (~1 GB each with `node_modules` and build output) of specs whose PR is merged; see the CLI table for what it keeps.
 1. `tdd-flow specs` selects the specs (see the CLI table) and shows why the others are skipped.
 2. For each spec, at most N at a time (`--parallel N`, default 3): `tdd-flow worktree` creates `.claude/worktrees/<slug>` on `feature/<slug>`, and `claude --bg -n <name> "/tdd-flow:implement-spec <slug> <base>"` starts a background session there. `<name>` is a 3-word kebab-case summary of the spec (e.g. `invitation-password-reset`), so you watch it with `claude attach invitation-password-reset`.
-3. `implement-spec`, in that session: installs JavaScript dependencies the fresh worktree lacks (frozen install per tracked lockfile: `npm ci`, `pnpm install --frozen-lockfile`, `yarn install --immutable`/`--frozen-lockfile`, `bun install --frozen-lockfile`) → one `tdd-implement {maxTasks: 1}` run per task, in `tasks.md` order (a task that hits `agent_limit` gets one more run) → `superpowers:requesting-code-review` over the branch (falls back to the `code-reviewer` agent without superpowers) → Critical and Important findings go through one `tdd-implement {findings}` run, with no second review → `git push` (push-gate runs the checks) → `gh pr create` with goal, ACs, tasks, review findings (Minor ones listed) and unverified checks. It ends with `tdd-flow run-report`.
+3. `implement-spec`, in that session: installs JavaScript dependencies the fresh worktree lacks (frozen install per tracked lockfile: `npm ci`, `pnpm install --frozen-lockfile`, `yarn install --immutable`/`--frozen-lockfile`, `bun install --frozen-lockfile`) → one `tdd-implement {maxTasks: 1}` run per task, in `tasks.md` order (a task that hits `agent_limit` gets one more run) → simplification of the whole PR (see [Simplification](#simplification)) → `superpowers:requesting-code-review` over the branch (falls back to the `code-reviewer` agent without superpowers) → Critical and Important findings go through one `tdd-implement {findings}` run, with no second review → `git push` (push-gate runs the checks) → `gh pr create` with goal, ACs, tasks, review findings (Minor ones listed) and unverified checks. It ends with `tdd-flow run-report`.
 4. `tdd-flow runs-wait`, in a background Bash call, waits for results. The autopilot then starts the next queued spec and finally prints a table: PR URL, or why a spec is blocked or stalled, and `claude attach <name>` for those.
 
 **Requirements**
 
-- `.tdd-flow/` is committed: the worktree gets the spec from git, and the status is committed with the code. `specs` stops if `.tdd-flow/` is git-ignored or `.tdd-flow/state.json` is tracked (every PR would change it). A spec must be committed on the base branch without local changes in `spec.md`/`tasks.md`.
+- `.tdd-flow/` is committed: the worktree gets the spec from git, and the status is committed with the code. `specs` stops if `.tdd-flow/` is git-ignored or `.tdd-flow/state.json` is tracked (every PR would change it). A spec must be committed on the base branch without local changes in `spec.md`/`tasks.md` (or, from `simplify-codebase --implement`, committed only on its `feature/<slug>` and named in the slugs).
 - The repo folder is trusted in Claude Code (worktrees under `.claude/worktrees/` inherit it), and `gh` is logged in.
 - Background sessions pause at permission prompts until you attach. Allow what they need (the Workflow tool for the tdd-flow workflows, `Bash(tdd-flow:*)`, your test commands, `Bash(git:*)`, `Bash(gh pr:*)`, Edit, Write) or use auto mode.
 
@@ -97,7 +119,31 @@ Self-check: `node --test plugins/tdd-flow/tests/` from the repo root.
 - A run that ends `blocked` keeps its worktree. Fix the cause there and run `/tdd-flow:autopilot <slug>`: it resumes from `tasks.md`. Without the slug, blocked specs are skipped.
 - `stalled` means the session went idle without a report, for example because it asked a question. Answer it with `claude attach <name>`.
 - N sessions use the rolling rate-limit window N times faster. Tests running at the same time can collide on ports, a shared local database or docker compose; use `--parallel 1` for such repos. PRs of parallel specs can conflict; that is resolved at merge.
-- Worktrees stay until you remove them (`claude rm <id>` or `git worktree remove .claude/worktrees/<slug>`), so fixes after PR review can go into the same branch.
+- Worktrees stay until the PR is merged, so fixes after PR review can go into the same branch. The next autopilot start removes them (step 0).
+
+## Simplification
+
+The `simplifier` agent looks for code that does not need to exist. Each finding gets one tag:
+- `duplicate`
+- `dead-code`
+- `single-use-abstraction`
+- `reinvented`: the stdlib, the platform or an installed dependency already does it
+- `speculative`: options or parameters no caller uses
+- `pass-through`
+
+It proves each claim from the code with `git grep` over tracked files, never `.claude/worktrees/`. It proposes only behaviour-preserving changes and rates the risk. A finding on a public contract, or on names used through strings, reflection or DI, is `high`: it is listed for you, never applied. A sceptic (the code-reviewer on Opus) then tries to refute every finding; only findings that survive go on.
+
+**Per PR** (implement-spec step 2, every autopilot spec):
+- The workflow `simplify {mode: "diff"}` checks the branch diff.
+- Each of the at most 8 confirmed proposals runs as its own `tdd-implement {refactors: [one]}`, so one failure does not stop the others. A failed one is set aside with `tdd-flow set-aside` (a patch, not a stash) and listed in the PR body.
+- The superpowers review then covers the simplification commits too.
+- Specs from simplify-codebase skip this step.
+
+**Across the codebase:** `/tdd-flow:simplify-codebase [path ...]`.
+- It scans area by area (at most 12 per run) and drops findings whose files belong to another area's finding, so the PRs do not conflict.
+- It writes draft specs (`simplify-<area>`, `Source: tdd-flow simplify-codebase`, at most 8 `[refactor]` tasks each) and stops so you can review them.
+- `--implement [slug ...]` approves them with `tdd-flow spec-branch`: each gets its own branch and worktree, and nothing is committed to the base. It then starts the autopilot with those slugs. Each spec ends as a `refactor(<slug>): ...` PR.
+- A repo without a test command is refused: refactor tasks are checked by the suite.
 
 ## push-gate
 
@@ -136,7 +182,8 @@ Workflows set the model on each call, so each step uses the cheapest model that 
 | Step | Model |
 |---|---|
 | Analyst drafts (x3), spec critics, per-task review, doc writing + fact-check, deploy sceptics | **Sonnet** (worker) |
-| Test-writer (RED), implementer (GREEN + REFACTOR / fixes) | **Sonnet**, auto-escalated to **Opus** if the step fails twice |
+| Test-writer (RED, CHARACTERIZE), implementer (GREEN + REFACTOR / fixes) | **Sonnet**, auto-escalated to **Opus** if the step fails twice |
+| Simplifier scan | **Sonnet** (worker); the sceptic that refutes its findings is **Opus** |
 | Spec synthesis + revision, final pre-merge review (3 lenses) | **Opus** (strong) |
 | CLI steps through `script-runner` (spec parsing, branch, commits, preflight, CI polling, close-out), stack detection, fetching non-GitHub issues | **Haiku** (light) |
 | Classifying a failed CI check from its log | **Sonnet** (worker), low effort |
@@ -153,8 +200,9 @@ Override per run with `args.models`, e.g. `{feature: "x", models: {worker: "opus
 |---|---|---|
 | stack-detector | haiku | Language, test/build/lint commands, CI, tracker |
 | requirements-analyst | sonnet (opus for synthesis) | Drafts and synthesizes specs |
-| test-writer | sonnet | RED: one failing test per behaviour, never production code |
-| implementer | sonnet | GREEN minimal code, one test at a time, + REFACTOR; SETUP for setup tasks |
+| test-writer | sonnet | RED: one failing test per behaviour, never production code; CHARACTERIZE: tests that pin today's behaviour before a refactor |
+| implementer | sonnet | GREEN minimal code, one test at a time, + REFACTOR; SETUP for setup tasks; the change of a refactor task |
+| simplifier | sonnet | Read-only: finds duplicates, dead code, single-use abstractions, reinvented helpers, speculative options and pass-through layers, with behaviour-preserving proposals |
 | code-reviewer | sonnet (opus for final review) | Read-only review and fact-checking |
 | doc-writer | sonnet | Docs from the actual diff |
 | release-engineer | sonnet | Push + PR, CI fix commits, merge/release (only with approval); preflight and CI watch for non-GitHub trackers |
@@ -170,7 +218,7 @@ Override per run with `args.models`, e.g. `{feature: "x", models: {worker: "opus
     spec.md  tasks.md  tdd-log.md  review.md
 ```
 
-Add `.tdd-flow/` to `.gitignore`, or commit it if you want specs versioned. The autopilot needs it committed, with only `.tdd-flow/state.json` ignored. Autopilot run results go to `.git/tdd-flow/runs/` (the shared git dir), not into the working tree.
+Add `.tdd-flow/` to `.gitignore`, or commit it if you want specs versioned. The autopilot needs it committed, with only `.tdd-flow/state.json` ignored. Autopilot run results and set-aside patches go to `.git/tdd-flow/runs/` (the shared git dir), not into the working tree.
 
 ## Setup
 

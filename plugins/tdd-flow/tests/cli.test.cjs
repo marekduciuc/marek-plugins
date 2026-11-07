@@ -150,7 +150,7 @@ test('every workflow has the same cli() helper', () => {
     assert.ok(m, `${f} has no cli() helper`);
     return m[0];
   });
-  assert.strictEqual(blocks.length, 4);
+  assert.strictEqual(blocks.length, 5);
   blocks.forEach((b) => assert.strictEqual(b, blocks[0]));
 });
 
@@ -488,4 +488,122 @@ test('cleanup is skipped when gh or the session list is unavailable', () => {
   assert.match(run(dir, 'cleanup', {}, { ...loggingClaude([]).env, ...fakeGh(null) }).result.skipped, /gh: gh: not logged in/);
   const noClaude = { TDD_FLOW_CLAUDE_BIN: '/nonexistent/claude', ...fakeGh(merged(tip())) };
   assert.match(run(dir, 'cleanup', {}, noClaude).result.skipped, /claude agents is not available/);
+});
+
+// ---------- simplify ----------
+test('parseTasks and parseTaskTable read the refactor kind, plan passes it on', () => {
+  assert.deepStrictEqual(parseTasks('- [ ] T-1 Drop dead helper (AC-1) [refactor]\n- [ ] T-2 X (AC-2) [setup]').map((t) => [t.id, t.title, t.kind]),
+    [['T-1', 'Drop dead helper', 'refactor'], ['T-2', 'X', 'setup']]);
+  assert.strictEqual(parseTaskTable('| ID | Task | Kind | ACs |\n|---|---|---|---|\n| T-3 | y | refactor | AC-1 |')['T-3'].kind, 'refactor');
+  const { dir, write } = repo();
+  write('.tdd-flow/features/12-csv/tasks.md', '- [ ] T-2 Export header (AC-1) [refactor]\n');
+  const r = run(dir, 'plan', { feature: '12-csv' });
+  assert.strictEqual(r.ok, true, r.error);
+  assert.strictEqual(r.result.tasks[0].kind, 'refactor');
+});
+
+const FINDING = (i) => ({ tag: 'duplicate', title: `Merge parser copy ${i} (AC-9)`, where: `src/a.js:${i}`, files: ['src/a.js'],
+  issue: 'two copies of the same parser', proposal: 'use parseRow from src/rows.js', gain: 12, risk: 'low' });
+
+test('simplify-spec writes draft refactor specs that plan reads, 8 tasks each, never over a taken slug', () => {
+  const { dir, g, read, write } = trackedRepo();
+  write('.tdd-flow/features/simplify-src/spec.md', 'taken');
+  g('branch', 'feature/simplify-src-2');
+  const r = run(dir, 'simplify-spec', { area: 'src/', findings: Array.from({ length: 9 }, (_, i) => FINDING(i + 1)) });
+  assert.strictEqual(r.ok, true, r.error);
+  assert.deepStrictEqual(r.result.specs.map((s) => [s.slug, s.tasks]), [['simplify-src-3', 8], ['simplify-src-4', 1]]);
+  assert.match(read('.tdd-flow/features/simplify-src-3/spec.md'), /Status: draft[\s\S]*Source: tdd-flow simplify-codebase|Source: tdd-flow simplify-codebase[\s\S]*Status: draft/);
+  assert.match(read('.tdd-flow/features/simplify-src-4/tasks.md'), /^- \[ \] T-1 Merge parser copy 9 AC 9 \(AC-1\) \[refactor\]$/m);
+  for (const slug of ['simplify-src-3', 'simplify-src-4']) {
+    setSpecStatus(path.join(dir, `.tdd-flow/features/${slug}/spec.md`), 'approved');
+    const p = run(dir, 'plan', { feature: slug, baseline: false });
+    assert.strictEqual(p.ok, true, p.error);
+    assert.ok(p.result.tasks.every((t) => t.kind === 'refactor' && t.behaviours.length === 1 && /parseRow/.test(t.behaviours[0].text)));
+  }
+  assert.match(run(dir, 'simplify-spec', { area: 'x', findings: [] }).error, /no findings/);
+});
+
+test('areas groups tracked source files by directory, skips tests, generated code and other files', () => {
+  const { dir, g, write } = trackedRepo();
+  for (let i = 0; i < 5; i++) write(`src/big/f${i}.js`, 'x');
+  write('src/small/a.ts', 'x');
+  write('src/tiny/b.py', 'x');
+  write('src/top.go', 'x');
+  write('src/big/f0.test.js', 'x');
+  write('tests/t.py', 'x');
+  write('vendor/v.js', 'x');
+  write('web/app.min.js', 'x');
+  write('README.md', 'x');
+  write('src/untracked.js', 'x');
+  g('add', 'src', 'tests', 'vendor', 'web', 'README.md');
+  g('reset', '-q', '--', 'src/untracked.js');
+  const r = run(dir, 'areas', { maxFiles: 3 });
+  assert.strictEqual(r.ok, true, r.error);
+  assert.deepStrictEqual(r.result.areas.map((a) => [a.area, a.include, a.files]), [
+    ['src/*', ['src/top.go'], 1],
+    ['src/big/*', ['src/big/f0.js', 'src/big/f1.js', 'src/big/f2.js'], 3],
+    ['src/big/*', ['src/big/f3.js', 'src/big/f4.js'], 2],
+    ['src/{small,tiny}', ['src/small/', 'src/tiny/'], 2],
+  ]);
+  assert.strictEqual(r.result.noTestSuite, false);
+  assert.deepStrictEqual(run(dir, 'areas', { paths: ['src/small'] }).result.areas.map((a) => a.area), ['.']);
+});
+
+test('spec-branch approves a draft on feature/<slug> without touching main, and refuses taken or tracked specs', () => {
+  const { dir, g, write } = trackedRepo();
+  run(dir, 'simplify-spec', { area: 'lib', findings: [FINDING(1)] });
+  const head = g('rev-parse', 'main').toString();
+  const r = run(dir, 'spec-branch', { slug: 'simplify-lib' });
+  assert.strictEqual(r.ok, true, r.error);
+  assert.strictEqual(r.result.branch, 'feature/simplify-lib');
+  assert.strictEqual(g('rev-parse', 'main').toString(), head);
+  assert.ok(!fs.existsSync(path.join(dir, '.tdd-flow/features/simplify-lib')));
+  assert.match(g('show', 'feature/simplify-lib:.tdd-flow/features/simplify-lib/spec.md').toString(), /Status: approved/);
+  assert.strictEqual(execFileSync('git', ['status', '--porcelain'], { cwd: r.result.path }).toString(), '');
+  // The autopilot finds it by name only.
+  const s = run(dir, 'specs', { slugs: ['simplify-lib'] }, fakeClaude([]));
+  assert.strictEqual(s.ok, true, s.error);
+  assert.deepStrictEqual(s.result.runnable.map((x) => [x.slug, x.title, x.resume]), [['simplify-lib', 'Simplify lib', true]]);
+  assert.ok(!run(dir, 'specs', {}, fakeClaude([])).result.runnable.some((x) => x.slug === 'simplify-lib'));
+  // Taken branch, tracked spec, missing spec.
+  write('.tdd-flow/features/simplify-lib/spec.md', '- Status: draft\n');
+  write('.tdd-flow/features/simplify-lib/tasks.md', '- [ ] T-1 x (AC-1) [refactor]\n');
+  assert.match(run(dir, 'spec-branch', { slug: 'simplify-lib' }).error, /already exists/);
+  assert.match(run(dir, 'spec-branch', { slug: '12-csv' }).error, /already in git/);
+  assert.match(run(dir, 'spec-branch', { slug: 'nope' }).error, /missing/);
+});
+
+test('set-aside saves uncommitted changes as a patch and restores HEAD, only on a feature branch', () => {
+  const { dir, g, read, write } = trackedRepo();
+  write('src/a.js', 'one\n');
+  g('add', 'src/a.js');
+  g('commit', '-qm', 'a');
+  assert.match(run(dir, 'set-aside', { slug: '12-csv', label: 'R-1' }).error, /feature branch/);
+  g('switch', '-q', '-c', 'feature/12-csv');
+  assert.deepStrictEqual(run(dir, 'set-aside', { slug: '12-csv', label: 'R-1' }).result, { setAside: false, files: [] });
+  write('src/a.js', 'two\n');
+  write('src/new.js', 'new\n');
+  const r = run(dir, 'set-aside', { slug: '12-csv', label: 'simplify 1' });
+  assert.strictEqual(r.ok, true, r.error);
+  assert.deepStrictEqual(r.result.files.sort(), ['src/a.js', 'src/new.js']);
+  assert.match(r.result.patch, /tdd-flow\/runs\/12-csv-simplify-1\.patch$/);
+  assert.strictEqual(read('src/a.js'), 'one\n');
+  assert.ok(!fs.existsSync(path.join(dir, 'src/new.js')));
+  assert.strictEqual(g('status', '--porcelain').toString(), '');
+  g('apply', r.result.patch);
+  assert.strictEqual(read('src/a.js'), 'two\n');
+});
+
+test('commit with includeDeletions also commits tracked files the agent did not list', () => {
+  const { dir, g, write } = trackedRepo();
+  write('src/old.js', 'x\n');
+  g('add', 'src/old.js');
+  g('commit', '-qm', 'old');
+  g('switch', '-q', '-c', 'feature/12-csv');
+  fs.rmSync(path.join(dir, 'src/old.js'));
+  write('src/new.js', 'x\n');
+  const r = run(dir, 'commit', { message: 'refactor: move', files: ['src/new.js'], includeDeletions: true });
+  assert.strictEqual(r.ok, true, r.error);
+  assert.strictEqual(r.result.committed, true);
+  assert.strictEqual(g('status', '--porcelain').toString(), '');
 });
