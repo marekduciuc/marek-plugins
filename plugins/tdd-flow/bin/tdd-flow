@@ -11,12 +11,15 @@
 //   TDD_FLOW_JSON
 //   tdd-flow replay <<< '{"id":"..."}'      prints the saved output of an earlier call with "_relay": "<id>" again
 //   tdd-flow test [-- <command>]              runs the tests (default: stack.md "test command (all)")
-//                                             and prints only the exit code and the failure tail
+//                                             and prints only the exit code and the failure tail;
+//                                             a PASS on unchanged files comes from the cache (see runTests)
 //
 // "fallback": true means the input is outside what the script handles (unexpected spec format, a tracker
 // other than GitHub); the workflow then uses its agent for that step. See plugins/tdd-flow/README.md.
 const { spawn, spawnSync } = require('child_process');
+const crypto = require('crypto');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 
 const TEST_TIMEOUT_MS = 570000; // stays under the Bash tool's 10-minute limit
@@ -140,12 +143,64 @@ function compact(out, passed) {
   return s;
 }
 
+// PASS cache: a command that passed is not run again while the files are unchanged (the reviewer's rerun of the
+// suite the implementer just ran, the commit's runTests). Key: the command, the directory it runs in and a tree hash
+// of the working tree (tracked + untracked, not ignored; .tdd-flow/ left out, agents write their logs there).
+// Gitignored inputs (node_modules, .env, build output) and outside state are not in the key; TDD_FLOW_TEST_CACHE=off
+// turns it off. Off in repos with submodules: edits inside a submodule do not change the tree hash.
+const TEST_CACHE_ENTRIES = 20;
+const testCacheOff = () => /^(0|off|false|no)$/i.test(process.env.TDD_FLOW_TEST_CACHE || '');
+
+/** Hash of the working tree, written through a temporary copy of the index (the real index is untouched), or ''. */
+function worktreeHash(top) {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tdd-flow-index-'));
+  const tmpIndex = path.join(tmpDir, 'index');
+  try {
+    const realIndex = path.resolve(gitOut('rev-parse', '--git-path', 'index'));
+    if (fs.existsSync(realIndex)) fs.copyFileSync(realIndex, tmpIndex); // keeps git's stat cache: only changed files are rehashed
+    const g = (...args) => spawnSync('git', args, { cwd: top, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, env: { ...process.env, GIT_INDEX_FILE: tmpIndex } });
+    // No exclude pathspec for .tdd-flow/ in `add`: git refuses it ("paths are ignored") where .tdd-flow/ is gitignored.
+    if (g('add', '-A', '--', ':/').status !== 0) return '';
+    if (g('rm', '-r', '--cached', '-q', '--ignore-unmatch', '--', ':/.tdd-flow').status !== 0) return '';
+    const w = g('write-tree');
+    return w.status === 0 ? w.stdout.trim() : '';
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+}
+
+/** {file, key(), entries} for this command in this directory, or null when the cache does not apply. */
+function testCache(cmd) {
+  if (testCacheOff()) return null;
+  const top = gitOut('rev-parse', '--show-toplevel');
+  if (!top || fs.existsSync(path.join(top, '.gitmodules'))) return null;
+  const file = path.resolve(gitOut('rev-parse', '--git-path', 'tdd-flow-test-cache'));
+  const prefix = gitOut('rev-parse', '--show-prefix');
+  const key = () => {
+    const tree = worktreeHash(top);
+    return tree ? crypto.createHash('sha256').update([cmd, prefix, tree].join('\0')).digest('hex') : '';
+  };
+  return { file, key, entries: (readJSON(file) || {}).entries || [] };
+}
+
+function saveTestPass(cache, key, summary) {
+  const entries = [{ key, summary }, ...cache.entries.filter((e) => e.key !== key)].slice(0, TEST_CACHE_ENTRIES);
+  const tmp = `${cache.file}.${process.pid}.tmp`;
+  try { writeJSON(tmp, { entries }); fs.renameSync(tmp, cache.file); } catch { fs.rmSync(tmp, { force: true }); } // the cache is optional
+}
+
 async function runTests(cmd) {
+  const cache = testCache(cmd);
+  const keyBefore = cache ? cache.key() : '';
+  const hit = keyBefore && cache.entries.find((e) => e.key === keyBefore);
+  if (hit) return { command: cmd, pass: true, exitCode: 0, timedOut: false, cached: true, summary: hit.summary };
   const r = await runShell(cmd, TEST_TIMEOUT_MS);
   const pytestEmpty = /pytest/.test(cmd) && r.code === 5; // pytest 5 = no tests collected
   const pass = !r.timedOut && (r.code === 0 || pytestEmpty);
   const summary = r.timedOut ? `timed out after ${TEST_TIMEOUT_MS / 1000} s\n${compact(r.out, false)}` : compact(r.out, pass) || (pass ? 'passed, no output' : 'failed, no output');
-  return { command: cmd, pass, exitCode: r.code, timedOut: !!r.timedOut, summary };
+  // A run that changed files (lint --fix, snapshots, generated code) passed on a tree that no longer exists: not cached.
+  if (pass && keyBefore && cache.key() === keyBefore) saveTestPass(cache, keyBefore, summary);
+  return { command: cmd, pass, exitCode: r.code, timedOut: !!r.timedOut, cached: false, summary };
 }
 
 // ---------- spec and task parsing (formats from agents/requirements-analyst.md) ----------
@@ -1112,8 +1167,16 @@ function setAside(inp) {
   return { setAside: true, patch: f, files, ...(left ? { left: left.split('\n') } : {}) };
 }
 
+/** The full suite from stack.md, run here so a workflow need not trust an agent's report. ran = false: no test command. */
+async function suite() {
+  const stack = readStack();
+  if (!stack || none(stack.testAll)) return { ran: false, pass: true, command: '', cached: false, summary: 'no test command in .tdd-flow/stack.md' };
+  const t = await runTests(stack.testAll);
+  return { ran: true, pass: t.pass, command: t.command, cached: t.cached, summary: t.summary };
+}
+
 const COMMANDS = {
-  plan, branch, block, commit, 'close-out': closeOut, 'add-secret-scan': addSecretScan, preflight,
+  plan, suite, branch, block, commit, 'close-out': closeOut, 'add-secret-scan': addSecretScan, preflight,
   'ci-watch': ciWatch, 'ci-rerun': ciRerun, context, specs, worktree, cleanup, 'run-report': runReport, 'runs-wait': runsWait,
   areas, 'simplify-spec': simplifySpec, 'spec-branch': specBranch, 'set-aside': setAside,
 };
@@ -1128,7 +1191,8 @@ async function main(argv) {
     const command = given.length === 1 ? given[0] : given.length ? given.map(shq).join(' ') : stack && !none(stack.testAll) ? stack.testAll : '';
     if (!command) { process.stdout.write('tdd-flow test: no test command (pass one after --, or set "test command (all)" in .tdd-flow/stack.md)\n'); return 2; }
     const t = await runTests(command);
-    process.stdout.write(`${t.pass ? 'PASS' : 'FAIL'} (exit ${t.timedOut ? 'timeout' : t.exitCode}) \`${command}\`\n${t.summary}\n`);
+    const how = t.cached ? 'cached: no file changed since this command last passed' : `exit ${t.timedOut ? 'timeout' : t.exitCode}`;
+    process.stdout.write(`${t.pass ? 'PASS' : 'FAIL'} (${how}) \`${command}\`\n${t.summary}\n`);
     return t.pass ? 0 : 1;
   }
   const print = (o) => process.stdout.write(JSON.stringify(o) + '\n');

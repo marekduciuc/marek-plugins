@@ -122,6 +122,7 @@ const REFAC = {
 }
 const BRANCH = { type: 'object', required: ['branch'], properties: { branch: str } }
 const COMMIT = { type: 'object', required: ['committed'], properties: { committed: { type: 'boolean' }, nothingToCommit: { type: 'boolean' }, ticked: { type: 'boolean' }, specStatus: str, specStatusSkipped: str, sha: str, reason: str, unexpected: strs } }
+const SUITE = { type: 'object', required: ['ran', 'pass'], properties: { ran: { type: 'boolean' }, pass: { type: 'boolean' }, command: str, cached: { type: 'boolean' }, summary: str } }
 const BLOCK = { type: 'object', required: ['logged'], properties: { logged: { type: 'boolean' }, unticked: { type: 'boolean' } } }
 
 // Deterministic steps run in the plugin's CLI (bin/tdd-flow) through the script-runner agent (haiku, Bash only)
@@ -512,6 +513,9 @@ async function refactorChange(task, info, findings = null) {
   return { ok: true, files: changedFiles(r.attempts) }
 }
 
+// The CLI checks the suite before each review, except on a red baseline (allowRedBaseline): it would fail every round.
+const checksSuite = () => hasTests && plan.baselinePass
+
 // ---------- Implement + Review, task by task (sequential: one working tree) ----------
 const done = []
 const skippedTasks = []
@@ -527,7 +531,7 @@ try {
     }
     // Start a task only if its minimum cost fits: tdd = RED + GREEN per batch, review, commit;
     // setup = setup step, review, commit; refactor = characterize + its commit, refactor, review, commit.
-    const est = isSetup ? 3 : isRefactor ? 5 : Math.max(1, Math.ceil(task.behaviours.length / BATCH)) * 2 + 2
+    const est = (isSetup ? 3 : isRefactor ? 5 : Math.max(1, Math.ceil(task.behaviours.length / BATCH)) * 2 + 2) + (checksSuite() ? 1 : 0)
     if (spawned + est + 1 > MAX_AGENTS) {
       return { status: 'agent_limit', slug: plan.slug, branch: br.branch, tasksCompleted: done, escalationsToStrongModel: escalations,
         next: done.length
@@ -574,12 +578,19 @@ try {
       : `ACs in scope: ${task.behaviours.map(b => b.ref).join(', ')}.`
     let review = null
     for (let round = 1; !skipReason && round <= MAX_REVIEW_ROUNDS + 1; round++) {
+      // The CLI runs the full suite itself, so a wrong suitePass from the implementer cannot reach the commit.
+      // When the implementer really ran it, this and the reviewer's own run are cache hits.
+      const checked = checksSuite() ? await cli('suite', {}, SUITE, { label: `${task.id} suite ${round}`, phase: 'Review' }) : null
+      if (checked && !checked.ok) log(`${task.id}: the CLI suite check did not run (${checked.error}) - relying on the reviewer`)
+      const suite = checked && checked.ok && checked.result.ran ? checked.result : null
       review = await run(
         `Review task ${task.id} (${task.title}). ${ctx}\nScope: uncommitted changes (\`git diff HEAD\` plus untracked files). ${scope}\n` +
+        (suite ? `The CLI ran the full suite on these files: ${suite.pass ? 'PASS' : 'FAIL'} (\`${suite.command}\`).${suite.pass ? '' : '\n' + suite.summary}\n` : '') +
         (testFixes.length ? `These tests were changed by the test-writer after the implementer reported them as wrong, so they were never seen failing in that form. Check each still asserts its behaviour fully (no weakened or removed assertion); a weakened one is a blocker with behavioural=true:\n${testFixes.map(f => '- ' + f).join('\n')}\n` : '') +
         `Write your review to ${dir}/review.md (append a "## ${task.id} round ${round}" section). Mark each finding behavioural=true if fixing it changes observable behaviour (needs a test), false for structure/naming/style.`,
         { agentType: A('code-reviewer'), model: M.worker, schema: REVIEW, label: `${task.id} review ${round}`, phase: 'Review' })
       if (!review) return await blocked(task, 'REVIEW', 'reviewer agent failed')
+      if (suite && !suite.pass) review.testsPass = false
       const must = review.findings.filter(f => f.severity !== 'minor')
       if (review.verdict === 'APPROVE' && review.testsPass && !review.uncoveredAcs.length) break
       if (round > MAX_REVIEW_ROUNDS) return await blocked(task, 'REVIEW', `Not approved after ${MAX_REVIEW_ROUNDS} fix rounds:\n${JSON.stringify(review, null, 1)}`)

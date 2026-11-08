@@ -188,6 +188,45 @@ test('test prints a compact failure and exits 1', () => {
   assert.strictEqual(r.stdout, 'FAIL (exit 3) `echo one; echo two >&2; exit 3`\none\ntwo\n');
 });
 
+test('test caches a pass until a file outside .tdd-flow/ changes', () => {
+  const { dir, write } = repo();
+  const counter = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'tdd-flow-count-')), 'runs');
+  const runs = () => fs.readFileSync(counter, 'utf8').split('\n').filter(Boolean).length;
+  const t = (cmd, env) => spawnSync(process.execPath, [CLI, 'test', '--', cmd], { cwd: dir, encoding: 'utf8', env: { ...process.env, ...env } });
+  const ok = `echo run >> '${counter}'`;
+  assert.match(t(ok).stdout, /^PASS \(exit 0\)/);
+  assert.match(t(ok).stdout, /^PASS \(cached: no file changed/);
+  write('.tdd-flow/features/12-csv/review.md', 'notes');
+  assert.match(t(ok).stdout, /cached/);
+  assert.strictEqual(runs(), 1);
+  write('src.js', 'x');
+  t(ok);
+  assert.strictEqual(runs(), 2);
+  t(ok, { TDD_FLOW_TEST_CACHE: 'off' });
+  assert.strictEqual(runs(), 3);
+  const bad = `echo run >> '${counter}'; exit 1`;
+  t(bad);
+  assert.strictEqual(t(bad).status, 1);
+  assert.strictEqual(runs(), 5);
+});
+
+test('test does not cache a run that changed files, nor in a repo with submodules', () => {
+  const { dir, write } = repo();
+  const t = (cmd) => spawnSync(process.execPath, [CLI, 'test', '--', cmd], { cwd: dir, encoding: 'utf8' }).stdout;
+  t('echo x >> gen.txt');
+  assert.match(t('echo x >> gen.txt'), /^PASS \(exit 0\)/);
+  write('.gitmodules', '');
+  t('node -e 0');
+  assert.match(t('node -e 0'), /^PASS \(exit 0\)/);
+});
+
+test('suite runs the stack.md test command and reports a cache hit', () => {
+  const { dir } = repo();
+  const first = run(dir, 'suite', {});
+  assert.deepStrictEqual({ ...first.result, summary: undefined }, { ran: true, pass: true, command: 'node -e 0', cached: false, summary: undefined });
+  assert.strictEqual(run(dir, 'suite', {}).result.cached, true);
+});
+
 test('compact keeps 3 lines on pass and strips ANSI codes', () => {
   assert.strictEqual(compact('a\nb\n\x1b[32mc\x1b[0m\nd\n', true), 'b\nc\nd');
 });

@@ -20,7 +20,7 @@ You make failing tests pass with the least code necessary, then refactor safely.
 
 **Inputs:** the failing tests (ref, file, name, failure output, behaviour - one or more, in order), the stack profile, the relevant spec excerpt, and the mode: `GREEN`, `REFACTOR` or `SETUP`.
 
-**Running tests:** run test commands through `tdd-flow test -- '<command>'` (plain `tdd-flow test` runs the full suite from the stack profile). It prints PASS/FAIL, the exit code and only the tail of a failure, which keeps your context small. Run the command directly only when you need the full output.
+**Running tests:** run test commands through `tdd-flow test -- '<command>'` (plain `tdd-flow test` runs the full suite from the stack profile). It prints PASS/FAIL, the exit code and only the tail of a failure, which keeps your context small. A command that already passed on the same files prints `PASS (cached: ...)` without running again. Run the command directly only when you need the full output.
 
 **GREEN mode:**
 
