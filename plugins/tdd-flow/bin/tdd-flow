@@ -863,15 +863,24 @@ function taskProgress(slug, root, base) {
   return { done: tasks.filter((t) => t.done).length, total: tasks.length, open: open ? `${open.id} ${title}`.trim() : '' };
 }
 
+/** Specs with a worktree or a run file, sorted: what `board` shows when no slugs are given. */
+function knownRuns(root) {
+  const names = (dir, keep) => { try { return fs.readdirSync(dir).filter(keep); } catch { return []; } };
+  const worktrees = names(path.join(root, WORKTREES), (n) => fs.statSync(path.join(root, WORKTREES, n)).isDirectory());
+  const runs = names(path.dirname(runFile('x')), (n) => n.endsWith('.json')).map((n) => n.slice(0, -5));
+  return [...new Set([...worktrees, ...runs])].filter((s) => SLUG.test(s)).sort();
+}
+
 /**
- * Status of every spec of an autopilot run, as rows and a ready Markdown table. Input: {slugs: [...], queued?: [...]}
- * (queued = not started yet). `progress` is the map to pass to the next runs-wait.
+ * Status of every spec of an autopilot run, as rows and a ready Markdown table. Input: {slugs?: [...], queued?: [...]}
+ * (queued = not started yet; no slugs = every spec with a worktree or a run file). `progress` is the map to pass to
+ * the next runs-wait.
  */
 function board(inp) {
-  const slugs = (inp.slugs || []).map(checkSlug);
-  if (!slugs.length) throw new Error('no slugs to show');
-  const queued = new Set((inp.queued || []).map(checkSlug));
   const root = mainRoot();
+  const slugs = (inp.slugs || []).length ? inp.slugs.map(checkSlug) : knownRuns(root);
+  if (!slugs.length) throw new Error(`no specs to show: no worktree in ${WORKTREES}/ and no autopilot run recorded`);
+  const queued = new Set((inp.queued || []).map(checkSlug));
   const base = baseBranch();
   const sessions = claudeSessions();
   const rows = slugs.map((slug) => {
