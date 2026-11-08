@@ -85,6 +85,12 @@ function runShell(cmd, timeoutMs) {
 const read = (p) => { try { return fs.readFileSync(p, 'utf8'); } catch { return null; } };
 const readJSON = (p) => { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; } };
 const writeJSON = (p, v) => { fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, JSON.stringify(v) + '\n'); };
+/** Writes through a temp file + rename, so a reader polling the file (runs-wait, board) never sees it half-written. */
+function writeAtomic(file, text) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = `${file}.${process.pid}.tmp`;
+  try { fs.writeFileSync(tmp, text); fs.renameSync(tmp, file); } catch (e) { fs.rmSync(tmp, { force: true }); throw e; }
+}
 const none = (v) => !v || /^(none|unknown|n\/a)\b/i.test(String(v).trim());
 const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const STATE = '.tdd-flow/state.json';
@@ -185,8 +191,7 @@ function testCache(cmd) {
 
 function saveTestPass(cache, key, summary) {
   const entries = [{ key, summary }, ...cache.entries.filter((e) => e.key !== key)].slice(0, TEST_CACHE_ENTRIES);
-  const tmp = `${cache.file}.${process.pid}.tmp`;
-  try { writeJSON(tmp, { entries }); fs.renameSync(tmp, cache.file); } catch { fs.rmSync(tmp, { force: true }); } // the cache is optional
+  try { writeAtomic(cache.file, JSON.stringify({ entries }) + '\n'); } catch { /* the cache is optional */ }
 }
 
 async function runTests(cmd) {
@@ -436,7 +441,7 @@ async function commit(inp) {
     const m = md && md.match(re);
     if (m) {
       ticked = true;
-      if (m[2] === ' ') fs.writeFileSync(inp.tick.file, md.replace(re, '$1x$3'));
+      if (m[2] === ' ') writeAtomic(inp.tick.file, md.replace(re, '$1x$3')); // the autopilot polls tasks.md
     }
   }
   if (inp.state) writeJSON(inp.state.file || STATE, inp.state.json || inp.state);
@@ -701,14 +706,8 @@ const commonDir = () => realpath(gitOut('rev-parse', '--git-common-dir') || '.gi
 const runFile = (slug) => path.join(commonDir(), 'tdd-flow', 'runs', `${slug}.json`);
 const readRun = (slug) => readJSON(runFile(slug));
 
-/** Writes the run file atomically (temp file + rename), because runs-wait reads it while sessions write. */
-function writeRun(slug, run) {
-  const f = runFile(slug);
-  fs.mkdirSync(path.dirname(f), { recursive: true });
-  const tmp = `${f}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(run) + '\n');
-  fs.renameSync(tmp, f);
-}
+/** Atomic, because runs-wait reads the run file while sessions write it. */
+const writeRun = (slug, run) => writeAtomic(runFile(slug), JSON.stringify(run) + '\n');
 
 /** The main checkout's root; autopilot commands must not run inside a worktree. */
 function mainRoot() {
@@ -832,31 +831,102 @@ function runReport(inp) {
   return run;
 }
 
+/** State of one autopilot run: its run file (done/blocked/running), or "stalled" when the session is idle or gone. */
+function runState(slug, sessions, root) {
+  const run = readRun(slug) || { slug, status: 'unknown' };
+  const s = findSession(sessions, run, path.join(root, WORKTREES, slug));
+  const attach = s && s.id ? { attach: `claude attach ${attachRef(sessions, s)}` } : {};
+  // A session that has just been started may not be listed as working yet.
+  const starting = run.status === 'running' && Date.now() - Date.parse(run.at) < START_GRACE_MS && !(s && s.state === 'done');
+  if (RUN_FINAL.includes(run.status)) return { ...run, ...attach };
+  if (!isLive(s) && !starting) return { slug, status: 'stalled', details: s ? `session is ${s.state || s.status} without a report` : 'no session found', ...attach };
+  return { slug, status: 'running', ...attach };
+}
+
 /**
- * Waits until at least one of the given runs has finished. A run is finished when its file says done or blocked,
- * or "stalled" when its session is idle or gone without a report (it asked a question or stopped early).
- * Input: {slugs: [...], maxMinutes?: 240}. Meant for a background Bash call, so it blocks without "again".
+ * Ticked and total tasks of a spec, and its first open task: from the worktree's tasks.md (the session ticks there),
+ * else feature/<slug> or the base branch, else the main checkout. null when no task list is found.
+ */
+function taskProgress(slug, root, base) {
+  const rel = `${featureDir(slug)}/tasks.md`;
+  let md = read(path.join(root, WORKTREES, slug, rel));
+  for (const ref of [`refs/heads/feature/${slug}`, base]) {
+    if (md != null) break;
+    const r = showFile(ref, rel);
+    if (r.code === 0) md = r.out;
+  }
+  if (md == null) md = read(path.join(root, rel));
+  const tasks = md == null ? [] : parseTasks(md);
+  if (!tasks.length) return null;
+  const open = tasks.find((t) => !t.done);
+  const title = open && open.title.length > 30 ? open.title.slice(0, 29) + '…' : open ? open.title : '';
+  return { done: tasks.filter((t) => t.done).length, total: tasks.length, open: open ? `${open.id} ${title}`.trim() : '' };
+}
+
+/**
+ * Status of every spec of an autopilot run, as rows and a ready Markdown table. Input: {slugs: [...], queued?: [...]}
+ * (queued = not started yet). `progress` is the map to pass to the next runs-wait.
+ */
+function board(inp) {
+  const slugs = (inp.slugs || []).map(checkSlug);
+  if (!slugs.length) throw new Error('no slugs to show');
+  const queued = new Set((inp.queued || []).map(checkSlug));
+  const root = mainRoot();
+  const base = baseBranch();
+  const sessions = claudeSessions();
+  const rows = slugs.map((slug) => {
+    const st = queued.has(slug) ? { status: 'queued' } : runState(slug, sessions, root);
+    const p = taskProgress(slug, root, base);
+    // Every task ticked while the session still runs: implement-spec is in its simplify / review / PR steps.
+    const current = !p ? '' : p.open || (st.status === 'running' ? 'simplify / review / PR' : '');
+    return { slug, status: st.status, done: p ? p.done : null, total: p ? p.total : null, current,
+      prUrl: st.prUrl || '', details: st.details || '', attach: st.attach || '' };
+  });
+  const progress = Object.fromEntries(rows.filter((r) => r.status === 'running' && r.done !== null).map((r) => [r.slug, r.done]));
+  return { rows, progress, table: boardTable(rows) };
+}
+
+function boardTable(rows) {
+  const cell = (v) => String(v).replace(/\r?\n.*$/s, '').replace(/\|/g, '\\|').trim();
+  const lines = ['| Spec | Status | Tasks | PR / reason |', '|---|---|---|---|'];
+  for (const r of rows) {
+    const tasks = r.total === null ? '–' : `${r.done}/${r.total}${r.current ? ` · ${r.current}` : ''}`;
+    const why = r.prUrl || [r.details.split('\n')[0].slice(0, 100), ['blocked', 'stalled'].includes(r.status) && r.attach ? `\`${r.attach}\`` : ''].filter(Boolean).join(' · ');
+    lines.push(`| ${cell(r.slug)} | ${r.status} | ${cell(tasks)} | ${cell(why)} |`);
+  }
+  return lines.join('\n');
+}
+
+/**
+ * Waits until at least one of the given runs has finished or ticked a task in its worktree's tasks.md (`progressed`).
+ * A run is finished when its file says done or blocked, or "stalled" when its session is idle or gone without a
+ * report (it asked a question or stopped early).
+ * Input: {slugs: [...], progress?: {slug: ticked}, maxMinutes?: 240}; `progress` is the board's map.
+ * Meant for a background Bash call, so it blocks without "again".
  */
 async function runsWait(inp) {
   const slugs = (inp.slugs || []).map(checkSlug);
   if (!slugs.length) throw new Error('no slugs to wait for');
   const root = mainRoot();
   const end = Date.now() + (inp.maxMinutes || 240) * 60000;
+  const base = baseBranch();
+  // Ticked tasks per slug seen last (from the board); a slug with no entry gets its baseline from the first poll.
+  const seen = { ...(inp.progress || {}) };
   for (;;) {
     const sessions = claudeSessions();
     const finished = [];
     const running = [];
+    const progressed = [];
     for (const slug of slugs) {
-      const run = readRun(slug) || { slug, status: 'unknown' };
-      const s = findSession(sessions, run, path.join(root, WORKTREES, slug));
-      const attach = s && s.id ? `claude attach ${attachRef(sessions, s)}` : '';
-      // A session that has just been started may not be listed as working yet.
-      const starting = run.status === 'running' && Date.now() - Date.parse(run.at) < START_GRACE_MS && !(s && s.state === 'done');
-      if (RUN_FINAL.includes(run.status)) finished.push({ ...run, ...(attach ? { attach } : {}) });
-      else if (!isLive(s) && !starting) finished.push({ slug, status: 'stalled', details: s ? `session is ${s.state || s.status} without a report` : 'no session found', ...(attach ? { attach } : {}) });
-      else running.push({ slug, ...(attach ? { attach } : {}) });
+      const st = runState(slug, sessions, root);
+      if (st.status !== 'running') { finished.push(st); continue; }
+      running.push({ slug, ...(st.attach ? { attach: st.attach } : {}) });
+      const p = taskProgress(slug, root, base);
+      if (!p) continue;
+      if (!Number.isInteger(seen[slug])) seen[slug] = p.done;
+      else if (p.done > seen[slug]) progressed.push(slug);
     }
-    if (finished.length) return { finished, running };
+    if (finished.length || progressed.length) return { finished, running, ...(progressed.length ? { progressed } : {}) };
     if (Date.now() > end) return { finished: [], running, timedOut: true };
     await sleep(Math.min(RUN_POLL_MS, Math.max(0, end - Date.now()) + 50));
   }
@@ -1177,7 +1247,7 @@ async function suite() {
 
 const COMMANDS = {
   plan, suite, branch, block, commit, 'close-out': closeOut, 'add-secret-scan': addSecretScan, preflight,
-  'ci-watch': ciWatch, 'ci-rerun': ciRerun, context, specs, worktree, cleanup, 'run-report': runReport, 'runs-wait': runsWait,
+  'ci-watch': ciWatch, 'ci-rerun': ciRerun, context, specs, worktree, cleanup, 'run-report': runReport, 'runs-wait': runsWait, board,
   areas, 'simplify-spec': simplifySpec, 'spec-branch': specBranch, 'set-aside': setAside,
 };
 

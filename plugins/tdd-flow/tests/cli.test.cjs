@@ -360,6 +360,50 @@ test('runs-wait returns finished runs and stalled sessions, waits for starting o
   assert.match(run(dir, 'run-report', { slug: 'a', status: 'merged' }).error, /running, done or blocked/);
 });
 
+test('board shows status and task progress per spec, read from the worktree once it exists', () => {
+  const { dir } = trackedRepo();
+  const working = fakeClaude([{ id: 's-1', kind: 'background', name: 'csv-export-flow', state: 'working' }]);
+  const idle = fakeClaude([{ id: 's-1', kind: 'background', name: 'csv-export-flow', state: 'done', status: 'idle' }]);
+  const board = (env, inp = { slugs: ['12-csv', 'later'], queued: ['later'] }) => run(dir, 'board', inp, env).result;
+  run(dir, 'run-report', { slug: '12-csv', status: 'running', session: 's-1' });
+  let b = board(working);
+  assert.deepStrictEqual(b.rows.map((r) => [r.slug, r.status, r.done, r.total, r.current]), [
+    ['12-csv', 'running', 0, 3, 'T-1 Docker compose'], ['later', 'queued', null, null, ''],
+  ]);
+  assert.deepStrictEqual(b.progress, { '12-csv': 0 });
+  assert.deepStrictEqual(b.table.split('\n'), [
+    '| Spec | Status | Tasks | PR / reason |', '|---|---|---|---|',
+    '| 12-csv | running | 0/3 · T-1 Docker compose |  |', '| later | queued | – |  |',
+  ]);
+  const wt = run(dir, 'worktree', { slug: '12-csv' }).result.path;
+  const tasksFile = path.join(wt, '.tdd-flow/features/12-csv/tasks.md');
+  fs.writeFileSync(tasksFile, TASKS.replace('[ ] T-1', '[x] T-1').replace('[ ] T-2', '[x] T-2'));
+  assert.strictEqual(board(working).rows[0].current, 'T-20 Later');
+  fs.writeFileSync(tasksFile, TASKS.replace(/\[ \]/g, '[x]'));
+  assert.strictEqual(board(working).rows[0].current, 'simplify / review / PR');
+  b = board(idle);
+  assert.strictEqual(b.rows[0].status, 'stalled');
+  assert.match(b.table, /\| 12-csv \| stalled \| 3\/3 \| session is done without a report · `claude attach csv-export-flow` \|/);
+  run(dir, 'run-report', { slug: '12-csv', status: 'done', prUrl: 'https://github.com/o/r/pull/7' });
+  assert.match(board(idle).table, /\| 12-csv \| done \| 3\/3 \| https:\/\/github.com\/o\/r\/pull\/7 \|/);
+  assert.match(run(dir, 'board', { slugs: [] }).error, /no slugs/);
+});
+
+test('runs-wait returns when a running spec ticks a task, with a baseline from the first poll for unknown slugs', () => {
+  const { dir } = trackedRepo();
+  const env = fakeClaude([{ id: 's-1', kind: 'background', name: 'csv-export-flow', state: 'working' }]);
+  run(dir, 'run-report', { slug: '12-csv', status: 'running', session: 's-1' });
+  const wt = run(dir, 'worktree', { slug: '12-csv' }).result.path;
+  fs.writeFileSync(path.join(wt, '.tdd-flow/features/12-csv/tasks.md'), TASKS.replace('[ ] T-1', '[x] T-1'));
+  const running = [{ slug: '12-csv', attach: 'claude attach csv-export-flow' }];
+  assert.deepStrictEqual(run(dir, 'runs-wait', { slugs: ['12-csv'], progress: { '12-csv': 0 } }, env).result,
+    { finished: [], running, progressed: ['12-csv'] });
+  assert.deepStrictEqual(run(dir, 'runs-wait', { slugs: ['12-csv'], progress: { '12-csv': 1 }, maxMinutes: 0.005 }, env).result,
+    { finished: [], running, timedOut: true });
+  assert.deepStrictEqual(run(dir, 'runs-wait', { slugs: ['12-csv'], maxMinutes: 0.005 }, env).result,
+    { finished: [], running, timedOut: true });
+});
+
 // Shapes taken from real specs: suffixed ids, a note after a verify command, a verify list under one "Verify" line.
 const SUFFIXED_SPEC = `- Status: approved
 
