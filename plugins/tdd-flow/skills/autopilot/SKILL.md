@@ -65,7 +65,15 @@ For each spec to start:
    ```
    This also replaces the result of an earlier run.
 
-Tell the user, per started spec: slug, worktree and `claude attach <name>` to watch it.
+Tell the user, per started spec: slug, worktree and `claude attach <name>` to watch it. Then show the board:
+
+```bash
+tdd-flow board <<'TDD_FLOW_JSON'
+{"slugs": ["<every spec of this run, in order>"], "queued": ["<the ones not started yet>"]}
+TDD_FLOW_JSON
+```
+
+Print its `table` exactly as returned (one row per spec: status, ticked/total tasks and the open task, PR or reason). Keep its `progress` for the next `runs-wait`.
 
 ## 3. Wait, refill, repeat
 
@@ -73,23 +81,21 @@ Run with the Bash tool and `run_in_background: true` (it blocks until a run fini
 
 ```bash
 tdd-flow runs-wait <<'TDD_FLOW_JSON'
-{"slugs": ["<every running slug>"]}
+{"slugs": ["<every running slug>"], "progress": <progress from the last board>}
 TDD_FLOW_JSON
 ```
 
-When it exits, read `finished`:
+It returns when a run finishes or when a running spec ticks a task (`progressed`). Every time it exits, run `board` again (same slugs, `queued` updated) and print its `table`. Then read `finished`:
 
 - `done` → note the `prUrl`.
 - `blocked` → note `details`.
 - `stalled` → the session went idle or disappeared without a report (it asked something or stopped early). Note its `attach` command (`runs-wait` gives the name, or the id when the name is ambiguous); do not restart it.
 
-Then start the next queued specs (step 2) until N are running again, and start `runs-wait` again for the running slugs. Repeat until nothing runs and nothing is queued. If `runs-wait` reports `timedOut`, list the running sessions with their `attach` commands and ask the user whether to keep waiting.
-
-Give one status line per finished spec as it comes in.
+Then start the next queued specs (step 2) until N are running again, and start `runs-wait` again for the running slugs with the latest `progress`. Repeat until nothing runs and nothing is queued. If `runs-wait` reports `timedOut`, list the running sessions with their `attach` commands and ask the user whether to keep waiting.
 
 ## 4. Summary
 
-A table: spec, result (`done` / `blocked` / `stalled` / skipped), PR URL or reason, worktree, `claude attach <name>` for blocked and stalled ones. Then:
+The final `board` table (it has the PR URL, or the reason and `claude attach <name>` for blocked and stalled specs), followed by the skipped specs (slug - reason) and the worktree of each blocked or stalled spec. Then:
 
 - A blocked spec: fix the cause (in its worktree), then run `/tdd-flow:autopilot <slug>`; it resumes from `tasks.md` on the same branch.
 - A stalled spec: `claude attach <name>` and answer the session.
