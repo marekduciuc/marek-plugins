@@ -386,7 +386,12 @@ test('board shows status and task progress per spec, read from the worktree once
   assert.match(b.table, /\| 12-csv \| stalled \| 3\/3 \| session is done without a report · `claude attach csv-export-flow` \|/);
   run(dir, 'run-report', { slug: '12-csv', status: 'done', prUrl: 'https://github.com/o/r/pull/7' });
   assert.match(board(idle).table, /\| 12-csv \| done \| 3\/3 \| https:\/\/github.com\/o\/r\/pull\/7 \|/);
-  assert.match(run(dir, 'board', { slugs: [] }).error, /no slugs/);
+  assert.deepStrictEqual(run(dir, 'board', {}, idle).result.rows.map((r) => r.slug), ['12-csv']); // worktree + run file, once
+});
+
+test('board without slugs reports that nothing ran yet', () => {
+  const { dir } = trackedRepo();
+  assert.match(run(dir, 'board', {}).error, /no specs to show/);
 });
 
 test('runs-wait returns when a running spec ticks a task, with a baseline from the first poll for unknown slugs', () => {
