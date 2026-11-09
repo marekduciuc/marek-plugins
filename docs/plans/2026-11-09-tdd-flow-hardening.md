@@ -4,7 +4,9 @@ Source: the "Where Things Go Wrong" to "On the Horizon" sections of the Claude C
 
 Goal: a user installs tdd-flow and it works without changing their whole environment. Fixes go into the plugin, not into the user's rules or repo CLAUDE.md.
 
-Status: phase 1 designed, all its questions answered. Nothing is implemented yet.
+Status: phase 1 implemented in tdd-flow 0.13.0 (54 tests pass). Phases 2 and 3 not started.
+
+Phase 1 as built, after the architecture review: the relay returns `relayFailed` and the task commit retries on that flag only; `block` keeps the tick when HEAD already is the task commit; `stageChanged` is opt-in and set only on task commits (not CHARACTERIZE, docs, mark-implemented or skipped-task commits); `tdd-flow test -- <cmd>` keeps the caller's directory; the type check comes from a new `type check command` field in `stack.md`; the identity check uses `git var GIT_COMMITTER_IDENT` and stops the autopilot when git has no identity.
 
 ## Already done outside the plugin
 
