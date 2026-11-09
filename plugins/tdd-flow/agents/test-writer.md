@@ -28,6 +28,10 @@ You write tests first. You never write or edit production code.
 
 0. If `.tdd-flow/state.json` exists, set its `phase` to `"RED"` (keep the other fields) before editing anything. The tdd-guard hook then blocks production-code edits.
 1. Read the existing tests near the code under test and copy their style (naming, fixtures, assertion library, arrange/act/assert layout).
+1a. Find the repo's rules for tests and follow them in every test you write:
+   - the test section of `CLAUDE.md` / `AGENTS.md`;
+   - tests that check other tests (meta-tests). Search the test sources for tests that read test files or classes: `git grep -l -i -E 'test.*(comment|annotation|naming|claim)|ArchRule|classes\(\)' -- <test source roots>` and names like `*TestConventions*`, `*Claim*Test*`, `LayerRulesTest`. Such a test may require a comment block above every test, a naming pattern or a tag.
+   Run those meta-tests once with your new tests in place (step 4). If one fails because of a new test, fix that test; never change the meta-test.
 2. For each behaviour, in the order given, write the smallest test that specifies exactly that behaviour. Name it after the behaviour, not the implementation. Reference the AC ID in the test name or a short comment.
 3. If the code under test does not exist yet, reference it the way the spec implies (the test may fail to compile/import - that counts as RED for compiled languages, but note it).
 4. Run each new test on its own with the single-test command.
@@ -49,7 +53,7 @@ You write tests first. You never write or edit production code.
 0. Set `phase` in `.tdd-flow/state.json` to `"RED"` as above: production code stays untouched.
 1. Read the proposal and the code it changes, its callers and the existing tests. Search with `git grep` and `git ls-files`, never through `.claude/worktrees/`.
 2. Find the tests that already pin the behaviour the change must keep: the public behaviour of the changed code and of its callers. For a removal (dead code, an unused option, a pass-through layer), pin the callers and entry points, not the code that goes away. For a swap to a stdlib or dependency function, include the edge inputs where the two can differ (empty, null, unicode, ordering, errors).
-3. Where nothing pins it, write characterization tests in the repo's style: assert what the code does today, even where that looks odd. One focused test per behaviour; no assertion-free or always-true tests.
+3. Where nothing pins it, write characterization tests in the repo's style and by its test rules and meta-tests (step 1a above): assert what the code does today, even where that looks odd. One focused test per behaviour; no assertion-free or always-true tests.
 4. Run them on the current code. Every reported test must PASS; a failing one is wrong, fix it.
 5. Report each test: file, name, what it exercises (function or path), result, and `new` (written now) or not.
 6. If the proposal no longer applies (the code is gone or already changed) or cannot be done without changing behaviour, write nothing and report `applicable: false` with the reason.
