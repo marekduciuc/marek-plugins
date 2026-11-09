@@ -20,6 +20,17 @@ TDD_FLOW_JSON
 
 **Report blocked and stop** means: run `run-report` with `status: "blocked"` and a short `details` (step, reason, what the user must do), print the same in your reply, and end.
 
+**Report a decision and stop** is the same, for a block that only the user can resolve because it needs a choice, not a fix. Examples: the spec contradicts itself or the code, an acceptance criterion allows two behaviours, or a review finding needs a product call. Technical failures (a red test, the environment, a merge conflict, the agent limit) stay **report blocked**. Do not guess the answer and do not go on with later tasks.
+1. Add the question to `## Open questions` in `.tdd-flow/features/<slug>/spec.md`, numbered after the highest `Q-<n>` in Open and Resolved questions: `- Q-<n> <question> - *assumption if unanswered:* <your recommendation>`. Then the options and the tasks it blocks, on indented lines.
+2. Commit only that file: `git add .tdd-flow/features/<slug>/spec.md && git commit -m "docs(<slug>): open question Q-<n>"`. Then set the rest of the uncommitted work aside with `tdd-flow set-aside` and `{"slug": "<slug>", "label": "decision-Q-<n>"}`. The restart needs a clean worktree, and the answer may change the blocked task, so it is redone from the committed code. Mention the patch path in `details`.
+3. Report it:
+   ```bash
+   tdd-flow run-report <<'TDD_FLOW_JSON'
+   {"slug": "<slug>", "status": "blocked", "details": "<step>: needs a decision (Q-<n>)", "decision": {"id": "Q-<n>", "question": "<question>", "recommendation": "<recommendation>", "options": ["<option>", "..."], "tasks": ["T-<n>"]}}
+   TDD_FLOW_JSON
+   ```
+   The autopilot asks the user, writes the answer into the spec and starts this skill again, and the run resumes from `tasks.md`.
+
 ## 0. Check the place
 
 `git branch --show-current` must be `feature/<slug>` and the current directory must be a worktree (`git rev-parse --git-dir` differs from `git rev-parse --git-common-dir`). Otherwise report blocked ("not in the spec's worktree") and stop.
@@ -48,7 +59,7 @@ Tasks run in order, each in its own `tdd-implement` run, so each task gets the f
 | `implemented` | The task is committed and ticked. Keep `unverified` for the PR body. If the open-task count did not go down, report blocked ("task not ticked after a successful run"); otherwise go back to 1. |
 | `nothing_to_do` | No open task is left: leave the loop. Continue if the branch has commits that are not on the base (`git log --oneline <base>..HEAD`); otherwise report blocked ("no changes to review"). |
 | `agent_limit` | The task did not fit into one run. Run the same args once more (it redoes the task on top of the uncommitted changes); if that also ends in `agent_limit`, report blocked. For a `[refactor]` task, first set its uncommitted changes aside (`tdd-flow set-aside` with `{"slug": "<slug>", "label": "<task id>"}`), so the rerun starts from committed code. |
-| `blocked` or an error | report blocked with the result's `task`, `step` and `details`. |
+| `blocked` or an error | report blocked with the result's `task`, `step` and `details`, or **report a decision** when the cause is a choice for the user. |
 
 Never start the next task while the previous run is still going: the runs share one working tree.
 
@@ -86,7 +97,7 @@ Sort the findings by severity. You act as the executor in that skill: drop a fin
 If there are Critical or Important findings, run the workflow `tdd-flow:tdd-implement` once more with `{"feature": "<slug>", "findings": [...]}`. Write each finding as one string: `"<severity>: <file:line> - <issue>. Expected: <fix>"`.
 
 - `implemented` → continue. Do **not** review again (one review pass per change).
-- `blocked`, `agent_limit` or an error → report blocked with the details, and say which findings are still open.
+- `blocked`, `agent_limit` or an error → report blocked with the details, and say which findings are still open. A finding that needs a product call → **report a decision**.
 
 Minor findings are not fixed; they go into the PR body.
 

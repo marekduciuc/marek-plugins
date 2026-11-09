@@ -1103,3 +1103,20 @@ test('sync-base refuses the base branch and uncommitted changes', () => {
   s.g('switch', '-q', 'main');
   assert.match(run(s.dir, 'sync-base', { base: 'main' }).error, /runs on a feature branch, not on main/);
 });
+
+test('a blocked run can carry a decision: run-report checks it, board and runs-wait show it', () => {
+  const { dir } = trackedRepo();
+  const env = fakeClaude([{ id: 's-1', kind: 'background', name: 'csv-export-flow', state: 'done', status: 'idle' }]);
+  const decision = { id: 'Q-3', question: 'Should an empty report export only the header?', recommendation: 'yes, header only',
+    options: ['header only', 'no file, 204'], tasks: ['T-2'] };
+  const r = run(dir, 'run-report', { slug: '12-csv', status: 'blocked', session: 's-1', details: 'T-2: AC-1 allows two behaviours', decision });
+  assert.deepStrictEqual(r.result.decision, decision);
+  assert.match(run(dir, 'run-report', { slug: '12-csv', status: 'blocked', decision: { ...decision, id: '3' } }).error, /decision\.id must be the spec's question id/);
+  assert.match(run(dir, 'run-report', { slug: '12-csv', status: 'blocked', decision: { id: 'Q-3', question: 'x' } }).error, /decision\.recommendation is required/);
+  assert.match(run(dir, 'run-report', { slug: '12-csv', status: 'done', decision }).error, /decision goes with status blocked/);
+  const b = run(dir, 'board', { slugs: ['12-csv'] }, env).result;
+  assert.deepStrictEqual(b.rows[0].decision, decision);
+  assert.match(b.table, /\| 12-csv \| blocked \| 0\/3 · T-1 Docker compose \| decision Q-3: Should an empty report export only the header\? \|/);
+  const w = run(dir, 'runs-wait', { slugs: ['12-csv'] }, env).result;
+  assert.deepStrictEqual([w.finished[0].status, w.finished[0].decision], ['blocked', decision]);
+});

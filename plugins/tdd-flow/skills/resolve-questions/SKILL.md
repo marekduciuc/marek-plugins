@@ -37,4 +37,4 @@ Print the result:
 - the questions still open;
 - whether `Status` changed.
 
-Then ask whether to approve the spec (`Status: approved`). Set it only on an explicit yes in this conversation. Do not commit. The autopilot needs the spec committed on the base branch, so tell the user to commit `spec.md` and `tasks.md` when they are done.
+Then ask whether to approve the spec (`Status: approved`). Set it only on an explicit yes in this conversation. Do not commit. Tell the user to commit `spec.md` and `tasks.md` when they are done: on the base branch for a new spec, or in its worktree (`.claude/worktrees/<slug>`) for a spec the autopilot stopped with a decision. A spec there must say `Status: approved` again before `/tdd-flow:autopilot <slug>` takes it. If it was `implemented`, add a task for the answer first, as in the autopilot's Decisions step 3.
