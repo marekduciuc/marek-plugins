@@ -36,6 +36,7 @@ test framework:
 test command (all):
 test command (single file / filter):
 build command:
+type check command:  (type check or compile without running tests, e.g. `npm run typecheck`, `npx tsc --noEmit`, `./mvnw -q test-compile`, `cargo check`; `none` if the language has none)
 lint/format command:
 test file pattern & location:
 production source roots:

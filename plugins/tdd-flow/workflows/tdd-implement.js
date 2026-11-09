@@ -41,7 +41,7 @@ const PLAN = {
   required: ['slug', 'approved', 'testAll', 'testSingle', 'baselinePass', 'tasks'],
   properties: {
     slug: str, status: str, approved: { type: 'boolean' },
-    testAll: str, testSingle: str, lint: str, testPattern: str,
+    testAll: str, testSingle: str, lint: str, typeCheck: str, testPattern: str,
     baselinePass: { type: 'boolean' }, baselineSummary: str, noTestSuite: { type: 'boolean' },
     taskCount: { type: 'integer' }, openIds: strs,
     tasks: { type: 'array', items: { type: 'object', required: ['id', 'title', 'done', 'behaviours'], properties: {
@@ -214,7 +214,8 @@ const br = branched.result
 const dir = `.tdd-flow/features/${plan.slug}`
 const ctxFor = () => `Feature: ${plan.slug}. Spec: ${dir}/spec.md. ` +
   (hasTests ? `Test all: \`${tests.all}\`. Single test: \`${tests.single}\`. Run tests as \`tdd-flow test -- '<command>'\` (prints only the exit code and the failure tail).` : 'No test suite yet.') +
-  (plan.lint ? ` Lint: \`${plan.lint}\`.` : '')
+  (plan.lint ? ` Lint: \`${plan.lint}\`.` : '') +
+  (plan.typeCheck ? ` Type check: \`${plan.typeCheck}\`.` : '')
 let ctx = ctxFor()
 
 const allOpen = plan.tasks.filter(t => !t.done)

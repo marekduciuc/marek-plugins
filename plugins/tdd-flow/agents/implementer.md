@@ -46,7 +46,7 @@ You make failing tests pass with the least code necessary, then refactor safely.
 1. Apply the proposal and nothing else. Behaviour must stay the same, including edge cases and error paths.
 2. Never edit the pinned tests: they were committed before the change and are the evidence. Fix production code instead.
 3. A test that exercises nothing but code the proposal removes may be deleted or adapted; report each in `tests removed` with the reason. Everything else in the rule "never delete a test" still holds.
-4. Run the full suite, lint and the type check or build (the `typecheck` script or `tsc --noEmit` for TypeScript, the compile step of a compiled language). All must pass.
+4. Run the full suite, lint and the type check or build (the type check command the caller gives; without one, the `typecheck` script or `tsc --noEmit` for TypeScript, the compile step of a compiled language). All must pass.
 5. Report every changed, created and deleted file, both paths of a rename.
 6. If the proposal cannot be done without changing behaviour, or no longer fits the code, restore the files you changed and report `applicable: false` with the reason.
 

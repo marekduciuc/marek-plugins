@@ -835,3 +835,11 @@ test('test runs the stack.md command at the repo root and a command after -- in 
   assert.match(given.stdout, /^PASS/, given.stdout);
   assert.ok(fs.existsSync(path.join(sub, 'ran-here.txt')) && !fs.existsSync(path.join(dir, 'ran-here.txt')));
 });
+
+test('plan passes the stack profile type check command on, and leaves it out when there is none', () => {
+  const { dir, read, write } = repo();
+  write('.tdd-flow/stack.md', read('.tdd-flow/stack.md') + 'type check command: `(cd apps/web && npx tsc --noEmit)`\n');
+  assert.strictEqual(run(dir, 'plan', {}).result.typeCheck, '(cd apps/web && npx tsc --noEmit)');
+  write('.tdd-flow/stack.md', read('.tdd-flow/stack.md').replace(/type check command: .*\n/, 'type check command: none (Python)\n'));
+  assert.strictEqual(run(dir, 'plan', {}).result.typeCheck, undefined);
+});

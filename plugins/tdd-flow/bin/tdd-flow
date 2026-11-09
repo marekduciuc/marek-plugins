@@ -115,7 +115,7 @@ function readStack() {
   };
   return {
     language: get('language(s)'), testAll: get('test command (all)', true), testSingle: get('test command (single file / filter)', true),
-    lint: get('lint/format command', true), tracker: get('tracker'), defaultBranch: get('default branch'), ci: get('ci system'),
+    lint: get('lint/format command', true), typeCheck: get('type check command', true), tracker: get('tracker'), defaultBranch: get('default branch'), ci: get('ci system'),
     baseline: get('baseline test run'),
   };
 }
@@ -357,6 +357,7 @@ async function plan(inp) {
     taskCount: tasks.length, openIds: open.map((t) => t.id),
   };
   if (!none(stack.lint)) res.lint = stack.lint;
+  if (!none(stack.typeCheck)) res.typeCheck = stack.typeCheck;
   // A run with only synthetic refactor tasks ({refactors}) on a finished spec needs the baseline too.
   if (!noTestSuite && inp.baseline !== false && res.approved && (tasks.some((t) => !t.done) || inp.refactors)) {
     const t = await runTests(stack.testAll);
