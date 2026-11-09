@@ -4,7 +4,7 @@ Source: the "Where Things Go Wrong" to "On the Horizon" sections of the Claude C
 
 Goal: a user installs tdd-flow and it works without changing their whole environment. Fixes go into the plugin, not into the user's rules or repo CLAUDE.md.
 
-Status: phase 1 implemented in tdd-flow 0.13.0. Phase 2: autopilot pre-flight and external test state (F6) implemented in tdd-flow 0.14.0; migrations (F7), meta-tests (F8), questions in chat (F4) and `/tdd-flow:resolve-questions` in tdd-flow 0.15.0. Phase 3 not started.
+Status: phase 1 implemented in tdd-flow 0.13.0. Phase 2: autopilot pre-flight and external test state (F6) implemented in tdd-flow 0.14.0; migrations (F7), meta-tests (F8), questions in chat (F4) and `/tdd-flow:resolve-questions` in tdd-flow 0.15.0. Phase 3: before-push sync implemented in tdd-flow 0.16.0, as a merge of the base (no rebase, so no force-push); the rest not started.
 
 Phase 2 (0.14.0) as built: a separate `tdd-flow autopilot-check` command. The base suite runs only for 2 or more specs and only in a clean main checkout on the base. Permissions come from managed settings, the user settings, the main checkout's `settings.local.json` (worktree sessions use it) and the base's `settings.json`. No rules are needed in `auto` mode, which is the default since Claude Code 2.1.283. `tests need:` in stack.md is inferred from the test lines only for older profiles. It sets parallel to 1. The test cache stays on (user decision after the architecture review: Testcontainers start fresh, and one session at a time already avoids shared state); `TDD_FLOW_TEST_CACHE=off` covers a shared local database.
 

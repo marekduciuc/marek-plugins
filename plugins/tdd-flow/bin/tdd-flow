@@ -134,7 +134,7 @@ function readStack() {
     testsNeed: needs.need, testsNeedInferred: needs.inferred,
     language: get('language(s)'), testAll: get('test command (all)', true), testSingle: get('test command (single file / filter)', true),
     lint: get('lint/format command', true), typeCheck: get('type check command', true), tracker: get('tracker'), defaultBranch: get('default branch'), ci: get('ci system'),
-    baseline: get('baseline test run'),
+    baseline: get('baseline test run'), generate: get('generate command', true), generatedFiles: get('generated files'),
   };
 }
 
@@ -893,6 +893,90 @@ function stackFill(inp) {
   return { added: true };
 }
 
+// ---------- sync with the base before the push ----------
+/** `generated files` globs as a test: `*` within a path segment, `**` across segments, a trailing `/` for a folder. */
+function generatedMatcher(list) {
+  const res = (none(list) ? [] : list.split(',')).map((g) => g.trim().replace(/^`+|`+$/g, '')).filter(Boolean)
+    .map((g) => new RegExp(`^${(g.endsWith('/') ? `${g}**` : g).split('**').map((part) => part.split('*').map(esc).join('[^/]*')).join('.*')}$`));
+  return (file) => res.some((re) => re.test(file));
+}
+const pathList = (out) => out.split('\n').map((l) => l.trim()).filter(Boolean);
+
+/**
+ * Runs the generate command and lists what it changed against the index: {ok, files (generated files to stage),
+ * other (files outside `generated files` it changed), summary}. Tracked files it changed outside them are restored.
+ */
+async function regenerate(cmd, isGenerated) {
+  const r = await runShell(cmd, TEST_TIMEOUT_MS);
+  const changed = [...new Set([...pathList(gitOut('diff', '--name-only')), ...pathList(gitOut('ls-files', '--others', '--exclude-standard'))])];
+  const other = changed.filter((f) => !isGenerated(f));
+  const tracked = other.filter((f) => git('ls-files', '--error-unmatch', '--', f).code === 0);
+  if (tracked.length) git('checkout', '--', ...tracked);
+  const failed = r.timedOut || r.code !== 0;
+  const summary = failed ? `\`${cmd}\` ${r.timedOut ? `timed out after ${TEST_TIMEOUT_MS / 1000} s` : `failed (exit ${r.code})`}:\n${compact(r.out, false)}` : '';
+  return { ok: !failed && !other.length, files: changed.filter(isGenerated), other, summary };
+}
+
+/**
+ * Merges origin/<base> into the feature branch before the push (also with a PR open: no history rewrite, no
+ * force-push), so parallel specs meet their conflicts here and not at merge time. Conflicts only in `generated files`
+ * are resolved by taking the base's version and running `generate command`, in the same merge commit. Any other
+ * conflict, or a failing generate, aborts the merge. With nothing to merge, the generate command still runs and its
+ * output is committed. The push-gate reruns the suite on the result. Input: {base?}.
+ * Output: {base, merged, upToDate, regenerated, conflict?, files?, generateFailed?, reason?}.
+ */
+async function syncBase(inp) {
+  const base = inp.base || baseBranch();
+  const branch = gitOut('branch', '--show-current');
+  if (!branch || branch === base) throw new Error(`sync-base runs on a feature branch, not on ${branch || 'a detached HEAD'}`);
+  const dirty = gitOut('status', '--porcelain', '--untracked-files=no');
+  if (dirty) throw new Error(`uncommitted changes - commit them first:\n${dirty}`);
+  const f = git('fetch', '--quiet', 'origin', base);
+  if (f.code !== 0) throw new Error(`git fetch origin ${base} failed: ${f.err || f.out}`);
+  const stack = readStack() || {};
+  const generate = none(stack.generate) ? '' : stack.generate;
+  const isGenerated = generatedMatcher(stack.generatedFiles);
+  const res = { base, merged: false, upToDate: false, regenerated: [] };
+  const ref = `origin/${base}`;
+
+  if (git('merge-base', '--is-ancestor', ref, 'HEAD').code === 0) {
+    res.upToDate = true;
+    if (!generate) return res;
+    const g = await regenerate(generate, isGenerated);
+    if (!g.ok) return { ...res, generateFailed: true, reason: g.summary || `the generate command changed files outside generated files: ${g.other.join(', ')}` };
+    if (!g.files.length) return res;
+    const slug = branch.replace(/^feature\//, '');
+    git('add', '--', ...g.files);
+    const c = git('commit', '-q', '-m', `chore(${slug}): regenerate ${g.files.join(', ')}`);
+    if (c.code !== 0) throw new Error(`commit of the regenerated files failed: ${c.err || c.out}`);
+    return { ...res, regenerated: g.files };
+  }
+
+  const m = git('merge', '--no-commit', '--no-ff', ref);
+  const conflicts = pathList(gitOut('diff', '--name-only', '--diff-filter=U'));
+  const abort = (extra) => { git('merge', '--abort'); return { ...res, ...extra }; };
+  if (m.code !== 0 && !conflicts.length) { abort({}); throw new Error(`git merge ${ref} failed: ${m.err || m.out}`); }
+  const other = conflicts.filter((p) => !isGenerated(p));
+  if (other.length) return abort({ conflict: true, files: conflicts, reason: `${ref} conflicts with this branch in ${other.join(', ')}` });
+  if (conflicts.length && !generate) return abort({ conflict: true, files: conflicts, reason: 'only generated files conflict, but stack.md has no generate command' });
+  if (conflicts.length) {
+    // The generator rebuilds these files from the merged sources, so either side will do as a starting point.
+    const co = git('checkout', '--theirs', '--', ...conflicts);
+    if (co.code !== 0) return abort({ conflict: true, files: conflicts, reason: `cannot take ${base}'s version: ${co.err || co.out}` });
+  }
+  let regenerated = [];
+  if (generate) {
+    const g = await regenerate(generate, isGenerated);
+    if (!g.ok) return abort({ generateFailed: true, reason: g.summary || `the generate command changed files outside generated files: ${g.other.join(', ')}` });
+    regenerated = g.files;
+  }
+  const stage = [...new Set([...conflicts, ...regenerated])];
+  if (stage.length) git('add', '--', ...stage);
+  const c = git('commit', '-q', '--no-edit');
+  if (c.code !== 0) return abort({ reason: `merge commit failed: ${c.err || c.out}` });
+  return { ...res, merged: true, regenerated };
+}
+
 // ---------- autopilot pre-flight ----------
 const PARALLEL_DEFAULT = 3;
 const DOCKER_TIMEOUT_MS = 20000;
@@ -1487,7 +1571,7 @@ async function suite() {
 const COMMANDS = {
   plan, suite, branch, block, commit, 'close-out': closeOut, 'add-secret-scan': addSecretScan, preflight,
   'ci-watch': ciWatch, 'ci-rerun': ciRerun, context, 'stack-fill': stackFill, specs, 'autopilot-check': autopilotCheck, worktree, cleanup, 'run-report': runReport, 'runs-wait': runsWait, board,
-  areas, 'simplify-spec': simplifySpec, 'spec-branch': specBranch, 'set-aside': setAside,
+  areas, 'simplify-spec': simplifySpec, 'spec-branch': specBranch, 'set-aside': setAside, 'sync-base': syncBase,
 };
 
 async function main(argv) {

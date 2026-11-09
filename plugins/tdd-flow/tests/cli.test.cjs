@@ -995,3 +995,100 @@ test('stack-fill writes tests need into stack.md when the detector left it out o
   fs.rmSync(path.join(dir, '.tdd-flow/stack.md'));
   assert.deepStrictEqual(run(dir, 'stack-fill', { testsNeed: 'none' }).result, { added: false, reason: '.tdd-flow/stack.md is missing' });
 });
+
+/** Repo with an origin (bare) and a second clone that moves origin/main; on feature/12-csv. gen.js writes gen.json from src/. */
+function syncRepo(generate = true) {
+  const r = repo();
+  const remote = fs.mkdtempSync(path.join(os.tmpdir(), 'tdd-flow-remote-'));
+  execFileSync('git', ['init', '-q', '--bare', '-b', 'main', remote]);
+  r.write('gen.js', "const fs = require('fs'); fs.writeFileSync('gen.json', JSON.stringify(fs.readdirSync('src').sort()) + '\\n');\n");
+  r.write('src/a.txt', 'a\n');
+  r.write('gen.json', '["a.txt"]\n');
+  r.g('add', 'gen.js', 'src', 'gen.json');
+  r.g('commit', '-qm', 'base');
+  r.g('remote', 'add', 'origin', remote);
+  r.g('push', '-q', 'origin', 'main');
+  r.write('.tdd-flow/stack.md', `test command (all): \`node -e 0\`\n${generate ? 'generate command: `node gen.js`\ngenerated files: gen.json\n' : ''}`);
+  r.g('switch', '-qc', 'feature/12-csv');
+  const other = fs.mkdtempSync(path.join(os.tmpdir(), 'tdd-flow-other-'));
+  execFileSync('git', ['clone', '-q', remote, other]);
+  const og = (...a) => execFileSync('git', a, { cwd: other, stdio: 'pipe' });
+  og('config', 'user.email', 'o@example.com');
+  og('config', 'user.name', 'O');
+  const onBase = (files) => {
+    for (const [p, s] of Object.entries(files)) { fs.mkdirSync(path.dirname(path.join(other, p)), { recursive: true }); fs.writeFileSync(path.join(other, p), s); }
+    og('add', '-A');
+    og('commit', '-qm', 'base moves');
+    og('push', '-q', 'origin', 'main');
+  };
+  const commitHere = (files, msg = 'feature work') => {
+    for (const [p, s] of Object.entries(files)) r.write(p, s);
+    r.g('add', '-A', '--', ...Object.keys(files));
+    r.g('commit', '-qm', msg);
+  };
+  const parents = () => r.g('log', '-1', '--format=%P').toString().trim().split(' ').length;
+  return { ...r, onBase, commitHere, parents, head: () => r.g('rev-parse', 'HEAD').toString().trim() };
+}
+
+test('sync-base merges a moved base, and leaves an up-to-date branch alone', () => {
+  const s = syncRepo(false);
+  s.commitHere({ 'src/b.txt': 'b\n' });
+  const head = s.head();
+  assert.deepStrictEqual(run(s.dir, 'sync-base', { base: 'main' }).result, { base: 'main', merged: false, upToDate: true, regenerated: [] });
+  assert.strictEqual(s.head(), head);
+  s.onBase({ 'src/c.txt': 'c\n' });
+  const r = run(s.dir, 'sync-base', { base: 'main' });
+  assert.deepStrictEqual(r.result, { base: 'main', merged: true, upToDate: false, regenerated: [] });
+  assert.strictEqual(s.parents(), 2);
+  assert.strictEqual(s.read('src/c.txt'), 'c\n');
+});
+
+test('sync-base aborts on a conflict outside the generated files', () => {
+  const s = syncRepo();
+  s.commitHere({ 'src/a.txt': 'mine\n' });
+  s.onBase({ 'src/a.txt': 'theirs\n' });
+  const head = s.head();
+  const r = run(s.dir, 'sync-base', { base: 'main' }).result;
+  assert.deepStrictEqual([r.conflict, r.files, r.merged], [true, ['src/a.txt'], false]);
+  assert.match(r.reason, /origin\/main conflicts with this branch in src\/a\.txt/);
+  assert.strictEqual(s.head(), head);
+  assert.strictEqual(s.read('src/a.txt'), 'mine\n');
+  assert.strictEqual(s.g('status', '--porcelain', '--untracked-files=no').toString(), '');
+});
+
+test('sync-base resolves a conflict in a generated file by regenerating it in the merge commit', () => {
+  const s = syncRepo();
+  s.commitHere({ 'src/b.txt': 'b\n', 'gen.json': '["a.txt","b.txt"]\n' });
+  s.onBase({ 'src/c.txt': 'c\n', 'gen.json': '["a.txt","c.txt"]\n' });
+  const r = run(s.dir, 'sync-base', { base: 'main' }).result;
+  assert.deepStrictEqual(r, { base: 'main', merged: true, upToDate: false, regenerated: ['gen.json'] });
+  assert.strictEqual(s.read('gen.json'), '["a.txt","b.txt","c.txt"]\n');
+  assert.strictEqual(s.parents(), 2);
+  assert.strictEqual(s.g('status', '--porcelain').toString(), '');
+});
+
+test('sync-base without a merge commits stale generated files, and refuses a generate that touches other files', () => {
+  const s = syncRepo();
+  s.commitHere({ 'src/b.txt': 'b\n' });
+  const r = run(s.dir, 'sync-base', { base: 'main' }).result;
+  assert.deepStrictEqual(r, { base: 'main', merged: false, upToDate: true, regenerated: ['gen.json'] });
+  assert.strictEqual(s.g('log', '-1', '--format=%s').toString().trim(), 'chore(12-csv): regenerate gen.json');
+  s.commitHere({ 'gen.js': "require('fs').writeFileSync('src/a.txt', 'touched\\n');\n" }, 'bad generator');
+  s.onBase({ 'src/c.txt': 'c\n' });
+  const head = s.head();
+  const bad = run(s.dir, 'sync-base', { base: 'main' }).result;
+  assert.deepStrictEqual([bad.generateFailed, bad.merged], [true, false]);
+  assert.match(bad.reason, /changed files outside generated files: src\/a\.txt/);
+  assert.strictEqual(s.head(), head);
+  assert.strictEqual(s.read('src/a.txt'), 'a\n');
+  assert.strictEqual(s.g('status', '--porcelain', '--untracked-files=no').toString(), '');
+});
+
+test('sync-base refuses the base branch and uncommitted changes', () => {
+  const s = syncRepo(false);
+  s.write('src/a.txt', 'dirty\n');
+  assert.match(run(s.dir, 'sync-base', { base: 'main' }).error, /uncommitted changes/);
+  s.g('checkout', '-q', '--', 'src/a.txt');
+  s.g('switch', '-q', 'main');
+  assert.match(run(s.dir, 'sync-base', { base: 'main' }).error, /runs on a feature branch, not on main/);
+});
