@@ -51,6 +51,6 @@ notes:
 
 Every command must work from the repo root, because tdd-flow runs it there. For a command that has to run in a subdirectory, write a subshell: `(cd apps/web && npm test)`, and join several with `&&`: `(cd apps/web && npm test) && (cd apps/backend && ./mvnw -B verify)`. Never write a bare `cd` chain such as `cd apps/web && npm test && cd ../backend && ...`: an agent that runs it moves its shell into the subdirectory.
 
-`tests need` makes the autopilot run one spec at a time, so write `none` only when the tests need nothing outside the repo.
+Write every line of the profile, including `tests need` (`none` when the tests need nothing outside the repo); a left-out line counts as unknown. `tests need` makes the autopilot run one spec at a time. Before returning, check that each label of the template is in the file.
 
 Write `unknown` rather than guessing. If the repo has no test framework or no tests yet (e.g. a new project being bootstrapped), write `none (no test suite yet)` for both test commands and `baseline test run: not run - no test suite`.

@@ -42,9 +42,12 @@ const STACK = {
   required: ['language', 'testAll', 'testSingle', 'tracker', 'defaultBranch'],
   properties: {
     language: str, testAll: str, testSingle: str, lint: str, tracker: str,
-    trackerCliReady: { type: 'boolean' }, defaultBranch: str, ci: str, baseline: str,
+    trackerCliReady: { type: 'boolean' }, defaultBranch: str, ci: str, baseline: str, testsNeed: str,
   },
 }
+// stack-detector must say what the tests need: the CLI writes it into stack.md if the agent left the line out.
+const DETECTED = { ...STACK, required: [...STACK.required, 'testsNeed'] }
+const FILLED = { type: 'object', required: ['added'], properties: { added: { type: 'boolean' }, reason: str } }
 const REQ = {
   type: 'object',
   required: ['ok', 'title', 'text', 'source', 'slug'],
@@ -149,8 +152,15 @@ try {
   const stackKnown = known.stack && !/^(unknown)?$/i.test(known.stack.testAll || '') ? known.stack : null
   const [stack, req] = await parallel([
     () => stackKnown || run(
-      'Detect this repository\'s stack. If .tdd-flow/stack.md already exists, read it and return its values without re-detecting. Otherwise detect and write .tdd-flow/stack.md.',
-      { agentType: A('stack-detector'), schema: STACK, label: 'stack-detector', effort: 'low' }),
+      'Detect this repository\'s stack. If .tdd-flow/stack.md already exists, read it and return its values without re-detecting. Otherwise detect and write .tdd-flow/stack.md. Return testsNeed as the `tests need` value (none, docker (...), database (...) or services (...)).',
+      { agentType: A('stack-detector'), schema: DETECTED, label: 'stack-detector', effort: 'low' })
+      .then(async (s) => {
+        if (!s) return s
+        const f = await cli('stack-fill', { testsNeed: s.testsNeed }, FILLED, { label: 'stack-fill', phase: 'Context' })
+        if (!f.ok) log(`stack-fill: ${f.error}`)
+        else if (f.result.added) log(`stack.md: added tests need: ${s.testsNeed}`)
+        return s
+      }),
     () => known.req || textReq || run(
       `Fetch the raw requirement for a software feature. Input: """${input}"""\n` +
       '- If it is an issue number or URL: detect the tracker from `git remote -v` and installed CLIs. GitHub: `gh issue view <id> --json number,title,body,labels,comments`. Azure DevOps: `az boards work-item show --id <id> -o json`. Jira: a connected Jira MCP tool if available, else the `jira` CLI.\n' +

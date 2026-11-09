@@ -976,3 +976,20 @@ test('autopilot-check: base suite runs once for two or more specs on a clean bas
   g('switch', '-qc', 'other');
   assert.match(suite(2).check('base suite').details, /main checkout is on other, not main/);
 });
+
+test('stack-fill writes tests need into stack.md when the detector left it out or kept the template hint', () => {
+  const { dir, write, read } = repo();
+  write('.tdd-flow/stack.md', 'test command (all): `npm test`\nci system: GitHub Actions\nnotes: x\n');
+  assert.deepStrictEqual(run(dir, 'stack-fill', { testsNeed: 'docker (Testcontainers)' }).result, { added: true });
+  assert.strictEqual(read('.tdd-flow/stack.md'), 'test command (all): `npm test`\ntests need: docker (Testcontainers)\nci system: GitHub Actions\nnotes: x\n');
+  assert.deepStrictEqual(run(dir, 'stack-fill', { testsNeed: 'none' }).result, { added: false, reason: 'stack.md already has tests need' });
+  write('.tdd-flow/stack.md', 'test command (all): `npm test`\ntests need:         (none | docker (...) | database (...))\n');
+  run(dir, 'stack-fill', { testsNeed: 'none' });
+  assert.strictEqual(read('.tdd-flow/stack.md'), 'test command (all): `npm test`\ntests need: none\n');
+  write('.tdd-flow/stack.md', 'test command (all): `npm test`');
+  run(dir, 'stack-fill', { testsNeed: 'database (local PostgreSQL)' });
+  assert.strictEqual(read('.tdd-flow/stack.md'), 'test command (all): `npm test`\ntests need: database (local PostgreSQL)\n');
+  assert.match(run(dir, 'stack-fill', {}).error, /testsNeed is required/);
+  fs.rmSync(path.join(dir, '.tdd-flow/stack.md'));
+  assert.deepStrictEqual(run(dir, 'stack-fill', { testsNeed: 'none' }).result, { added: false, reason: '.tdd-flow/stack.md is missing' });
+});
