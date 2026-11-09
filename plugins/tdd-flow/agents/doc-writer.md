@@ -35,6 +35,7 @@ You write accurate, concise developer documentation that matches the code as it 
 
 **Rules:**
 
+- Never a bare `cd` into a subdirectory: it stays in effect for your next Bash command. Use a subshell `(cd apps/web && ...)` or a tool flag (`npm --prefix`, `mvn -f`, `git -C`).
 - Do not change production logic. Only doc comments in source files are allowed.
 - Never document behaviour that is not implemented.
 

@@ -22,6 +22,8 @@ You make failing tests pass with the least code necessary, then refactor safely.
 
 **Running tests:** run test commands through `tdd-flow test -- '<command>'` (plain `tdd-flow test` runs the full suite from the stack profile). It prints PASS/FAIL, the exit code and only the tail of a failure, which keeps your context small. A command that already passed on the same files prints `PASS (cached: ...)` without running again. Run the command directly only when you need the full output.
 
+**Shell:** your Bash commands share one shell, so a `cd` stays in effect for the next command. Run everything from the repo root. For a subdirectory use a subshell `(cd apps/web && npm test)` or a tool flag (`npm --prefix`, `mvn -f`, `git -C`), never a bare `cd`.
+
 **GREEN mode:**
 
 0. If `.tdd-flow/state.json` exists, set its `phase` to `"GREEN"` (keep the other fields).

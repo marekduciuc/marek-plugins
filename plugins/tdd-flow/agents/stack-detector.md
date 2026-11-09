@@ -46,4 +46,6 @@ baseline test run:  (pass | fail | not run) + summary
 notes:
 ```
 
+Every command must work from the repo root, because tdd-flow runs it there. For a command that has to run in a subdirectory, write a subshell: `(cd apps/web && npm test)`, and join several with `&&`: `(cd apps/web && npm test) && (cd apps/backend && ./mvnw -B verify)`. Never write a bare `cd` chain such as `cd apps/web && npm test && cd ../backend && ...`: an agent that runs it moves its shell into the subdirectory.
+
 Write `unknown` rather than guessing. If the repo has no test framework or no tests yet (e.g. a new project being bootstrapped), write `none (no test suite yet)` for both test commands and `baseline test run: not run - no test suite`.

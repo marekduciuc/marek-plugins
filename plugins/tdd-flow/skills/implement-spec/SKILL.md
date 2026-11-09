@@ -24,7 +24,7 @@ TDD_FLOW_JSON
 
 `git branch --show-current` must be `feature/<slug>` and the current directory must be a worktree (`git rev-parse --git-dir` differs from `git rev-parse --git-common-dir`). Otherwise report blocked ("not in the spec's worktree") and stop.
 
-A new worktree has no installed dependencies. For JavaScript, install them for each directory that has a tracked lockfile (`git ls-files '*package-lock.json' '*pnpm-lock.yaml' '*yarn.lock' '*bun.lock' '*bun.lockb'`) and no `node_modules`, using the frozen command for its lockfile:
+A new worktree has no installed dependencies. For JavaScript, install them for each directory that has a tracked lockfile (`git ls-files '*package-lock.json' '*pnpm-lock.yaml' '*yarn.lock' '*bun.lock' '*bun.lockb'`) and no `node_modules`, using the frozen command for its lockfile, in a subshell so the shell stays at the worktree root: `(cd apps/web && npm ci)`.
 
 | Lockfile | Command |
 |---|---|

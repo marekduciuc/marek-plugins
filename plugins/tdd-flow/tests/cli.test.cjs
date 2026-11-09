@@ -803,3 +803,35 @@ test('commit without stageChanged stages only listed files, but a listed new fil
   assert.deepStrictEqual(committedFiles(g), ['.tdd-flow/features/12-csv/review.md', 'src/a.js']);
   assert.strictEqual(r.result.extraStaged, undefined);
 });
+
+test('commands called from a subdirectory work from the repo root', () => {
+  const { dir, g, read, write } = repo();
+  g('switch', '-q', '-c', 'feature/12-csv');
+  write('a.js', 'x\n');
+  fs.mkdirSync(path.join(dir, 'apps/web'), { recursive: true });
+  const r = run(path.join(dir, 'apps/web'), 'commit', {
+    message: 'feat(12-csv): T-2 Export header', files: ['a.js'], tick: { file: '.tdd-flow/features/12-csv/tasks.md', task: 'T-2' },
+    state: { feature: '12-csv', phase: 'IDLE', task: 'T-20' },
+  });
+  assert.strictEqual(r.ok, true, r.error);
+  assert.strictEqual(r.result.committed, true);
+  assert.strictEqual(r.result.ticked, true);
+  assert.deepStrictEqual(JSON.parse(read('.tdd-flow/state.json')), { feature: '12-csv', phase: 'IDLE', task: 'T-20' });
+  assert.ok(!fs.existsSync(path.join(dir, 'apps/web/.tdd-flow')), 'nothing written below the subdirectory');
+});
+
+test('test runs the stack.md command at the repo root and a command after -- in the caller directory', () => {
+  const { dir, write } = repo();
+  const mark = 'node -e "require(\'fs\').writeFileSync(\'ran-here.txt\', \'x\')"';
+  write('.tdd-flow/stack.md', `test command (all): \`${mark}\`\ndefault branch: main\n`);
+  const sub = path.join(dir, 'apps/web');
+  fs.mkdirSync(sub, { recursive: true });
+  const env = { ...process.env, TDD_FLOW_TEST_CACHE: 'off' };
+  const own = spawnSync(process.execPath, [CLI, 'test'], { cwd: sub, encoding: 'utf8', env });
+  assert.match(own.stdout, /^PASS/, own.stdout);
+  assert.ok(fs.existsSync(path.join(dir, 'ran-here.txt')) && !fs.existsSync(path.join(sub, 'ran-here.txt')));
+  fs.rmSync(path.join(dir, 'ran-here.txt'));
+  const given = spawnSync(process.execPath, [CLI, 'test', '--', mark], { cwd: sub, encoding: 'utf8', env });
+  assert.match(given.stdout, /^PASS/, given.stdout);
+  assert.ok(fs.existsSync(path.join(sub, 'ran-here.txt')) && !fs.existsSync(path.join(dir, 'ran-here.txt')));
+});

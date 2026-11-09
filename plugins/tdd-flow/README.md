@@ -71,7 +71,7 @@ Each workflow returns `{status, ..., next}`. If a coding step still fails after 
 
 ## tdd-flow CLI
 
-`bin/tdd-flow` does the steps that need no judgement. Claude Code adds the plugin's `bin/` to the Bash `PATH`, so agents call it as `tdd-flow`. Workflows pass JSON on stdin; it prints `{"ok": true, "result": {...}}` or `{"ok": false, "error": "...", "fallback": true?}`.
+`bin/tdd-flow` does the steps that need no judgement. Claude Code adds the plugin's `bin/` to the Bash `PATH`, so agents call it as `tdd-flow`. It works from the repo (or worktree) root wherever the caller's shell is, so an agent's `cd apps/web` cannot move `.tdd-flow/` or a commit's files; only a command given after `tdd-flow test --` runs in the caller's directory. The stack profile's commands must therefore work from the root (stack-detector writes subshells such as `(cd apps/web && npm test)`), and every agent prompt forbids a bare `cd`. Workflows pass JSON on stdin; it prints `{"ok": true, "result": {...}}` or `{"ok": false, "error": "...", "fallback": true?}`.
 
 | Command | Used by | Does |
 |---|---|---|

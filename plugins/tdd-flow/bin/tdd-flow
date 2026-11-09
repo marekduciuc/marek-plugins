@@ -1290,6 +1290,11 @@ const COMMANDS = {
 
 async function main(argv) {
   const [cmd, ...rest] = argv;
+  // Every path (.tdd-flow/, the files of a commit, the stack.md commands) is relative to the repo root, wherever the
+  // caller's shell is: an agent's `cd apps/web` must not move them.
+  const callerDir = process.cwd();
+  const top = gitOut('rev-parse', '--show-toplevel');
+  if (top) process.chdir(top);
   if (cmd === 'test') {
     const dash = rest.indexOf('--');
     const stack = readStack();
@@ -1297,6 +1302,8 @@ async function main(argv) {
     const shq = (a) => (/^[\w@%+=:,./-]+$/.test(a) ? a : `'${a.replace(/'/g, `'\\''`)}'`);
     const command = given.length === 1 ? given[0] : given.length ? given.map(shq).join(' ') : stack && !none(stack.testAll) ? stack.testAll : '';
     if (!command) { process.stdout.write('tdd-flow test: no test command (pass one after --, or set "test command (all)" in .tdd-flow/stack.md)\n'); return 2; }
+    // A command the agent gives runs where the agent is; the stack.md command runs at the root.
+    if (given.length) process.chdir(callerDir);
     const t = await runTests(command);
     const how = t.cached ? 'cached: no file changed since this command last passed' : `exit ${t.timedOut ? 'timeout' : t.exitCode}`;
     process.stdout.write(`${t.pass ? 'PASS' : 'FAIL'} (${how}) \`${command}\`\n${t.summary}\n`);
