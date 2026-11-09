@@ -26,7 +26,8 @@ You detect how a repository is built and tested. Be fast and factual.
 4. Determine the test-file naming convention and location (e.g. `tests/test_*.py`, `*.test.ts` next to source, separate `*.Tests` project).
 5. Detect the CI system and the issue tracker remote: run `git remote -v`; check for `.github/`, `azure-pipelines.yml`, `.gitlab-ci.yml`, `Jenkinsfile`; check which CLIs exist (`gh`, `az`, `jira`, `glab`) with `command -v`.
 6. Find what the tests need outside the repo: Testcontainers or a Docker client in the test dependencies, `docker compose` in test scripts or CI test jobs, a database URL or a service (Redis, a queue) in the test config that nothing in the tests starts.
-7. If possible, run the test command once to confirm it works. Report the result; do not fix anything.
+7. Find committed files that a command generates from the sources (an OpenAPI snapshot such as `openapi.json`, a generated API client, GraphQL types) and the command that rebuilds them. Fill `generate command` only when it rebuilds the files completely from the sources, not when it patches them. `tdd-flow sync-base` uses it to resolve merge conflicts in those files.
+8. If possible, run the test command once to confirm it works. Report the result; do not fix anything.
 
 **Output:** write the profile to the path the caller gives you (default `.tdd-flow/stack.md`) in this form, then return it verbatim:
 
@@ -41,6 +42,8 @@ type check command:  (type check or compile without running tests, e.g. `npm run
 lint/format command:
 test file pattern & location:
 production source roots:
+generate command:   (command that rebuilds the generated files from the sources, from the repo root, or `none`)
+generated files:    (comma-separated paths or globs that command writes and that are committed, e.g. `apps/backend/openapi.json`, or `none`)
 tests need:         (none | docker (...) | database (...) | services (...)) what the tests use outside the repo, e.g. `docker (Testcontainers)`, `database (local PostgreSQL)`
 ci system:
 tracker:            (github | azure-devops | jira | none) + CLI available?

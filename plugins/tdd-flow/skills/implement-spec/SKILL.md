@@ -95,17 +95,27 @@ Minor findings are not fixed; they go into the PR body.
 1. `gh pr list --head feature/<slug> --state all --json number,state,url --limit 1`
    - `MERGED` → report blocked ("feature/<slug> was already merged; start a new branch").
    - `OPEN` → push only (it updates that PR) and use its URL.
-2. `git push -u origin feature/<slug>`. The push-gate hook runs the type check, lint, tests and a secret scan first. If it blocks the push, report blocked with the gate's message. Never bypass it (`--no-verify`, `TDD_FLOW_PUSH_GATE=off`).
-3. With no open PR: `gh pr create --base <base> --head feature/<slug> --title "<type>(<slug>): <spec title from its first # heading>" --body-file <file>`. `<type>` is `refactor` for a spec with `Source: tdd-flow simplify-codebase`, otherwise `feat`. (write the body to a file in the scratchpad or a temp directory). Body:
+2. Bring the base in, with the Bash tool and `timeout: 600000` (it may run the generate command):
+   ```bash
+   tdd-flow sync-base <<'TDD_FLOW_JSON'
+   {"base": "<base>"}
+   TDD_FLOW_JSON
+   ```
+   It merges `origin/<base>` into the branch, so conflicts with specs merged in the meantime show up here and not when the PR is merged. It never rebases, so an open PR needs no force-push. Running this skill (and the autopilot) is the user's approval for this merge. Conflicts in `generated files` from `stack.md` are resolved by running the `generate command`, in the same merge commit; with nothing to merge, it still regenerates and commits stale generated files.
+   - `conflict` → report blocked: "`<base>` conflicts in <files>: run `git merge origin/<base>` in the worktree, resolve, commit, then `/tdd-flow:autopilot <slug>`" (`reason` says which files). The merge is already aborted, so the branch is as it was.
+   - `generateFailed` → report blocked with `reason`.
+   - `merged` or `regenerated` → note it for the PR body (**Test plan**).
+3. `git push -u origin feature/<slug>`. The push-gate hook runs the type check, lint, tests and a secret scan first, after a merge on the merged code. If it blocks the push, report blocked with the gate's message. Never bypass it (`--no-verify`, `TDD_FLOW_PUSH_GATE=off`).
+4. With no open PR: `gh pr create --base <base> --head feature/<slug> --title "<type>(<slug>): <spec title from its first # heading>" --body-file <file>`. `<type>` is `refactor` for a spec with `Source: tdd-flow simplify-codebase`, otherwise `feat`. (write the body to a file in the scratchpad or a temp directory). Body:
    - **Summary**: the spec's goal, with a link to the source issue if `spec.md` has `Source:` with an issue
    - **Acceptance criteria**: AC ids with one line each
    - **Tasks**: the commits from step 1 (`git log --oneline <base>..HEAD`), and refactor tasks skipped with their reason
    - **Simplification**: the changes step 2 applied (commits). Also, with their reasons: proposals refuted by the verifier (`dropped`), proposals set aside, with the patch path, and proposals that no longer applied. "Lean already" if there were none.
    - **Code review**: counts per severity; what the fix round fixed; Minor findings as a list; findings set aside, with the reason
    - **Not verified here**: the `unverified` list from step 1 (verify commands that could not run), if any
-   - **Test plan**: the test command from `.tdd-flow/stack.md`, and that the push-gate ran it before the push
+   - **Test plan**: the test command from `.tdd-flow/stack.md`, that the push-gate ran it before the push, and whether `sync-base` merged `<base>` or regenerated files
    - the attribution line your instructions give for PR descriptions
-4. Read the URL that `gh pr create` printed (or `gh pr view --json url`).
+5. Read the URL that `gh pr create` printed (or `gh pr view --json url`).
 
 ## 6. Record the result
 
