@@ -8,7 +8,7 @@ const path = require('path');
 const { execFileSync, spawnSync } = require('child_process');
 
 const CLI = path.join(__dirname, '..', 'bin', 'tdd-flow');
-const { parseSpec, parseTasks, parseTaskTable, compact, kebab, onMergeSummary, setSpecStatus, shapeOf } = require(CLI);
+const { parseSpec, parseTasks, parseTaskTable, compact, kebab, onMergeSummary, setSpecStatus, shapeOf, specTitle } = require(CLI);
 
 const SPEC = `- Source: https://github.com/o/r/issues/12
 - Slug: 12-csv
@@ -356,7 +356,7 @@ test('runs-wait returns finished runs and stalled sessions, waits for starting o
   assert.strictEqual(r.finished[1].attach, 'claude attach s-c'); // name used by two sessions: the id is unambiguous
   assert.deepStrictEqual(r.running, [{ slug: 'b', attach: 'claude attach invite-reset-flow' }, { slug: 'd' }]);
   const t = run(dir, 'runs-wait', { slugs: ['b'], maxMinutes: 0.005 }, sessions).result;
-  assert.deepStrictEqual(t, { finished: [], running: [{ slug: 'b', attach: 'claude attach invite-reset-flow' }], timedOut: true });
+  assert.deepStrictEqual(t, { finished: [], running: [{ slug: 'b', attach: 'claude attach invite-reset-flow' }], timedOut: true, progress: {} });
   assert.match(run(dir, 'run-report', { slug: 'a', status: 'merged' }).error, /running, done or blocked/);
 });
 
@@ -413,11 +413,38 @@ test('runs-wait returns when a running spec ticks a task, with a baseline from t
   fs.writeFileSync(path.join(wt, '.tdd-flow/features/12-csv/tasks.md'), TASKS.replace('[ ] T-1', '[x] T-1'));
   const running = [{ slug: '12-csv', attach: 'claude attach csv-export-flow' }];
   assert.deepStrictEqual(run(dir, 'runs-wait', { slugs: ['12-csv'], progress: { '12-csv': 0 } }, env).result,
-    { finished: [], running, progressed: ['12-csv'] });
+    { finished: [], running, progressed: ['12-csv'], progress: { '12-csv': 1 } });
   assert.deepStrictEqual(run(dir, 'runs-wait', { slugs: ['12-csv'], progress: { '12-csv': 1 }, maxMinutes: 0.005 }, env).result,
-    { finished: [], running, timedOut: true });
+    { finished: [], running, timedOut: true, progress: { '12-csv': 1 } });
   assert.deepStrictEqual(run(dir, 'runs-wait', { slugs: ['12-csv'], maxMinutes: 0.005 }, env).result,
-    { finished: [], running, timedOut: true });
+    { finished: [], running, timedOut: true, progress: { '12-csv': 1 } });
+  // A caller that passes the stale map again (a shell loop) waits for the next tick instead of spinning.
+  assert.deepStrictEqual(run(dir, 'runs-wait', { slugs: ['12-csv'], progress: { '12-csv': 0 }, maxMinutes: 0.005 }, env).result,
+    { finished: [], running, timedOut: true, progress: { '12-csv': 1 } });
+  fs.writeFileSync(path.join(wt, '.tdd-flow/features/12-csv/tasks.md'), TASKS.replace('[ ] T-1', '[x] T-1').replace('[ ] T-2', '[x] T-2'));
+  assert.deepStrictEqual(run(dir, 'runs-wait', { slugs: ['12-csv'], progress: { '12-csv': 0 } }, env).result,
+    { finished: [], running, progressed: ['12-csv'], progress: { '12-csv': 2 } });
+  // A reset tasks.md lowers the count: the remembered 2 is stale, the next tick is reported again.
+  fs.writeFileSync(path.join(wt, '.tdd-flow/features/12-csv/tasks.md'), TASKS);
+  assert.deepStrictEqual(run(dir, 'runs-wait', { slugs: ['12-csv'], progress: { '12-csv': 2 }, maxMinutes: 0.005 }, env).result,
+    { finished: [], running, timedOut: true, progress: { '12-csv': 0 } });
+  fs.writeFileSync(path.join(wt, '.tdd-flow/features/12-csv/tasks.md'), TASKS.replace('[ ] T-1', '[x] T-1'));
+  assert.deepStrictEqual(run(dir, 'runs-wait', { slugs: ['12-csv'], progress: { '12-csv': 0 } }, env).result,
+    { finished: [], running, progressed: ['12-csv'], progress: { '12-csv': 1 } });
+});
+
+test('board leaves out worktrees that are not on a feature/<slug> branch', () => {
+  const { dir, g } = trackedRepo();
+  run(dir, 'worktree', { slug: '12-csv' });
+  g('worktree', 'add', '-q', '-b', 'fix/web-deps', '.claude/worktrees/web-deps');
+  assert.deepStrictEqual(run(dir, 'board', {}, fakeClaude([])).result.rows.map((r) => r.slug), ['12-csv']);
+});
+
+test('specTitle takes the # heading, else the first sentence of the Goal', () => {
+  assert.strictEqual(specTitle('# CSV export\n\n- Status: approved\n\n## Goal\n\nX.'), 'CSV export');
+  assert.strictEqual(specTitle('- Status: approved\n\n## Goal\n\nUsers export the report as CSV. It has a header.\n\n## Context\n'), 'Users export the report as CSV.');
+  assert.strictEqual(specTitle(`## Goal\n\n${'a'.repeat(100)}`), `${'a'.repeat(79)}…`);
+  assert.strictEqual(specTitle('- Status: draft\n'), '');
 });
 
 // Shapes taken from real specs: suffixed ids, a note after a verify command, a verify list under one "Verify" line.
@@ -568,7 +595,7 @@ test('cleanup keeps worktrees with open PRs, later commits, changes, open sessio
   const why = (env) => { const r = run(dir, 'cleanup', {}, env); assert.strictEqual(r.ok, true, r.error); assert.deepStrictEqual(r.result.removed, []); return r.result.kept[0].why; };
   assert.match(why({ ...none, ...fakeGh([{ number: 8, state: 'OPEN', headRefOid: tip() }, ...merged(tip())]) }), /PR #8 is open/);
   assert.match(why({ ...none, ...fakeGh([]) }), /no PR/);
-  assert.match(why({ ...loggingClaude([{ id: 'cd34', kind: 'interactive', cwd: path.join(wt, '.tdd-flow'), state: 'idle' }]).env, ...fakeGh(merged(tip())) }), /session cd34 is still open \(idle\)/);
+  assert.match(why({ ...loggingClaude([{ id: 'cd34', kind: 'interactive', cwd: path.join(wt, '.tdd-flow'), state: 'idle' }]).env, ...fakeGh(merged(tip())) }), /session cd34 is still open \(idle\) - if its work is done, close it with `claude stop cd34`/);
   fs.appendFileSync(path.join(dir, '.git/info/exclude'), '*.local\n');
   fs.writeFileSync(path.join(wt, 'db.local'), 'data');
   assert.match(why({ ...none, ...fakeGh(merged(tip())) }), /ignored files would be deleted: db\.local/);

@@ -12,6 +12,8 @@ Each spec runs in its own background session (`claude --bg`) in `.claude/worktre
 
 `tdd-flow` is the plugin CLI (on the Bash `PATH`); it takes JSON on stdin and prints `{"ok": ..., "result": ...}`. Run it from the main checkout's root.
 
+**Shell:** this session's shell keeps a `cd` for every later command, and the paths below are relative to the main checkout's root. Never use a bare `cd` into a subdirectory. Use a subshell `(cd apps/web && npm ci)` or a tool flag (`npm --prefix`, `mvn -f`, `git -C`).
+
 ## 0. Clean up merged specs
 
 ```bash
@@ -101,13 +103,13 @@ tdd-flow runs-wait <<'TDD_FLOW_JSON'
 TDD_FLOW_JSON
 ```
 
-It returns when a run finishes or when a running spec ticks a task (`progressed`). Every time it exits, run `board` again (same slugs, `queued` updated) and print its `table`. Then read `finished`:
+It returns when a run finishes or when a running spec ticks a task (`progressed`), with the current `progress`. Pass that `progress` to the next `runs-wait`. Run `runs-wait` itself as the background command: never wrap it in a shell loop or filter its result in the shell. Every return, `progressed` included, must come back to you, so the table is printed after each ticked task. Every time it exits, run `board` again (same slugs, `queued` updated) and print its `table`. Then read `finished`:
 
 - `done` → note the `prUrl`.
 - `blocked` → note `details`. With a `decision`, the spec waits for the user's answer: see **Decisions** below.
 - `stalled` → the session went idle or disappeared without a report (it asked something or stopped early). Note its `attach` command (`runs-wait` gives the name, or the id when the name is ambiguous); do not restart it.
 
-Then start the next queued specs (step 2) until N are running again, and start `runs-wait` again for the running slugs with the latest `progress`. Repeat until nothing runs and nothing is queued. If `runs-wait` reports `timedOut`, list the running sessions with their `attach` commands and ask the user whether to keep waiting.
+Then start the next queued specs (step 2) until N are running again, and start `runs-wait` again for the running slugs with the latest `progress`. Leave finished slugs out: `runs-wait` returns at once for them. Repeat until nothing runs and nothing is queued. If `runs-wait` reports `timedOut`, list the running sessions with their `attach` commands and ask the user whether to keep waiting.
 
 ### Decisions
 

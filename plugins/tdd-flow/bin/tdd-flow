@@ -767,6 +767,8 @@ const realpath = (p) => { try { return fs.realpathSync(p); } catch { return path
 const commonDir = () => realpath(gitOut('rev-parse', '--git-common-dir') || '.git');
 /** Run results live in the shared git dir: visible from every worktree, never committed. */
 const runFile = (slug) => path.join(commonDir(), 'tdd-flow', 'runs', `${slug}.json`);
+/** Ticked tasks runs-wait last reported per slug (outside runs/, which holds one file per run). */
+const PROGRESS_FILE = () => path.join(commonDir(), 'tdd-flow', 'progress.json');
 const readRun = (slug) => readJSON(runFile(slug));
 
 /** Atomic, because runs-wait reads the run file while sessions write it. */
@@ -809,6 +811,15 @@ function checkSpecsInGit(base) {
   }
 }
 const showFile = (ref, file) => exec('git', ['show', `${ref}:${file}`], undefined, true);
+
+/** The spec's `# ` heading; specs written before the template had one: the first sentence of `## Goal`, cut to 80. */
+function specTitle(spec) {
+  const h1 = ((spec.match(/^#\s+(.+)$/m) || [])[1] || '').trim();
+  if (h1) return h1;
+  const goal = ((spec.match(/^##\s+Goal\s*\n+([\s\S]*?)(?:\n\s*\n|\n#|$)/m) || [])[1] || '').replace(/\s+/g, ' ').trim();
+  const first = (goal.match(/^.*?[.!?](?=\s|$)/) || [goal])[0];
+  return first.length > 80 ? `${first.slice(0, 79)}…` : first;
+}
 
 function specs(inp) {
   const root = mainRoot();
@@ -860,7 +871,7 @@ function specs(inp) {
       continue;
     }
     // The title lets the autopilot give the background session a readable name.
-    const title = ((specText.match(/^#\s+(.+)$/m) || [])[1] || '').trim();
+    const title = specTitle(specText);
     runnable.push({ slug, title, resume: hasWorktree || !!onBranch, lastRun: run ? run.status : null });
   }
   return { base, runnable, skipped, ...(id.warning ? { warnings: [id.warning] } : {}) };
@@ -1194,7 +1205,9 @@ function taskProgress(slug, root, base) {
 /** Specs with a worktree or a run file, sorted: what `board` shows when no slugs are given. */
 function knownRuns(root) {
   const names = (dir, keep) => { try { return fs.readdirSync(dir).filter(keep); } catch { return []; } };
-  const worktrees = names(path.join(root, WORKTREES), (n) => fs.statSync(path.join(root, WORKTREES, n)).isDirectory());
+  // Only spec worktrees (branch feature/<slug>): .claude/worktrees/ also holds worktrees of other work.
+  const worktrees = names(path.join(root, WORKTREES), (n) => fs.statSync(path.join(root, WORKTREES, n)).isDirectory()
+    && git('rev-parse', '--verify', '--quiet', `refs/heads/feature/${n}`).code === 0);
   // A done run whose worktree is gone is finished: its PR was merged and cleaned up (or the worktree removed by hand).
   const runs = names(path.dirname(runFile('x')), (n) => n.endsWith('.json')).map((n) => n.slice(0, -5))
     .filter((s) => worktrees.includes(s) || (readRun(s) || {}).status !== 'done');
@@ -1251,24 +1264,40 @@ async function runsWait(inp) {
   const root = mainRoot();
   const end = Date.now() + (inp.maxMinutes || 240) * 60000;
   const base = baseBranch();
-  // Ticked tasks per slug seen last (from the board); a slug with no entry gets its baseline from the first poll.
-  const seen = { ...(inp.progress || {}) };
+  // Ticked tasks per slug seen last: the caller's map (from the board or the last runs-wait), raised to what an earlier
+  // runs-wait already reported, so a caller that passes a stale map again waits for the next tick instead of
+  // returning at once (a shell loop around runs-wait would otherwise spin). A slug with no entry gets its baseline
+  // from the first poll.
+  const reported = readJSON(PROGRESS_FILE()) || {};
+  const seen = {};
   for (;;) {
     const sessions = claudeSessions();
     const finished = [];
     const running = [];
     const progressed = [];
+    const current = {};
     for (const slug of slugs) {
       const st = runState(slug, sessions, root);
       if (st.status !== 'running') { finished.push(st); continue; }
       running.push({ slug, ...(st.attach ? { attach: st.attach } : {}) });
       const p = taskProgress(slug, root, base);
       if (!p) continue;
-      if (!Number.isInteger(seen[slug])) seen[slug] = p.done;
-      else if (p.done > seen[slug]) progressed.push(slug);
+      current[slug] = p.done;
+      if (!(slug in seen)) {
+        // First poll. A count above today's (tasks.md was reset or replaced, a restarted spec) is stale and ignored.
+        const usable = [inp.progress && inp.progress[slug], reported[slug]].filter((v) => Number.isInteger(v) && v <= p.done);
+        seen[slug] = usable.length ? Math.max(...usable) : p.done;
+      }
+      if (p.done > seen[slug]) progressed.push(slug);
     }
-    if (finished.length || progressed.length) return { finished, running, ...(progressed.length ? { progressed } : {}) };
-    if (Date.now() > end) return { finished: [], running, timedOut: true };
+    if (progressed.length) {
+      // Re-read before writing: another autopilot may have written its slugs during this wait.
+      const latest = readJSON(PROGRESS_FILE()) || {};
+      for (const slug of progressed) latest[slug] = current[slug];
+      try { writeAtomic(PROGRESS_FILE(), JSON.stringify(latest) + '\n'); } catch { /* only a guard against re-reporting */ }
+    }
+    if (finished.length || progressed.length) return { finished, running, ...(progressed.length ? { progressed } : {}), progress: current };
+    if (Date.now() > end) return { finished: [], running, timedOut: true, progress: current };
     await sleep(Math.min(RUN_POLL_MS, Math.max(0, end - Date.now()) + 50));
   }
 }
@@ -1352,7 +1381,7 @@ function cleanup() {
     const inside = (s) => s.cwd && (realpath(s.cwd) === wt.path || realpath(s.cwd).startsWith(wt.path + path.sep));
     const own = sessions.filter((s) => inside(s) || (run && run.session && (s.id === run.session || s.sessionId === run.session)));
     const active = own.find((s) => !ENDED.includes(s.state));
-    if (active) { keep(`session ${attachRef(sessions, active)} is still open (${active.state || 'unknown state'})`); continue; }
+    if (active) { keep(`session ${attachRef(sessions, active)} is still open (${active.state || 'unknown state'}) - if its work is done, close it with \`claude stop ${attachRef(sessions, active)}\``); continue; }
     const precious = exec('git', ['-C', wt.path, 'status', '--porcelain', '--ignored'], undefined, true).out.split('\n')
       .filter((l) => l.startsWith('!! ')).map((l) => l.slice(3).replace(/^"|"$/g, '').replace(/\/$/, ''))
       .filter((p) => p !== STATE && !p.split('/').some((seg) => REGENERABLE.has(seg) || seg.endsWith('.iml')));
@@ -1646,4 +1675,4 @@ async function main(argv) {
 
 if (require.main === module) main(process.argv.slice(2)).then((code) => { process.exitCode = code; });
 
-module.exports = { main, shapeOf, parseSpec, parseTasks, parseTaskTable, readStack, compact, kebab, onMergeSummary, taskLine, setSpecStatus, COMMANDS };
+module.exports = { main, shapeOf, specTitle, parseSpec, parseTasks, parseTaskTable, readStack, compact, kebab, onMergeSummary, taskLine, setSpecStatus, COMMANDS };

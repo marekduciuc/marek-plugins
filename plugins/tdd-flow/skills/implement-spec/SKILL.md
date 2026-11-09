@@ -10,6 +10,8 @@ Input: $ARGUMENTS - the feature slug, optionally followed by the base branch (de
 
 This runs without a human watching, usually in a `claude --bg` session started by `/tdd-flow:autopilot`. Do not ask questions and do not stop to wait for input: every way this skill ends goes through `tdd-flow run-report`, so the autopilot sees the result. Never merge, release or force-push.
 
+**Shell:** this session's shell keeps a `cd` for every later command, and the paths below are relative to the worktree root. Never use a bare `cd` into a subdirectory. Use a subshell `(cd apps/web && npm ci)` or a tool flag (`npm --prefix`, `mvn -f`, `git -C`).
+
 `tdd-flow` is the plugin CLI (on the Bash `PATH`); it takes JSON on stdin and prints `{"ok": ..., "result": ...}`:
 
 ```bash
@@ -117,7 +119,7 @@ Minor findings are not fixed; they go into the PR body.
    - `generateFailed` → report blocked with `reason`.
    - `merged` or `regenerated` → note it for the PR body (**Test plan**).
 3. `git push -u origin feature/<slug>`. The push-gate hook runs the type check, lint, tests and a secret scan first, after a merge on the merged code. If it blocks the push, report blocked with the gate's message. Never bypass it (`--no-verify`, `TDD_FLOW_PUSH_GATE=off`).
-4. With no open PR: `gh pr create --base <base> --head feature/<slug> --title "<type>(<slug>): <spec title from its first # heading>" --body-file <file>`. `<type>` is `refactor` for a spec with `Source: tdd-flow simplify-codebase`, otherwise `feat`. (write the body to a file in the scratchpad or a temp directory). Body:
+4. With no open PR: `gh pr create --base <base> --head feature/<slug> --title "<type>(<slug>): <spec title>" --body-file <file>`. The spec title is its first `# ` heading. A spec without one takes the issue title (`gh issue view <n> --json title`) when `Source:` names an issue, else the first sentence of `## Goal`. `<type>` is `refactor` for a spec with `Source: tdd-flow simplify-codebase`, otherwise `feat`. (write the body to a file in the scratchpad or a temp directory). Body:
    - **Summary**: the spec's goal, with a link to the source issue if `spec.md` has `Source:` with an issue
    - **Acceptance criteria**: AC ids with one line each
    - **Tasks**: the commits from step 1 (`git log --oneline <base>..HEAD`), and refactor tasks skipped with their reason

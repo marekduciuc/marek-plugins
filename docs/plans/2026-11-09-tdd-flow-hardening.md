@@ -80,6 +80,14 @@ Seen: `npm ci` left the shell in `apps/web`, T-1 started from the wrong director
 - **`/tdd-flow:cleanup` skill:** exposes `tdd-flow cleanup` outside the autopilot.
 - **Dependency graph between specs** and merge order. Related to the deferred task-level parallel worktrees idea (01.11.2026).
 
+## Findings from the first live run (symple-crm #34, 09.11.2026, fixed in 0.17.1)
+
+- **Shell loop around runs-wait.** The autopilot wrapped `runs-wait` in a shell loop that ignored `progressed` and passed the same stale `progress` every time. After the first ticked task it restarted about once a second, and the table after each task never showed. Fix: `runs-wait` returns the current `progress` and remembers what it reported, so a stale map waits for the next tick; the skill forbids a shell loop.
+- **Specs had no title.** The spec template had no `# ` heading, so `specs` returned `title: ""` and the PR title rule pointed at a heading that did not exist. Fix: the template has a title line; specs without one fall back to the first sentence of `## Goal`, and PRs to the issue title.
+- **board listed other worktrees.** A worktree of other work (`fix/...`) showed as `stalled`. Fix: only worktrees on `feature/<slug>`.
+- **cleanup kept worktrees for old sessions** waiting for input. It now says to close them with `claude stop <name>`.
+- **Bare `cd` in agents.** The agents' shell text said a `cd` carries into the next command. In workflow subagents every Bash call starts at the worktree root (seen in the transcripts), so the agents ignored the rule, and that did no harm. Fix: the agents' text describes the real behaviour; the no-bare-`cd` rule stays in the skills that run in a main session (implement-spec, autopilot, ship-feature), where a `cd` does carry.
+
 ## Later: move global rules into the plugin
 
 So users don't need your `~/.claude/rules`: Shell (no bare `cd`), Questions (in chat, one at a time), Git state reporting (commit check, block check, PR only after `gh pr create` returned a URL). How a plugin ships rules is to be checked in the Claude Code docs first.
