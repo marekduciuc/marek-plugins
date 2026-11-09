@@ -1017,6 +1017,49 @@ test('autopilot-check: base suite runs once for two or more specs on a clean bas
   assert.match(suite(2).check('base suite').details, /main checkout is on other, not main/);
 });
 
+test('autopilot-check: the local base must have what origin has, else the worktrees start from old code', () => {
+  const { dir, g, write } = trackedRepo();
+  const check = (runnable = 2) => autopilotCheck(dir, { runnable }, { settings: { permissions: { defaultMode: 'auto' } } });
+  const noRemote = check();
+  assert.deepStrictEqual([noRemote.ok, noRemote.check('base').status, noRemote.check('base suite').status], [true, 'warn', 'ok']);
+  assert.match(noRemote.check('base').details, /^cannot fetch origin\/main \(.+\): worktrees start from the local main/);
+
+  const remote = fs.mkdtempSync(path.join(os.tmpdir(), 'tdd-flow-remote-'));
+  execFileSync('git', ['init', '-q', '--bare', '-b', 'main', remote]);
+  g('remote', 'add', 'origin', remote);
+  g('push', '-q', 'origin', 'main');
+  assert.deepStrictEqual(check().check('base'), { name: 'base', status: 'ok', details: 'main is up to date with origin/main' });
+
+  const other = fs.mkdtempSync(path.join(os.tmpdir(), 'tdd-flow-other-'));
+  execFileSync('git', ['clone', '-q', remote, other]);
+  const og = (...a) => execFileSync('git', a, { cwd: other, stdio: 'pipe' });
+  og('-c', 'user.email=o@example.com', '-c', 'user.name=O', 'commit', '-q', '--allow-empty', '-m', 'merged on GitHub');
+  og('push', '-q', 'origin', 'main');
+  const behind = check();
+  assert.deepStrictEqual([behind.ok, behind.check('base').status, behind.check('base').fix], [false, 'fail', 'run `! git pull --ff-only` in the main checkout']);
+  assert.match(behind.check('base').details, /^main is 1 commit\(s\) behind origin\/main/);
+  assert.match(behind.check('base suite').details, /^main is not in line with origin\/main/);
+  g('switch', '-qc', 'other');
+  assert.strictEqual(check().check('base').fix, 'run `! git fetch origin main:main`');
+  g('switch', '-q', 'main');
+
+  write('local.txt', 'x\n');
+  g('add', 'local.txt');
+  g('commit', '-qm', 'local only');
+  const diverged = check().check('base');
+  assert.strictEqual(diverged.status, 'fail');
+  assert.match(diverged.details, /^main and origin\/main have diverged \(1 local, 1 on origin\)/);
+
+  g('pull', '-q', '--no-rebase', '--no-edit', 'origin', 'main');
+  const ahead = check().check('base');
+  assert.strictEqual(ahead.status, 'warn');
+  assert.match(ahead.details, /^main has 2 commit\(s\) that are not on origin\/main, and every feature branch and PR gets them: \w+ Merge branch/);
+
+  g('switch', '-q', 'other');
+  g('branch', '-q', '-D', 'main');
+  assert.deepStrictEqual(check(1).check('base'), { name: 'base', status: 'fail', details: 'there is no local main, only origin/main; worktrees branch from the local one', fix: 'run `! git branch main origin/main`' });
+});
+
 test('stack-fill writes tests need into stack.md when the detector left it out or kept the template hint', () => {
   const { dir, write, read } = repo();
   write('.tdd-flow/stack.md', 'test command (all): `npm test`\nci system: GitHub Actions\nnotes: x\n');

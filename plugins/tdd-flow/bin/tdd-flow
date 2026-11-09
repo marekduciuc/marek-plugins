@@ -991,6 +991,7 @@ async function syncBase(inp) {
 // ---------- autopilot pre-flight ----------
 const PARALLEL_DEFAULT = 3;
 const DOCKER_TIMEOUT_MS = 20000;
+const FETCH_TIMEOUT_MS = 30000;
 // What every background session runs (implement-spec and the workflows it starts). Test and build commands run
 // inside `tdd-flow test`, so they need no rule of their own.
 const SESSION_RULES = [
@@ -1062,10 +1063,50 @@ function permissionsCheck(root, base) {
   };
 }
 
+/**
+ * Whether the local base, which every new worktree branches from, has what origin has. A base behind origin fails:
+ * the CLI never pulls, because a merge into the default branch needs the user's OK.
+ */
+function baseFreshnessCheck(base) {
+  const name = 'base';
+  const remote = `origin/${base}`;
+  const hasRef = (ref) => git('rev-parse', '--verify', '--quiet', ref).code === 0;
+  // No terminal prompt and a timeout: an SSH or credential prompt must not hang the foreground pre-flight.
+  const f = spawnSync('git', ['fetch', '--quiet', 'origin', base], { encoding: 'utf8', timeout: FETCH_TIMEOUT_MS, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } });
+  const fetched = !f.error && f.status === 0;
+  if (!hasRef(`refs/heads/${base}`)) {
+    return hasRef(`refs/remotes/${remote}`)
+      ? { name, status: 'fail', details: `there is no local ${base}, only ${remote}; worktrees branch from the local one`, fix: `run \`! git branch ${base} ${remote}\`` }
+      : { name, status: 'fail', details: `there is no branch ${base}`, fix: 'set `default branch:` in .tdd-flow/stack.md to the branch the specs are on' };
+  }
+  if (!fetched) {
+    const why = f.error ? (f.error.code === 'ETIMEDOUT' ? `timed out after ${FETCH_TIMEOUT_MS / 1000} s` : f.error.message) : (f.stderr || '').trim().split('\n')[0];
+    return { name, status: 'warn', details: `cannot fetch ${remote} (${why}): worktrees start from the local ${base}, which may be behind` };
+  }
+  const [ahead, behind] = gitOut('rev-list', '--left-right', '--count', `${base}...${remote}`).split(/\s+/).map(Number);
+  if (!behind && !ahead) return { name, status: 'ok', details: `${base} is up to date with ${remote}` };
+  if (!behind) {
+    const commits = gitOut('log', '--oneline', '-5', `${remote}..${base}`).split('\n').join('; ');
+    return { name, status: 'warn', details: `${base} has ${ahead} commit(s) that are not on ${remote}, and every feature branch and PR gets them: ${commits}`, fix: `push them through a PR first, unless every spec should carry them` };
+  }
+  const onBase = gitOut('branch', '--show-current') === base;
+  if (!ahead) {
+    return {
+      name, status: 'fail', details: `${base} is ${behind} commit(s) behind ${remote}: the worktrees would start from old code`,
+      fix: onBase ? 'run `! git pull --ff-only` in the main checkout' : `run \`! git fetch origin ${base}:${base}\``,
+    };
+  }
+  return {
+    name, status: 'fail', details: `${base} and ${remote} have diverged (${ahead} local, ${behind} on origin): the worktrees would start from code origin does not have`,
+    fix: `bring ${base} together with ${remote} in the main checkout (a merge or rebase on ${base} needs your OK)`,
+  };
+}
+
 /** The base suite once in the main checkout, instead of every session finding a red base at its own baseline. */
-async function baseSuiteCheck(base, runnable, stack) {
+async function baseSuiteCheck(base, runnable, stack, isBaseStale) {
   const skip = (why) => ({ name: 'base suite', status: 'skipped', details: `${why}; each session runs its own baseline` });
   if (runnable < 2) return skip('one spec');
+  if (isBaseStale) return skip(`${base} is not in line with origin/${base}, so the suite here is not what the worktrees should get`);
   if (!stack || none(stack.testAll)) return skip('no test command in .tdd-flow/stack.md');
   const branch = gitOut('branch', '--show-current');
   if (branch !== base) return skip(`the main checkout is on ${branch || 'a detached HEAD'}, not ${base}`);
@@ -1115,7 +1156,9 @@ async function autopilotCheck(inp) {
   }
 
   checks.push(permissionsCheck(root, base));
-  checks.push(await baseSuiteCheck(base, runnable, stack));
+  const fresh = baseFreshnessCheck(base);
+  checks.push(fresh);
+  checks.push(await baseSuiteCheck(base, runnable, stack, fresh.status === 'fail'));
 
   const parallel = inp.parallel || (outside ? 1 : PARALLEL_DEFAULT);
   if (outside && !inp.parallel) checks.push({ name: 'parallel', status: 'ok', details: `1 at a time, because the tests need ${need}; pass --parallel N to run more` });
