@@ -81,9 +81,9 @@ git branch -d <branch>     # never -D; if -d refuses, tell the user
 
 Useful checks: `gh pr view --json url,state,mergeable`, `gh pr checks`.
 
-## 5. Release tag (after merge)
+## 5. Release tag (only when the user asks)
 
-The version bump goes through a PR like any other change. After the user has merged it, tag the merge commit:
+Tags are optional. The marketplace installs from `main` and reads the version from `plugin.json`, never from tags. Do not create or offer a tag after a merge. Only when the user asks for one, tag the merge commit:
 
 ```bash
 gh pr view <number> --json state,mergeCommit --jq '.state, .mergeCommit.oid'   # must be MERGED
