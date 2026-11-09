@@ -104,14 +104,31 @@ TDD_FLOW_JSON
 It returns when a run finishes or when a running spec ticks a task (`progressed`). Every time it exits, run `board` again (same slugs, `queued` updated) and print its `table`. Then read `finished`:
 
 - `done` → note the `prUrl`.
-- `blocked` → note `details`.
+- `blocked` → note `details`. With a `decision`, the spec waits for the user's answer: see **Decisions** below.
 - `stalled` → the session went idle or disappeared without a report (it asked something or stopped early). Note its `attach` command (`runs-wait` gives the name, or the id when the name is ambiguous); do not restart it.
 
 Then start the next queued specs (step 2) until N are running again, and start `runs-wait` again for the running slugs with the latest `progress`. Repeat until nothing runs and nothing is queued. If `runs-wait` reports `timedOut`, list the running sessions with their `attach` commands and ask the user whether to keep waiting.
 
+### Decisions
+
+A blocked run with `decision` added an open question (`decision.id`) to `spec.md` in its worktree and stopped before the tasks it blocks.
+1. If other specs are still running, start `runs-wait` again in the background for them first, so they keep being watched while you ask. Skip this when nothing else runs.
+2. Ask the open decisions in chat, one at a time, in plain text: slug, question, options, recommendation and the blocked tasks. Wait for each answer. Do not put two questions in one message.
+3. Apply the answer in the worktree, as the `resolve-questions` skill does. Move the question to `## Resolved questions` with the answer, and update the criteria, edge cases, tasks and `tasks.md` it changes. Keep `Status: approved`: the user's answer in this conversation approves the change. If the spec already says `Status: implemented` (the decision came from the simplify or review step, after every task was ticked), add a task for the answer to the task table and `tasks.md` (`- [ ] T-<next> <what the answer changes> (<AC ids>)`) and set `Status: approved` again. Otherwise the restart would find nothing to do. Then commit it: `git -C .claude/worktrees/<slug> add .tdd-flow/features/<slug> && git -C .claude/worktrees/<slug> commit -m "docs(<slug>): answer Q-<n>"`.
+4. Remove the old session with `claude rm <session>` (the id from the run's `session`), but only when `claude agents --json --all` does not list it as `working`. If `rm` fails, note it and go on: a leftover session does no harm, because the new run's id is matched first.
+5. Queue the spec again. `specs` with its slug takes a blocked spec that is named. It starts in step 2 when a slot is free and resumes from the first open task. Once it runs, stop the background `runs-wait` (TaskStop) and start a new one that includes the restarted slug.
+
+A decision the user does not answer stays open; list it in the summary.
+
 ## 4. Summary
 
-The final `board` table (it has the PR URL, or the reason and `claude attach <name>` for blocked and stalled specs), followed by the skipped specs (slug - reason) and the worktree of each blocked or stalled spec. Then:
+The final `board` table (it has the PR URL, or the reason and `claude attach <name>` for blocked and stalled specs, or `decision Q-<n>: ...`), then the open decisions: slug, question, recommendation. To answer one later:
+- run `/tdd-flow:resolve-questions <slug>` in the worktree;
+- set `Status: approved` again (for an implemented spec, add a task for the answer as in **Decisions** step 3);
+- commit in the worktree;
+- run `/tdd-flow:autopilot <slug>`.
+
+Then list the skipped specs (slug - reason) and the worktree of each blocked or stalled spec. Then:
 
 - A blocked spec: fix the cause (in its worktree), then run `/tdd-flow:autopilot <slug>`; it resumes from `tasks.md` on the same branch.
 - A stalled spec: `claude attach <name>` and answer the session.

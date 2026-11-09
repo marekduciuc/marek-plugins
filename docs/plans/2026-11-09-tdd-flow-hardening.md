@@ -4,7 +4,7 @@ Source: the "Where Things Go Wrong" to "On the Horizon" sections of the Claude C
 
 Goal: a user installs tdd-flow and it works without changing their whole environment. Fixes go into the plugin, not into the user's rules or repo CLAUDE.md.
 
-Status: phase 1 implemented in tdd-flow 0.13.0. Phase 2: autopilot pre-flight and external test state (F6) implemented in tdd-flow 0.14.0; migrations (F7), meta-tests (F8), questions in chat (F4) and `/tdd-flow:resolve-questions` in tdd-flow 0.15.0. Phase 3: before-push sync implemented in tdd-flow 0.16.0, as a merge of the base (no rebase, so no force-push); the rest not started.
+Status: phase 1 implemented in tdd-flow 0.13.0. Phase 2: autopilot pre-flight and external test state (F6) implemented in tdd-flow 0.14.0; migrations (F7), meta-tests (F8), questions in chat (F4) and `/tdd-flow:resolve-questions` in tdd-flow 0.15.0. Phase 3: before-push sync implemented in tdd-flow 0.16.0, as a merge of the base (no rebase, so no force-push); the cleanup skill in 0.16.1; the decision queue in 0.17.0. Migration collisions and the dependency graph not started.
 
 Phase 2 (0.14.0) as built: a separate `tdd-flow autopilot-check` command. The base suite runs only for 2 or more specs and only in a clean main checkout on the base. Permissions come from managed settings, the user settings, the main checkout's `settings.local.json` (worktree sessions use it) and the base's `settings.json`. No rules are needed in `auto` mode, which is the default since Claude Code 2.1.283. `tests need:` in stack.md is inferred from the test lines only for older profiles. It sets parallel to 1. The test cache stays on (user decision after the architecture review: Testcontainers start fresh, and one session at a time already avoids shared state); `TDD_FLOW_TEST_CACHE=off` covers a shared local database.
 
@@ -63,6 +63,20 @@ Seen: `npm ci` left the shell in `apps/web`, T-1 started from the wrong director
 - **Before push:** rebase onto the base and run the generate commands (new `stack.md` field, e.g. `openapi.json`), then rerun the suite (PR #83/#84 conflicts).
 - **Migration collisions:** the autopilot warns when two specs running at the same time add migrations.
 - **Decision queue:** a blocked run writes a structured decision (context, options, recommendation, blocked tasks) to `run-report`; `board` and the autopilot summary show it in chat; optionally a draft PR with the decisions at the top. No polling, no skipping ahead to later tasks.
+
+  Design (decided 09.11.2026):
+  - **When.** implement-spec raises a decision only when a step is blocked on a choice that is the user's to make: the spec contradicts itself or the code, an AC allows two behaviours, or a finding needs a product call. Technical failures (a red test, the environment, a merge conflict) stay plain `blocked`.
+  - **Where.** In the worktree, the session adds the question to `## Open questions` in `spec.md`, in the usual format. The assumption is its recommendation, followed by the options and the tasks it blocks. It commits the file (`docs(<slug>): open question Q-<n>`), then runs `run-report` with `status: blocked` and `decision: {id, question, options, recommendation, tasks}`. Later tasks are not started.
+  - **Shown.**
+    - `board` puts `decision Q-<n>: <question>` in the reason column.
+    - `runs-wait` returns the decision with the finished run.
+    - The autopilot starts `runs-wait` again in the background, then asks the open decisions in chat, one at a time, as `resolve-questions` does. The other specs keep running meanwhile.
+  - **Answer.**
+    - The autopilot writes the answer into the worktree's `spec.md` (`## Resolved questions`, plus the ACs and tasks it changes) and commits it.
+    - It then restarts the spec as in step 2: `specs` with the slug, `worktree`, a new `claude --bg` session. The old session is removed with `claude rm` first.
+    - The restarted spec continues from the first open task. It waits in the queue when N specs are already running.
+    - When the autopilot has already ended, the user answers with `/tdd-flow:resolve-questions <slug>` in the worktree, then runs `/tdd-flow:autopilot <slug>`.
+  - **No draft PR.** The PR still opens at the end, so there is no early push and no early CI.
 - **`/tdd-flow:cleanup` skill:** exposes `tdd-flow cleanup` outside the autopilot.
 - **Dependency graph between specs** and merge order. Related to the deferred task-level parallel worktrees idea (01.11.2026).
 

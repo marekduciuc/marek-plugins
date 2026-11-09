@@ -1135,12 +1135,26 @@ function worktree(inp) {
   return { path: abs, branch, created: true };
 }
 
-/** Records a run result. Input: {slug, status: running|done|blocked, session?, prUrl?, details?}. */
+/** A blocked run's question for the user, checked: {id: Q-<n>, question, recommendation, options?: [...], tasks?: [...]}. */
+function checkDecision(d) {
+  if (!d || typeof d !== 'object') throw new Error('decision must be an object {id, question, recommendation, options, tasks}');
+  if (!/^Q-\d+$/.test(String(d.id || ''))) throw new Error(`decision.id must be the spec's question id (Q-<n>), not ${JSON.stringify(d.id)}`);
+  for (const k of ['question', 'recommendation']) if (!String(d[k] || '').trim()) throw new Error(`decision.${k} is required`);
+  const list = (k) => (d[k] == null ? [] : Array.isArray(d[k]) ? d[k].map(String) : [String(d[k])]);
+  return { id: d.id, question: String(d.question).trim(), recommendation: String(d.recommendation).trim(), options: list('options'), tasks: list('tasks') };
+}
+
+/**
+ * Records a run result. Input: {slug, status: running|done|blocked, session?, prUrl?, details?, decision?}. `decision`
+ * (blocked only) is the question the session added to the worktree's spec.md and needs the user to answer.
+ */
 function runReport(inp) {
   const slug = checkSlug(inp.slug);
   if (!['running', ...RUN_FINAL].includes(inp.status)) throw new Error(`status must be running, done or blocked, not "${inp.status}"`);
+  if (inp.decision && inp.status !== 'blocked') throw new Error('decision goes with status blocked');
   const run = { slug, status: inp.status, at: new Date().toISOString() };
   for (const k of ['session', 'prUrl', 'details']) if (inp[k]) run[k] = String(inp[k]);
+  if (inp.decision) run.decision = checkDecision(inp.decision);
   writeRun(slug, run);
   return run;
 }
@@ -1205,7 +1219,7 @@ function board(inp) {
     // Every task ticked while the session still runs: implement-spec is in its simplify / review / PR steps.
     const current = !p ? '' : p.open || (st.status === 'running' ? 'simplify / review / PR' : '');
     return { slug, status: st.status, done: p ? p.done : null, total: p ? p.total : null, current,
-      prUrl: st.prUrl || '', details: st.details || '', attach: st.attach || '' };
+      prUrl: st.prUrl || '', details: st.details || '', attach: st.attach || '', ...(st.decision ? { decision: st.decision } : {}) };
   });
   const progress = Object.fromEntries(rows.filter((r) => r.status === 'running' && r.done !== null).map((r) => [r.slug, r.done]));
   return { rows, progress, table: boardTable(rows) };
@@ -1216,7 +1230,9 @@ function boardTable(rows) {
   const lines = ['| Spec | Status | Tasks | PR / reason |', '|---|---|---|---|'];
   for (const r of rows) {
     const tasks = r.total === null ? '–' : `${r.done}/${r.total}${r.current ? ` · ${r.current}` : ''}`;
-    const why = r.prUrl || [r.details.split('\n')[0].slice(0, 100), ['blocked', 'stalled'].includes(r.status) && r.attach ? `\`${r.attach}\`` : ''].filter(Boolean).join(' · ');
+    // A decision waits for the user, not for the session: no attach command.
+    const why = r.prUrl || (r.decision ? `decision ${r.decision.id}: ${r.decision.question.slice(0, 100)}`
+      : [r.details.split('\n')[0].slice(0, 100), ['blocked', 'stalled'].includes(r.status) && r.attach ? `\`${r.attach}\`` : ''].filter(Boolean).join(' · '));
     lines.push(`| ${cell(r.slug)} | ${r.status} | ${cell(tasks)} | ${cell(why)} |`);
   }
   return lines.join('\n');
