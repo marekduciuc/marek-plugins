@@ -1008,7 +1008,7 @@ async function autopilotCheck(inp) {
   if (outside) {
     const how = stack.testsNeedInferred ? ' (inferred from the test lines of .tdd-flow/stack.md)' : '';
     checks.push({
-      name: 'tests need', status: 'warn', details: `${need}${how}: parallel sessions share it`,
+      name: 'tests need', status: stack.testsNeedInferred ? 'warn' : 'ok', details: `${need}${how}: parallel sessions share it`,
       ...(stack.testsNeedInferred ? { fix: 'add a `tests need:` line to .tdd-flow/stack.md (`none` if they need nothing)' } : {}),
     });
   }
@@ -1023,7 +1023,7 @@ async function autopilotCheck(inp) {
   checks.push(await baseSuiteCheck(base, runnable, stack));
 
   const parallel = inp.parallel || (outside ? 1 : PARALLEL_DEFAULT);
-  if (outside && !inp.parallel) checks.push({ name: 'parallel', status: 'warn', details: `1 at a time, because the tests need ${need}; pass --parallel N to run more` });
+  if (outside && !inp.parallel) checks.push({ name: 'parallel', status: 'ok', details: `1 at a time, because the tests need ${need}; pass --parallel N to run more` });
   else if (outside && parallel > 1) checks.push({ name: 'parallel', status: 'warn', details: `${parallel} at a time although the tests need ${need}: their tests may collide` });
   else checks.push({ name: 'parallel', status: 'ok', details: `${parallel} at a time` });
 

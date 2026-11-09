@@ -901,12 +901,13 @@ test('autopilot-check: tests need from the stack.md field, else inferred from it
   const need = (txt) => {
     write('.tdd-flow/stack.md', txt);
     const r = autopilotCheck(dir, { runnable: 1 }, { settings: { permissions: { defaultMode: 'auto' } }, env: { TDD_FLOW_DOCKER_BIN: fakeBin('docker', 'exit 0') } });
-    return [r.testsNeed, /inferred/.test((r.check('tests need') || {}).details || '')];
+    const c = r.check('tests need') || {};
+    return [r.testsNeed, /inferred/.test(c.details || ''), c.status];
   };
-  assert.deepStrictEqual(need('tests need: docker (Testcontainers)\n'), ['docker (Testcontainers)', false]);
-  assert.deepStrictEqual(need('tests need: none\ntest command (all): ./mvnw verify\n  note: needs Docker\n'), ['none', false]);
-  assert.deepStrictEqual(need('test command (all): ./mvnw verify\n  note: ITs use Testcontainers, need Docker\nbuild command: npm run build\n'), ['docker', true]);
-  assert.deepStrictEqual(need('test command (all): npm test\nbuild command: docker build .\nci system: GitHub Actions builds a docker image\n'), ['none', false]);
+  assert.deepStrictEqual(need('tests need: docker (Testcontainers)\n'), ['docker (Testcontainers)', false, 'ok']);
+  assert.deepStrictEqual(need('tests need: none\ntest command (all): ./mvnw verify\n  note: needs Docker\n'), ['none', false, undefined]);
+  assert.deepStrictEqual(need('test command (all): ./mvnw verify\n  note: ITs use Testcontainers, need Docker\nbuild command: npm run build\n'), ['docker', true, 'warn']);
+  assert.deepStrictEqual(need('test command (all): npm test\nbuild command: docker build .\nci system: GitHub Actions builds a docker image\n'), ['none', false, undefined]);
 });
 
 test('autopilot-check: gh login is required', () => {
@@ -945,6 +946,7 @@ test('autopilot-check: tests that need Docker check the engine and run one spec 
   const opts = (code) => ({ settings: { permissions: { defaultMode: 'auto' } }, env: { TDD_FLOW_DOCKER_BIN: fakeBin('docker', `exit ${code}`) } });
   const up = autopilotCheck(dir, { runnable: 1 }, opts(0));
   assert.deepStrictEqual([up.ok, up.parallel, up.testsNeed, up.check('docker').status], [true, 1, 'docker (Testcontainers)', 'ok']);
+  assert.deepStrictEqual([up.check('tests need').status, up.check('parallel').status], ['ok', 'ok']);
   assert.match(up.check('tests need').details, /parallel sessions share it/);
   assert.match(up.check('parallel').details, /^1 at a time, because the tests need docker/);
   const down = autopilotCheck(dir, { runnable: 1 }, opts(1));
