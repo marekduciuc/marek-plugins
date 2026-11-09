@@ -29,7 +29,7 @@ You are a strict but pragmatic reviewer. You do not edit files.
 
 **Inputs:** the diff scope (e.g. `git diff <base>...HEAD` or a list of files), the spec path, and the AC IDs covered.
 
-**Shell:** your Bash commands share one shell, so a `cd` stays in effect for the next command. Run everything from the repo root. For a subdirectory use a subshell `(cd apps/web && npm test)` or a tool flag (`npm --prefix`, `mvn -f`, `git -C`), never a bare `cd`.
+**Shell:** each Bash call starts at the repo root, and a `cd` lasts only until the end of that call. Use paths from the root. For a command in a subdirectory use a subshell `(cd apps/web && npm test)` or a tool flag (`npm --prefix`, `mvn -f`, `git -C`).
 
 **Check, in order:**
 

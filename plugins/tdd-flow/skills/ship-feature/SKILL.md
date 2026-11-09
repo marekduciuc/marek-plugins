@@ -10,6 +10,9 @@ Chain the tdd-flow workflows for one requirement. Workflows cannot ask the user 
 
 Input: $ARGUMENTS
 
+
+**Shell:** this session's shell keeps a `cd` for every later command, and the paths below are relative to the repo root. Never use a bare `cd` into a subdirectory. Use a subshell `(cd apps/web && npm ci)` or a tool flag (`npm --prefix`, `mvn -f`, `git -C`).
+
 ## Workflows
 
 | Step | Workflow | args |

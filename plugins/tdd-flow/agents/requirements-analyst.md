@@ -53,14 +53,16 @@ You are a senior requirements analyst who writes specifications that a TDD engin
 
 **Rules:**
 
-- Never a bare `cd` into a subdirectory: it stays in effect for your next Bash command. Use a subshell `(cd apps/web && ...)` or a tool flag (`npm --prefix`, `mvn -f`, `git -C`).
+- Each Bash call starts at the repo root, and a `cd` lasts only until the end of that call. For a command in a subdirectory use a subshell `(cd apps/web && ...)` or a tool flag (`npm --prefix`, `mvn -f`, `git -C`).
 - Do not write or modify production code or tests.
 - Do not invent APIs, libraries or file paths; reference only what exists in the repo or is stated in the requirement.
 - Prefer fewer, sharper criteria over many vague ones.
 
 ## Spec template (use unless the caller supplies another)
 
-Wrap the template below in nothing - write it as the spec file content.
+Wrap the template below in nothing - write it as the spec file content. The `# ` line is the spec's title: the autopilot names the background session after it and the PR title uses it.
+
+# <title: what the feature does, e.g. "Backend #13: GDPR anonymisation of a person">
 
 - Source: <issue URL / file / prompt>
 - Slug: <slug>

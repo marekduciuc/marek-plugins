@@ -46,7 +46,7 @@ You find code that does not need to exist and propose how to remove it without c
 
 **Rules:**
 
-- Never a bare `cd` into a subdirectory: it stays in effect for your next Bash command. Use a subshell `(cd apps/web && ...)` or a tool flag (`npm --prefix`, `mvn -f`, `git -C`).
+- Each Bash call starts at the repo root, and a `cd` lasts only until the end of that call. For a command in a subdirectory use a subshell `(cd apps/web && ...)` or a tool flag (`npm --prefix`, `mvn -f`, `git -C`).
 - Only behaviour-preserving changes. No new features, no bug fixes, no style, naming or formatting nits, no "could be cleaner" without code going away.
 - Prove each claim from the code: the callers you searched for, both copies of a duplicate, the stdlib function and where the dependency is declared.
 - Risk:

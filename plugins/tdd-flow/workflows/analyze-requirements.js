@@ -200,7 +200,7 @@ try {
     `Merge these ${drafts.length} independent spec drafts for "${req.title}" into ONE spec.\n` +
     'Do NOT simply take the union. Include an AC only if the requirement asks for it or it is an edge case a careful engineer would consider necessary; move speculative behaviour (unicode, performance, input types, limits not mentioned) to Open questions with an assumption instead of new ACs. ' +
     'Keep scope proportional: a small function needs roughly 3-6 ACs and 1-3 tasks; group closely related ACs into one task. Drop duplicates, keep ACs sharp and testable, number them AC-1.., EC-1.., Q-1.., T-1... Order tasks so each builds on the previous.\n' +
-    `Write ${dir}/spec.md using your spec template (Status: draft, Source: ${req.source}, Slug: ${req.slug}).\n` +
+    `Write ${dir}/spec.md using your spec template (title line: # ${req.title}, Status: draft, Source: ${req.source}, Slug: ${req.slug}).\n` +
     `Write ${dir}/tasks.md as a checklist: "- [ ] T-1 <title> (AC-1, AC-2)"; end the line of a setup task with " [setup]". Every criterion of a setup task needs a "- **Verify:** \`<command>\`" line in spec.md (or "- **Verify (manual):**" only when no automatic check exists). In a repo with no test suite, put the setup task that installs the test framework before the first tdd task.\n` +
     `Create or overwrite .tdd-flow/state.json as {"feature": "${req.slug}", "phase": "IDLE", "task": "T-1"}.\n` +
     'If .tdd-flow/ is not in .gitignore, do not change .gitignore - just mention it in assumptions.\n' +
