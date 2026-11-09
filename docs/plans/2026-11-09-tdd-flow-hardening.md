@@ -87,6 +87,8 @@ Seen: `npm ci` left the shell in `apps/web`, T-1 started from the wrong director
 - **board listed other worktrees.** A worktree of other work (`fix/...`) showed as `stalled`. Fix: only worktrees on `feature/<slug>`.
 - **cleanup kept worktrees for old sessions** waiting for input. It now says to close them with `claude stop <name>`.
 - **Bare `cd` in agents.** The agents' shell text said a `cd` carries into the next command. In workflow subagents every Bash call starts at the worktree root (seen in the transcripts), so the agents ignored the rule, and that did no harm. Fix: the agents' text describes the real behaviour; the no-bare-`cd` rule stays in the skills that run in a main session (implement-spec, autopilot, ship-feature), where a `cd` does carry.
+- **sync-base on #34 (0.17.0) worked as designed**: a conflict in `testreport.md`, not a generated file, aborted the merge and blocked the spec with nothing pushed. The cause was in symple-crm: `testreport.md` was tracked although `.gitignore` lists it, so every PR rewrote it (untracked in symple-crm #95).
+- **Worktrees started from a stale local base.** The next autopilot run branched spec 69 from local `main`, 2 commits behind `origin/main`. Fix (0.18.0): the pre-flight check `base` fetches and fails when the local base is behind or diverged; the user pulls. Rejected: branching from `origin/<base>` (silent, the base-suite check would test other code, local-only specs would be missing).
 
 ## Later: move global rules into the plugin
 

@@ -56,7 +56,8 @@ Print one line per entry of `checks`: `<status> <name> - <details>`, plus its `f
 - `gh` is logged in;
 - Docker is running, when `.tdd-flow/stack.md` says the tests need it (`tests need:`);
 - the rules background sessions need are allowed, unless they run in `auto` mode. Otherwise they stop at a permission prompt until someone attaches;
-- the base suite passes, once for all specs (only with 2 or more specs and a clean main checkout on the base branch).
+- the local base branch has what `origin` has (`base`): every worktree branches from it. Behind or diverged fails; the fix is a pull the user runs, never you without their OK;
+- the base suite passes, once for all specs (only with 2 or more specs, a clean main checkout on the base branch and a base in line with origin).
 
 If `ok` is false, stop: a failed check would stop every session. Warnings do not stop the run. Use the returned `parallel` as N from here on.
 
