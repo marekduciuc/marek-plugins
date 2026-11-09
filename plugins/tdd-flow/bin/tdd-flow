@@ -550,6 +550,16 @@ function onMergeSummary(base) {
   return hits.length ? `Merging into ${base} runs: ${hits.join('; ')} (push triggers in .github/workflows)` : `No GitHub Actions workflow runs on push to ${base}.`;
 }
 
+/** The identity commits get: `error` when git has none (commits would fail), `warning` when git makes one up. */
+function identityCheck() {
+  const fix = 'run `git config --global user.name "Your Name"` and `git config --global user.email you@example.com`';
+  const ident = git('var', 'GIT_COMMITTER_IDENT');
+  if (ident.code !== 0) return { error: `no git identity, so commits would fail: ${fix}` };
+  if (process.env.GIT_COMMITTER_EMAIL || process.env.EMAIL || gitOut('config', 'user.email')) return {};
+  const email = (ident.out.match(/<([^>]*)>/) || [])[1] || 'an address made from the hostname';
+  return { warning: `git user.email is not set, so commits get ${email}: ${fix}` };
+}
+
 function preflight(inp) {
   const tr = tracker();
   if (tr !== 'github') throw new Fallback(`tracker is ${tr}; the script handles GitHub only`);
@@ -566,6 +576,8 @@ function preflight(inp) {
     slug, base: baseBranch(), branch: gitOut('branch', '--show-current'), openTasks: tasks.filter((t) => !t.done).map((t) => t.id),
     hasCi, cliReady: false, secretScan: wf.length ? 'missing' : 'not_github', workflowScope: false,
   };
+  const id = identityCheck();
+  if (id.error || id.warning) res.warnings = [id.error || id.warning];
   if (issue) res.issueId = issue[1];
   if (!none(stack.testAll)) res.testAll = stack.testAll;
   if (!none(stack.testSingle)) res.testSingle = stack.testSingle;
@@ -780,6 +792,9 @@ function specs(inp) {
   const root = mainRoot();
   const base = baseBranch();
   checkSpecsInGit(base);
+  // Every background session commits: without an identity all of them would block at their first commit.
+  const id = identityCheck();
+  if (id.error) throw new Error(id.error);
   let slugs;
   try { slugs = fs.readdirSync('.tdd-flow/features', { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name).sort(); } catch { slugs = []; }
   const wanted = (inp.slugs || []).length ? new Set(inp.slugs) : null;
@@ -826,7 +841,7 @@ function specs(inp) {
     const title = ((specText.match(/^#\s+(.+)$/m) || [])[1] || '').trim();
     runnable.push({ slug, title, resume: hasWorktree || !!onBranch, lastRun: run ? run.status : null });
   }
-  return { base, runnable, skipped };
+  return { base, runnable, skipped, ...(id.warning ? { warnings: [id.warning] } : {}) };
 }
 
 /** Creates (or reuses) .claude/worktrees/<slug> on branch feature/<slug>. Input: {slug}. */

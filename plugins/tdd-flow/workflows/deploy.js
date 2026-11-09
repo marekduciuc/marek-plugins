@@ -41,7 +41,7 @@ const PRE = {
   required: ['slug', 'base', 'branch', 'cliReady', 'hasCi', 'openTasks'],
   properties: {
     slug: str, base: str, branch: str, issueId: str, cliReady: { type: 'boolean' }, cliFix: str,
-    hasCi: { type: 'boolean' }, openTasks: strs,
+    hasCi: { type: 'boolean' }, openTasks: strs, warnings: strs,
     secretScan: { type: 'string', enum: ['present', 'missing', 'not_github'] }, workflowScope: { type: 'boolean' }, existingPr: str, testSingle: str, testAll: str,
     reviewDecision: { type: 'string', enum: ['APPROVED', 'CHANGES_REQUESTED', 'REVIEW_REQUIRED', 'NONE'] },
   },
@@ -140,6 +140,9 @@ try {
   if (!pre) throw new Error('tdd-flow: preflight failed.')
   if (!pre.cliReady) throw new Error(`tdd-flow: tracker CLI not ready. Run: ${pre.cliFix || 'gh auth login / az login'}`)
   if (pre.branch === pre.base) throw new Error(`tdd-flow: you are on ${pre.base}. Deploy works from a feature branch.`)
+  // An identity problem (none, or one git made up from the hostname) is shown, not fatal: deploy commits only CI fixes.
+  const warnings = pre.warnings || []
+  warnings.forEach(w => log(`warning: ${w}`))
 
   // CI watch. GitHub: the CLI polls (the runner repeats the call every ~8.5 minutes up to 30 minutes, cheap
   // because each call prints one line), and an agent reads the failure log only when a check failed.
@@ -286,13 +289,14 @@ try {
 
   if (!ci || ci.status !== 'passed') {
     return {
-      status: 'ci_not_green', prUrl: pr.prUrl, ci,
+      status: 'ci_not_green', prUrl: pr.prUrl, ci, ...(warnings.length ? { warnings } : {}),
       next: 'Show the CI root cause to the user and decide together (fix via /tdd-flow:tdd-implement with findings, re-run, or investigate).',
     }
   }
   return {
     status: 'ready_to_merge',
     prUrl: pr.prUrl,
+    ...(warnings.length ? { warnings } : {}),
     ciRun: ci.runUrl,
     onMerge: ci.onMerge,
     reviewDecision: ci.reviewDecision || 'NONE',

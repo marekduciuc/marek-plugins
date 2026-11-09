@@ -843,3 +843,25 @@ test('plan passes the stack profile type check command on, and leaves it out whe
   write('.tdd-flow/stack.md', read('.tdd-flow/stack.md').replace(/type check command: .*\n/, 'type check command: none (Python)\n'));
   assert.strictEqual(run(dir, 'plan', {}).result.typeCheck, undefined);
 });
+
+/** Runs the CLI with no git identity from config or the environment (git then falls back to user@hostname). */
+function runWithoutIdentity(dir, cmd, input, env) {
+  const clean = { ...process.env, ...env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' };
+  ['EMAIL', 'GIT_COMMITTER_EMAIL', 'GIT_AUTHOR_EMAIL', 'GIT_COMMITTER_NAME', 'GIT_AUTHOR_NAME'].forEach((k) => delete clean[k]);
+  const r = spawnSync(process.execPath, [CLI, cmd], { cwd: dir, input: JSON.stringify(input || {}), encoding: 'utf8', env: clean });
+  return JSON.parse(r.stdout.trim());
+}
+
+test('specs warns about an automatic git identity and stops when git has none', () => {
+  const { dir, g } = trackedRepo();
+  assert.strictEqual(run(dir, 'specs', {}, fakeClaude([])).result.warnings, undefined);
+  g('config', '--unset', 'user.email');
+  g('config', '--unset', 'user.name');
+  const auto = runWithoutIdentity(dir, 'specs', {}, fakeClaude([]));
+  assert.strictEqual(auto.ok, true, auto.error);
+  assert.match(auto.result.warnings.join('\n'), /user\.email is not set.*git config --global user\.email/);
+  g('config', 'user.useConfigOnly', 'true');
+  const none = runWithoutIdentity(dir, 'specs', {}, fakeClaude([]));
+  assert.strictEqual(none.ok, false);
+  assert.match(none.error, /no git identity.*git config --global user\.email/);
+});

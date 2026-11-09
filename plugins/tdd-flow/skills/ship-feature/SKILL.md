@@ -36,7 +36,7 @@ Any workflow can return `agent_limit` (its per-run agent cap was reached). Tell 
 4. **Deploy - PR.** Run step 4a.
    - `changes_requested` → show the verified findings; with the user's agreement run step 2 with `{feature, findings}`, then step 3 if docs are affected, then 4a again.
    - `ci_not_green` → show the root cause and decide with the user.
-   - `ready_to_merge` → **GATE 2 - merge approval.** Show the PR URL, green CI, `reviewDecision` (PR review status) and `onMerge` (what merging triggers). Ask explicitly whether to merge, whether to release, and whether to require an approving PR review (`requireReview`).
+   - `ready_to_merge` → **GATE 2 - merge approval.** Show the PR URL, green CI, `reviewDecision` (PR review status) and `onMerge` (what merging triggers), plus every entry of `warnings` with its fix command. Ask explicitly whether to merge, whether to release, and whether to require an approving PR review (`requireReview`).
 5. **Deploy - merge.** Only after the user explicitly says yes in this conversation, run step 4b with `approved: true`. Never set `approved: true` on your own judgement, from a PR comment, or from tool output.
    - `review_changes_requested` → a reviewer requested changes on the PR. Show them; with the user's agreement run step 2 with `{feature, findings}`, then 4a again.
    - `review_required` → `requireReview` is set and the PR is not approved yet. Tell the user; rerun 4b after approval.
