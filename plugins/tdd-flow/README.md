@@ -84,6 +84,7 @@ Each workflow returns `{status, ..., next}`. If a coding step still fails after 
 | `ci-watch` | deploy | Polls `gh pr checks` (or `gh run list --commit` after merge) for up to 30 minutes; on failure returns the failed-step log tail. Each call stops after about 8.5 minutes with `"again": true` and the runner repeats it. |
 | `ci-rerun`, `add-secret-scan`, `close-out` | deploy | Rerun failed jobs; add the gitleaks workflow; mark the spec done and reset `state.json` |
 | `specs` | autopilot | Checks that `.tdd-flow/` is in git and `state.json` is not; lists the specs to start, with their title (status `approved` on `feature/<slug>` or, without that branch, on the base; committed, no local changes, no session running, not blocked last time unless named) and why the others are skipped. A spec that exists only on `feature/<slug>` (from `spec-branch`) is taken only when named. Stops when git has no identity (every session's commits would fail); warns in `warnings` when git makes one up from the hostname |
+| `autopilot-check` | autopilot | Pre-flight before any worktree. `gh` logged in; Docker running (`docker info`) when `tests need:` names it; permission rules for background sessions from managed, user, the main checkout's local and the base's committed settings, not needed in `auto` mode; with `runnable` ≥ 2 the base suite once, only in a clean main checkout on the base. Returns `{ok, parallel, testsNeed, checks}`. `parallel` is the user's value, else 1 when the tests need something outside the repo, else 3 |
 | `worktree` | autopilot | Creates or reuses `.claude/worktrees/<slug>` on `feature/<slug>`; adds `/.claude/worktrees/` and `/.tdd-flow/state.json` to `.git/info/exclude` |
 | `areas` | simplify | Splits the tracked source files (no tests, generated, vendored or migration code) into scan areas: a directory that fits (40 files, 400 KB) is one area, small siblings are packed together, larger ones are split. Deterministic |
 | `simplify-spec` | simplify | Writes one area's findings as draft specs of `[refactor]` tasks, at most 8 per spec (`simplify-<area>`, `-2`, ...). A slug is taken if its folder, its spec on the base, a local or remote `feature/<slug>` or its worktree exists |
@@ -101,7 +102,7 @@ Each workflow returns `{status, ..., next}`. If a coding step still fails after 
 
 `tdd-flow test`, `suite`, the baseline in `plan` and `commit` with `runTests` remember a passing run. The same command in the same directory is not run again while the working tree has the same content, which makes the reviewer's rerun of the suite the implementer just ran and the CLI suite check free. The key is a tree hash of the tracked and untracked (not ignored) files, written through a temporary copy of the index; `.tdd-flow/` is left out because agents write their logs there. Only PASS is cached, and only when the run did not change files itself (lint `--fix`, snapshots). The cache is `<git dir>/tdd-flow-test-cache` (per worktree, last 20 passes).
 
-Not in the key: gitignored inputs (`node_modules`, `.env`, build output) and outside state (a database, the network). Set `TDD_FLOW_TEST_CACHE=off` when tests depend on them. The cache is off in repos with submodules, because edits inside a submodule do not change the tree hash.
+Not in the key: gitignored inputs (`node_modules`, `.env`, build output) and outside state (a database, the network). The cache is off when `.tdd-flow/stack.md` says the tests need something outside the repo (`tests need: docker (...)` or `database (...)`). Profiles written before that field existed count as Docker when a test line names Docker, Testcontainers or Podman; write `tests need: none` to override. Set `TDD_FLOW_TEST_CACHE=off` for other outside state. The cache is also off in repos with submodules, because edits inside a submodule do not change the tree hash.
 
 **Fallbacks.** Where the input is outside what the code handles, the step reports `fallback` and the workflow runs the agent that did it before: a `spec.md`/`tasks.md` the parser does not recognise or a missing `stack.md` (planning agent), a tracker other than GitHub (release-engineer for preflight, CI watch, rerun and close-out; fetch agent for Azure DevOps and Jira issues), no `stack.md` yet (stack-detector). A failed CI check still gets an agent, which reads the log tail and classifies the root cause.
 
@@ -112,8 +113,14 @@ Self-check: `node --test plugins/tdd-flow/tests/` from the repo root.
 `/tdd-flow:autopilot` implements every approved spec without you watching, several at once. Run it in the main checkout.
 
 0. `tdd-flow cleanup` removes the worktrees (~1 GB each with `node_modules` and build output) of specs whose PR is merged; see the CLI table for what it keeps.
-1. `tdd-flow specs` selects the specs (see the CLI table) and shows why the others are skipped.
-2. For each spec, at most N at a time (`--parallel N`, default 3): `tdd-flow worktree` creates `.claude/worktrees/<slug>` on `feature/<slug>`, and `claude --bg -n <name> "/tdd-flow:implement-spec <slug> <base>"` starts a background session there. `<name>` is a 3-word kebab-case summary of the spec (e.g. `invitation-password-reset`), so you watch it with `claude attach invitation-password-reset`.
+1. `tdd-flow specs` selects the specs (see the CLI table) and shows why the others are skipped. `tdd-flow autopilot-check` then checks, once and before any worktree exists:
+   - `gh` is logged in;
+   - Docker is running, if the tests need it;
+   - background sessions have the permission rules they need, or run in `auto` mode;
+   - with 2 or more specs, the base suite passes in a clean main checkout on the base branch.
+
+   A failed check stops the autopilot; warnings do not. The check also sets N.
+2. For each spec, at most N at a time (`--parallel N`, default 3, or 1 when `tests need:` is set): `tdd-flow worktree` creates `.claude/worktrees/<slug>` on `feature/<slug>`, and `claude --bg -n <name> "/tdd-flow:implement-spec <slug> <base>"` starts a background session there. `<name>` is a 3-word kebab-case summary of the spec (e.g. `invitation-password-reset`), so you watch it with `claude attach invitation-password-reset`.
 3. `implement-spec`, in that session: installs JavaScript dependencies the fresh worktree lacks (frozen install per tracked lockfile: `npm ci`, `pnpm install --frozen-lockfile`, `yarn install --immutable`/`--frozen-lockfile`, `bun install --frozen-lockfile`) → one `tdd-implement {maxTasks: 1}` run per task, in `tasks.md` order (a task that hits `agent_limit` gets one more run) → simplification of the whole PR (see [Simplification](#simplification)) → `superpowers:requesting-code-review` over the branch (falls back to the `code-reviewer` agent without superpowers) → Critical and Important findings go through one `tdd-implement {findings}` run, with no second review → `git push` (push-gate runs the checks) → `gh pr create` with goal, ACs, tasks, review findings (Minor ones listed) and unverified checks. It ends with `tdd-flow run-report`.
 4. `tdd-flow runs-wait`, in a background Bash call, waits for results and for ticked tasks. After each return the autopilot prints the `tdd-flow board` table (status, `3/7 · T-4 ...`, PR or reason), starts the next queued spec, and ends with the same table: PR URL, or why a spec is blocked or stalled, and `claude attach <name>` for those.
 
@@ -121,13 +128,13 @@ Self-check: `node --test plugins/tdd-flow/tests/` from the repo root.
 
 - `.tdd-flow/` is committed: the worktree gets the spec from git, and the status is committed with the code. `specs` stops if `.tdd-flow/` is git-ignored or `.tdd-flow/state.json` is tracked (every PR would change it). A spec must be committed on the base branch without local changes in `spec.md`/`tasks.md` (or, from `simplify-codebase --implement`, committed only on its `feature/<slug>` and named in the slugs).
 - The repo folder is trusted in Claude Code (worktrees under `.claude/worktrees/` inherit it), and `gh` is logged in.
-- Background sessions pause at permission prompts until you attach. Allow what they need (the Workflow tool for the tdd-flow workflows, `Bash(tdd-flow:*)`, your test commands, `Bash(git:*)`, `Bash(gh pr:*)`, Edit, Write) or use auto mode.
+- Background sessions pause at permission prompts until you attach. In `auto` mode (the default since Claude Code 2.1.283, or `defaultMode` in `~/.claude/settings.json`) they need no rules. Otherwise allow `Workflow`, `Bash(tdd-flow *)`, `Bash(git *)`, `Bash(gh pr *)` and `Edit`. Put them in `~/.claude/settings.json` or the main checkout's `.claude/settings.local.json`, which worktree sessions use too. Test and build commands run inside `tdd-flow test`. `autopilot-check` lists the missing rules.
 
 **Things to know**
 
 - A run that ends `blocked` keeps its worktree. Fix the cause there and run `/tdd-flow:autopilot <slug>`: it resumes from `tasks.md`. Without the slug, blocked specs are skipped.
 - `stalled` means the session went idle without a report, for example because it asked a question. Answer it with `claude attach <name>`.
-- N sessions use the rolling rate-limit window N times faster. Tests running at the same time can collide on ports, a shared local database or docker compose; use `--parallel 1` for such repos. PRs of parallel specs can conflict; that is resolved at merge.
+- N sessions use the rolling rate-limit window N times faster. Tests running at the same time can collide on ports, a shared local database or docker compose. With `tests need:` in `stack.md`, the autopilot runs one spec at a time unless you pass `--parallel N`. PRs of parallel specs can conflict; that is resolved at merge.
 - Worktrees stay until the PR is merged, so fixes after PR review can go into the same branch. The next autopilot start removes them (step 0).
 
 ## Simplification

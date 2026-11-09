@@ -4,7 +4,9 @@ Source: the "Where Things Go Wrong" to "On the Horizon" sections of the Claude C
 
 Goal: a user installs tdd-flow and it works without changing their whole environment. Fixes go into the plugin, not into the user's rules or repo CLAUDE.md.
 
-Status: phase 1 implemented in tdd-flow 0.13.0 (54 tests pass). Phases 2 and 3 not started.
+Status: phase 1 implemented in tdd-flow 0.13.0. Phase 2: autopilot pre-flight and external test state (F6) implemented in tdd-flow 0.14.0; the rest of phase 2 and phase 3 not started.
+
+Phase 2 (0.14.0) as built: a separate `tdd-flow autopilot-check` command. The base suite runs only for 2 or more specs and only in a clean main checkout on the base. Permissions come from managed settings, the user settings, the main checkout's `settings.local.json` (worktree sessions use it) and the base's `settings.json`. No rules are needed in `auto` mode, which is the default since Claude Code 2.1.283. `tests need:` in stack.md is inferred from the test lines only for older profiles. It sets parallel to 1 and turns the cache off repo-wide, as the plan says; the architecture review advised keeping the cache, which is still open.
 
 Phase 1 as built, after the architecture review: the relay returns `relayFailed` and the task commit retries on that flag only; `block` keeps the tick when HEAD already is the task commit; `stageChanged` is opt-in and set only on task commits (not CHARACTERIZE, docs, mark-implemented or skipped-task commits); `tdd-flow test -- <cmd>` keeps the caller's directory; the type check comes from a new `type check command` field in `stack.md`; the identity check uses `git var GIT_COMMITTER_IDENT` and stops the autopilot when git has no identity.
 

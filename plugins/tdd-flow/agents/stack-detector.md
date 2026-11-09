@@ -25,7 +25,8 @@ You detect how a repository is built and tested. Be fast and factual.
 3. Read scripts/targets to find the real commands (e.g. `package.json` scripts, Makefile targets, CI workflow files under `.github/workflows/` or `azure-pipelines.yml`). Prefer the commands CI uses.
 4. Determine the test-file naming convention and location (e.g. `tests/test_*.py`, `*.test.ts` next to source, separate `*.Tests` project).
 5. Detect the CI system and the issue tracker remote: run `git remote -v`; check for `.github/`, `azure-pipelines.yml`, `.gitlab-ci.yml`, `Jenkinsfile`; check which CLIs exist (`gh`, `az`, `jira`, `glab`) with `command -v`.
-6. If possible, run the test command once to confirm it works. Report the result; do not fix anything.
+6. Find what the tests need outside the repo: Testcontainers or a Docker client in the test dependencies, `docker compose` in test scripts or CI test jobs, a database URL or a service (Redis, a queue) in the test config that nothing in the tests starts.
+7. If possible, run the test command once to confirm it works. Report the result; do not fix anything.
 
 **Output:** write the profile to the path the caller gives you (default `.tdd-flow/stack.md`) in this form, then return it verbatim:
 
@@ -40,6 +41,7 @@ type check command:  (type check or compile without running tests, e.g. `npm run
 lint/format command:
 test file pattern & location:
 production source roots:
+tests need:         (none | docker (...) | database (...) | services (...)) what the tests use outside the repo, e.g. `docker (Testcontainers)`, `database (local PostgreSQL)`
 ci system:
 tracker:            (github | azure-devops | jira | none) + CLI available?
 default branch:
@@ -48,5 +50,7 @@ notes:
 ```
 
 Every command must work from the repo root, because tdd-flow runs it there. For a command that has to run in a subdirectory, write a subshell: `(cd apps/web && npm test)`, and join several with `&&`: `(cd apps/web && npm test) && (cd apps/backend && ./mvnw -B verify)`. Never write a bare `cd` chain such as `cd apps/web && npm test && cd ../backend && ...`: an agent that runs it moves its shell into the subdirectory.
+
+`tests need` makes the autopilot run one spec at a time and turns the test cache off, so write `none` only when the tests need nothing outside the repo.
 
 Write `unknown` rather than guessing. If the repo has no test framework or no tests yet (e.g. a new project being bootstrapped), write `none (no test suite yet)` for both test commands and `baseline test run: not run - no test suite`.

@@ -102,9 +102,25 @@ function resolveSlug(feature) {
   return slug;
 }
 
+// An old profile has no `tests need:` field; Docker named on its test lines (test commands with their indented
+// notes, baseline, notes) means the tests need it. Other lines (build, deploy) do not count.
+const TEST_LINE = /^[-*]?[ \t]*(test command|baseline test run|notes)\b/i;
+const DOCKER_RE = /\b(docker|testcontainers|podman)\b/i;
+
+/** What the tests need outside the repo (`none`, `docker (...)`, `database (...)`) and whether it was inferred. */
+function testsNeed(txt, field) {
+  if (field) return { need: none(field) ? 'none' : field, inferred: false };
+  let onTestLine = false;
+  for (const line of txt.split(/\r?\n/)) {
+    if (/^\S/.test(line)) onTestLine = TEST_LINE.test(line);
+    if (onTestLine && DOCKER_RE.test(line)) return { need: 'docker', inferred: true };
+  }
+  return { need: 'none', inferred: false };
+}
+
 /** Fields of .tdd-flow/stack.md (see agents/stack-detector.md), or null if the file is missing. */
-function readStack() {
-  const txt = read('.tdd-flow/stack.md');
+function readStack(root = '.') {
+  const txt = read(path.join(root, '.tdd-flow', 'stack.md'));
   if (txt == null) return null;
   const get = (label, command) => {
     const m = txt.match(new RegExp(`^[ \\t]*[-*]?[ \\t]*${esc(label)}[ \\t]*:[ \\t]*(.*)$`, 'mi'));
@@ -113,7 +129,9 @@ function readStack() {
     const bt = command && v.match(/`([^`]+)`/);
     return (bt ? bt[1] : v.replace(/^`+|`+$/g, '')).trim();
   };
+  const needs = testsNeed(txt, get('tests need'));
   return {
+    testsNeed: needs.need, testsNeedInferred: needs.inferred,
     language: get('language(s)'), testAll: get('test command (all)', true), testSingle: get('test command (single file / filter)', true),
     lint: get('lint/format command', true), typeCheck: get('type check command', true), tracker: get('tracker'), defaultBranch: get('default branch'), ci: get('ci system'),
     baseline: get('baseline test run'),
@@ -153,7 +171,8 @@ function compact(out, passed) {
 // suite the implementer just ran, the commit's runTests). Key: the command, the directory it runs in and a tree hash
 // of the working tree (tracked + untracked, not ignored; .tdd-flow/ left out, agents write their logs there).
 // Gitignored inputs (node_modules, .env, build output) and outside state are not in the key; TDD_FLOW_TEST_CACHE=off
-// turns it off. Off in repos with submodules: edits inside a submodule do not change the tree hash.
+// turns it off. Off in repos with submodules: edits inside a submodule do not change the tree hash. Off when stack.md
+// says the tests need Docker or a database (`tests need:`): a pass there also depends on state outside the tree.
 const TEST_CACHE_ENTRIES = 20;
 const testCacheOff = () => /^(0|off|false|no)$/i.test(process.env.TDD_FLOW_TEST_CACHE || '');
 
@@ -180,6 +199,8 @@ function testCache(cmd) {
   if (testCacheOff()) return null;
   const top = gitOut('rev-parse', '--show-toplevel');
   if (!top || fs.existsSync(path.join(top, '.gitmodules'))) return null;
+  const stack = readStack(top); // from the root: `tdd-flow test -- <cmd>` runs in the caller's directory
+  if (stack && stack.testsNeed !== 'none') return null;
   const file = path.resolve(gitOut('rev-parse', '--git-path', 'tdd-flow-test-cache'));
   const prefix = gitOut('rev-parse', '--show-prefix');
   const key = () => {
@@ -848,6 +869,143 @@ function specs(inp) {
   return { base, runnable, skipped, ...(id.warning ? { warnings: [id.warning] } : {}) };
 }
 
+// ---------- autopilot pre-flight ----------
+const PARALLEL_DEFAULT = 3;
+const DOCKER_TIMEOUT_MS = 20000;
+// What every background session runs (implement-spec and the workflows it starts). Test and build commands run
+// inside `tdd-flow test`, so they need no rule of their own.
+const SESSION_RULES = [
+  { rule: 'Workflow', tool: 'Workflow' },
+  { rule: 'Bash(tdd-flow *)', tool: 'Bash', cmd: 'tdd-flow' },
+  { rule: 'Bash(git *)', tool: 'Bash', cmd: 'git' },
+  { rule: 'Bash(gh pr *)', tool: 'Bash', cmd: 'gh pr' },
+  { rule: 'Edit', tool: 'Edit' },
+];
+const NO_PROMPT_MODES = ['auto', 'bypassPermissions'];
+const AUTO_DEFAULT_SINCE = [2, 1, 283]; // Claude Code versions from this one start sessions in auto mode by default
+
+/** The mode a session gets with no defaultMode set: auto on a new enough `claude`, else default. */
+function builtInMode() {
+  const v = (exec(claudeBin(), ['--version']).out.match(/(\d+)\.(\d+)\.(\d+)/) || []).slice(1).map(Number);
+  if (v.length !== 3) return 'default';
+  const i = v.findIndex((n, k) => n !== AUTO_DEFAULT_SINCE[k]);
+  return i < 0 || v[i] > AUTO_DEFAULT_SINCE[i] ? 'auto' : 'default';
+}
+
+/** True when the allow rule `allow` (e.g. `Bash`, `Bash(git:*)`, `Bash(git *)`) covers the needed rule. */
+function ruleCovers(allow, need) {
+  const m = String(allow).match(/^(\w+)(?:\((.*)\))?$/);
+  if (!m || m[1] !== need.tool) return false;
+  if (m[2] === undefined || m[2].trim() === '*') return true;
+  if (!need.cmd) return false; // a path-limited Edit(...) rule does not cover the whole worktree
+  const prefix = m[2].replace(/(:\*|\s\*)$/, '').trim();
+  return need.cmd === prefix || need.cmd.startsWith(`${prefix} `);
+}
+
+/**
+ * Settings a background session in a worktree loads, highest precedence first (managed, the main checkout's
+ * settings.local.json, which worktree sessions use, the base's committed settings.json, user). Each {label, settings | error}.
+ */
+function sessionSettings(root, base) {
+  const managed = { darwin: '/Library/Application Support/ClaudeCode/managed-settings.json', linux: '/etc/claude-code/managed-settings.json' }[process.platform];
+  const shared = showFile(base, '.claude/settings.json');
+  const sources = [
+    { label: 'managed settings', text: managed ? read(managed) : null, canSkipPrompts: true },
+    { label: '.claude/settings.local.json', text: read(path.join(root, '.claude', 'settings.local.json')), canSkipPrompts: false },
+    { label: `.claude/settings.json on ${base}`, text: shared.code === 0 ? shared.out : null, canSkipPrompts: false },
+    { label: '~/.claude/settings.json', text: read(path.join(os.homedir(), '.claude', 'settings.json')), canSkipPrompts: true },
+  ];
+  return sources.filter((s) => s.text != null).map((s) => {
+    try { return { label: s.label, canSkipPrompts: s.canSkipPrompts, settings: JSON.parse(s.text) }; } catch (e) { return { label: s.label, error: e.message }; }
+  });
+}
+
+/** Whether background sessions would stop at (or be denied) a permission prompt for a step they always run. */
+function permissionsCheck(root, base) {
+  const files = sessionSettings(root, base);
+  const broken = files.filter((f) => f.error).map((f) => `${f.label} is not valid JSON (${f.error})`);
+  const perms = files.filter((f) => f.settings).map((f) => ({ ...f, p: f.settings.permissions || {} }));
+  // auto and bypassPermissions in project settings do not take effect; only managed and user settings set them.
+  const modeFrom = perms.find((f) => f.p.defaultMode && (f.canSkipPrompts || !NO_PROMPT_MODES.includes(f.p.defaultMode)));
+  const mode = modeFrom ? modeFrom.p.defaultMode : builtInMode();
+  const from = modeFrom ? modeFrom.label : 'Claude Code default';
+  const note = broken.length ? ` ${broken.join('; ')}.` : '';
+  if (NO_PROMPT_MODES.includes(mode)) return { name: 'permissions', status: broken.length ? 'warn' : 'ok', details: `mode ${mode} (${from}): sessions do not stop at prompts.${note}` };
+  const allow = perms.flatMap((f) => (Array.isArray(f.p.allow) ? f.p.allow : []));
+  const missing = SESSION_RULES.filter((n) => !(n.tool === 'Edit' && mode === 'acceptEdits') && !allow.some((a) => ruleCovers(a, n)));
+  if (!missing.length) return { name: 'permissions', status: broken.length ? 'warn' : 'ok', details: `the rules background sessions need are allowed.${note}` };
+  const rules = missing.map((n) => n.rule);
+  const what = mode === 'dontAsk' ? 'deny without asking' : 'stop at a permission prompt until you attach';
+  return {
+    name: 'permissions', status: 'warn',
+    details: `background sessions ${what} for: ${rules.join(', ')} (mode ${mode}, ${from}).${note}`,
+    fix: `add ${JSON.stringify(rules)} to permissions.allow in ${path.join(root, '.claude', 'settings.local.json')} or ~/.claude/settings.json, or set "defaultMode": "auto" in ~/.claude/settings.json`,
+  };
+}
+
+/** The base suite once in the main checkout, instead of every session finding a red base at its own baseline. */
+async function baseSuiteCheck(base, runnable, stack) {
+  const skip = (why) => ({ name: 'base suite', status: 'skipped', details: `${why}; each session runs its own baseline` });
+  if (runnable < 2) return skip('one spec');
+  if (!stack || none(stack.testAll)) return skip('no test command in .tdd-flow/stack.md');
+  const branch = gitOut('branch', '--show-current');
+  if (branch !== base) return skip(`the main checkout is on ${branch || 'a detached HEAD'}, not ${base}`);
+  // Untracked files count too: a new worktree does not get them, so the suite here would test something else.
+  if (gitOut('status', '--porcelain', '--', ':/', ':(top,exclude).tdd-flow/state.json', `:(top,exclude)${WORKTREES}`)) {
+    return skip('the main checkout has local changes, so it is not what the worktrees get');
+  }
+  const t = await runTests(stack.testAll);
+  if (!t.pass) {
+    return { name: 'base suite', status: 'fail', details: `\`${t.command}\` fails on ${base}, so every session would stop at its baseline:\n${t.summary}`, fix: `fix the suite on ${base} first` };
+  }
+  // A fresh worktree has no node_modules or .env yet: implement-spec installs the dependencies before its baseline.
+  return { name: 'base suite', status: 'ok', details: `\`${t.command}\` passes on ${base}${t.cached ? ' (cached)' : ''}` };
+}
+
+/**
+ * Checks before the autopilot creates worktrees. Input: {runnable: number of specs to start, parallel?: the user's
+ * --parallel}. Output: {ok (no check failed), parallel, testsNeed, checks: [{name, status ok|warn|fail|skipped, details, fix?}]}.
+ */
+async function autopilotCheck(inp) {
+  const root = mainRoot();
+  const base = baseBranch();
+  if (inp.parallel != null && !(Number.isInteger(inp.parallel) && inp.parallel > 0)) throw new Error(`parallel must be a positive whole number, not ${JSON.stringify(inp.parallel)}`);
+  const runnable = Number(inp.runnable) || 0;
+  const stack = readStack();
+  const need = stack ? stack.testsNeed : 'none';
+  const outside = need !== 'none';
+  const checks = [];
+
+  const auth = gh('auth', 'status');
+  if (auth.code === 0) checks.push({ name: 'gh', status: 'ok', details: 'logged in' });
+  else if (auth.code === 127) checks.push({ name: 'gh', status: 'fail', details: 'the GitHub CLI is not installed; every session opens its PR with it', fix: 'install it (https://cli.github.com), then run `! gh auth login`' });
+  else checks.push({ name: 'gh', status: 'fail', details: 'not logged in; every session opens its PR with it', fix: 'run `! gh auth login`' });
+
+  if (outside) {
+    const how = stack.testsNeedInferred ? ' (inferred from the test lines of .tdd-flow/stack.md)' : '';
+    checks.push({
+      name: 'tests need', status: 'warn', details: `${need}${how}: parallel sessions share it, and the test cache is off`,
+      ...(stack.testsNeedInferred ? { fix: 'add a `tests need:` line to .tdd-flow/stack.md (`none` if they need nothing)' } : {}),
+    });
+  }
+  if (DOCKER_RE.test(need)) {
+    const d = spawnSync(process.env.TDD_FLOW_DOCKER_BIN || 'docker', ['info'], { encoding: 'utf8', stdio: 'ignore', timeout: DOCKER_TIMEOUT_MS });
+    if (d.status === 0) checks.push({ name: 'docker', status: 'ok', details: 'running' });
+    else if (d.error && d.error.code === 'ENOENT') checks.push({ name: 'docker', status: 'fail', details: 'the tests need Docker, and `docker` is not installed', fix: 'install Docker Desktop (or another Docker engine)' });
+    else checks.push({ name: 'docker', status: 'fail', details: `the tests need Docker, and \`docker info\` ${d.error ? 'timed out' : 'failed'}: the engine is not running`, fix: 'start Docker Desktop, then run the autopilot again' });
+  }
+
+  checks.push(permissionsCheck(root, base));
+  checks.push(await baseSuiteCheck(base, runnable, stack));
+
+  const parallel = inp.parallel || (outside ? 1 : PARALLEL_DEFAULT);
+  if (outside && !inp.parallel) checks.push({ name: 'parallel', status: 'warn', details: `1 at a time, because the tests need ${need}; pass --parallel N to run more` });
+  else if (outside && parallel > 1) checks.push({ name: 'parallel', status: 'warn', details: `${parallel} at a time although the tests need ${need}: their tests may collide` });
+  else checks.push({ name: 'parallel', status: 'ok', details: `${parallel} at a time` });
+
+  return { ok: !checks.some((c) => c.status === 'fail'), parallel, testsNeed: need, checks };
+}
+
 /** Creates (or reuses) .claude/worktrees/<slug> on branch feature/<slug>. Input: {slug}. */
 function worktree(inp) {
   const slug = checkSlug(inp.slug);
@@ -1304,7 +1462,7 @@ async function suite() {
 
 const COMMANDS = {
   plan, suite, branch, block, commit, 'close-out': closeOut, 'add-secret-scan': addSecretScan, preflight,
-  'ci-watch': ciWatch, 'ci-rerun': ciRerun, context, specs, worktree, cleanup, 'run-report': runReport, 'runs-wait': runsWait, board,
+  'ci-watch': ciWatch, 'ci-rerun': ciRerun, context, specs, 'autopilot-check': autopilotCheck, worktree, cleanup, 'run-report': runReport, 'runs-wait': runsWait, board,
   areas, 'simplify-spec': simplifySpec, 'spec-branch': specBranch, 'set-aside': setAside,
 };
 

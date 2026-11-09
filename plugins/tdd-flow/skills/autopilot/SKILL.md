@@ -6,7 +6,7 @@ argument-hint: "[slug ...] [--parallel N]"
 
 # Autopilot: implement every approved spec in parallel
 
-Input: $ARGUMENTS - optional feature slugs (default: every spec), optional `--parallel N` (default 3).
+Input: $ARGUMENTS - optional feature slugs (default: every spec), optional `--parallel N` (default 3, or 1 when the tests need Docker or a database; step 1b decides).
 
 Each spec runs in its own background session (`claude --bg`) in `.claude/worktrees/<slug>` on branch `feature/<slug>`. That session runs `/tdd-flow:implement-spec`, which implements the tasks, simplifies the whole PR, reviews, fixes once and opens a PR. This skill selects the specs, starts the sessions, keeps at most N running and reports. It never merges.
 
@@ -40,7 +40,23 @@ Pass the slugs from the input in `slugs` (naming a spec also restarts it after a
 
 Show `runnable` and `skipped` (one line each: slug - reason), and every entry of `warnings` (for example a git identity made up from the hostname) with its fix command. An error that there is no git identity stops the autopilot: show the fix command. Specs are runnable when their status on `feature/<slug>`, or on the base branch if that branch does not exist yet, is `approved`. They must also be committed on the base branch without local changes. The exception is a spec that exists only on `feature/<slug>`, which `/tdd-flow:simplify-codebase --implement` creates: it runs when it is named in the slugs. If nothing is runnable, stop.
 
-Before starting, check `gh auth status`; if it fails, tell the user to run `! gh auth login` and stop.
+## 1b. Pre-flight
+
+Once, in the main checkout, before any worktree exists. Run it with the Bash tool and `timeout: 600000`: it may run the test suite.
+
+```bash
+tdd-flow autopilot-check <<'TDD_FLOW_JSON'
+{"runnable": <number of runnable specs>, "parallel": <N from --parallel, or leave the key out>}
+TDD_FLOW_JSON
+```
+
+Print one line per entry of `checks`: `<status> <name> - <details>`, plus its `fix` when there is one. It checks:
+- `gh` is logged in;
+- Docker is running, when `.tdd-flow/stack.md` says the tests need it (`tests need:`);
+- the rules background sessions need are allowed, unless they run in `auto` mode. Otherwise they stop at a permission prompt until someone attaches;
+- the base suite passes, once for all specs (only with 2 or more specs and a clean main checkout on the base branch).
+
+If `ok` is false, stop: a failed check would stop every session. Warnings do not stop the run. Use the returned `parallel` as N from here on.
 
 ## 2. Start sessions (at most N at a time)
 
@@ -103,6 +119,6 @@ The final `board` table (it has the PR URL, or the reason and `claude attach <na
 
 ## Notes
 
-- Background sessions stop at permission prompts until someone attaches. For unattended runs, allow in your settings what the sessions need: the Workflow tool for tdd-flow workflows, `Bash(tdd-flow:*)`, your test/build commands, `Bash(git:*)`, `Bash(gh pr:*)`, Edit and Write (or run in auto mode).
-- N sessions use the rolling rate-limit window N times faster. Tests of parallel sessions can collide on shared resources (ports, one local database, docker compose): use `--parallel 1` for such repos.
+- Background sessions stop at permission prompts until someone attaches. Step 1b lists the rules they need when they do not run in `auto` mode: `Workflow`, `Bash(tdd-flow *)`, `Bash(git *)`, `Bash(gh pr *)`, `Edit`. Allow them in `~/.claude/settings.json` or the main checkout's `.claude/settings.local.json` (worktree sessions use that file too).
+- N sessions use the rolling rate-limit window N times faster. Tests of parallel sessions can collide on shared resources (ports, one local database, docker compose). With `tests need:` in `stack.md` the autopilot runs one spec at a time unless you pass `--parallel N`.
 - PRs of parallel specs can conflict with each other; that is resolved at merge.
