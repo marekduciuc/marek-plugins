@@ -901,12 +901,13 @@ test('autopilot-check: tests need from the stack.md field, else inferred from it
   const need = (txt) => {
     write('.tdd-flow/stack.md', txt);
     const r = autopilotCheck(dir, { runnable: 1 }, { settings: { permissions: { defaultMode: 'auto' } }, env: { TDD_FLOW_DOCKER_BIN: fakeBin('docker', 'exit 0') } });
-    return [r.testsNeed, /inferred/.test((r.check('tests need') || {}).details || '')];
+    const c = r.check('tests need') || {};
+    return [r.testsNeed, /inferred/.test(c.details || ''), c.status];
   };
-  assert.deepStrictEqual(need('tests need: docker (Testcontainers)\n'), ['docker (Testcontainers)', false]);
-  assert.deepStrictEqual(need('tests need: none\ntest command (all): ./mvnw verify\n  note: needs Docker\n'), ['none', false]);
-  assert.deepStrictEqual(need('test command (all): ./mvnw verify\n  note: ITs use Testcontainers, need Docker\nbuild command: npm run build\n'), ['docker', true]);
-  assert.deepStrictEqual(need('test command (all): npm test\nbuild command: docker build .\nci system: GitHub Actions builds a docker image\n'), ['none', false]);
+  assert.deepStrictEqual(need('tests need: docker (Testcontainers)\n'), ['docker (Testcontainers)', false, 'ok']);
+  assert.deepStrictEqual(need('tests need: none\ntest command (all): ./mvnw verify\n  note: needs Docker\n'), ['none', false, undefined]);
+  assert.deepStrictEqual(need('test command (all): ./mvnw verify\n  note: ITs use Testcontainers, need Docker\nbuild command: npm run build\n'), ['docker', true, 'warn']);
+  assert.deepStrictEqual(need('test command (all): npm test\nbuild command: docker build .\nci system: GitHub Actions builds a docker image\n'), ['none', false, undefined]);
 });
 
 test('autopilot-check: gh login is required', () => {
@@ -945,6 +946,7 @@ test('autopilot-check: tests that need Docker check the engine and run one spec 
   const opts = (code) => ({ settings: { permissions: { defaultMode: 'auto' } }, env: { TDD_FLOW_DOCKER_BIN: fakeBin('docker', `exit ${code}`) } });
   const up = autopilotCheck(dir, { runnable: 1 }, opts(0));
   assert.deepStrictEqual([up.ok, up.parallel, up.testsNeed, up.check('docker').status], [true, 1, 'docker (Testcontainers)', 'ok']);
+  assert.deepStrictEqual([up.check('tests need').status, up.check('parallel').status], ['ok', 'ok']);
   assert.match(up.check('tests need').details, /parallel sessions share it/);
   assert.match(up.check('parallel').details, /^1 at a time, because the tests need docker/);
   const down = autopilotCheck(dir, { runnable: 1 }, opts(1));
@@ -975,4 +977,21 @@ test('autopilot-check: base suite runs once for two or more specs on a clean bas
   assert.match(red.check('base suite').details, /fails on main, so every session would stop at its baseline/);
   g('switch', '-qc', 'other');
   assert.match(suite(2).check('base suite').details, /main checkout is on other, not main/);
+});
+
+test('stack-fill writes tests need into stack.md when the detector left it out or kept the template hint', () => {
+  const { dir, write, read } = repo();
+  write('.tdd-flow/stack.md', 'test command (all): `npm test`\nci system: GitHub Actions\nnotes: x\n');
+  assert.deepStrictEqual(run(dir, 'stack-fill', { testsNeed: 'docker (Testcontainers)' }).result, { added: true });
+  assert.strictEqual(read('.tdd-flow/stack.md'), 'test command (all): `npm test`\ntests need: docker (Testcontainers)\nci system: GitHub Actions\nnotes: x\n');
+  assert.deepStrictEqual(run(dir, 'stack-fill', { testsNeed: 'none' }).result, { added: false, reason: 'stack.md already has tests need' });
+  write('.tdd-flow/stack.md', 'test command (all): `npm test`\ntests need:         (none | docker (...) | database (...))\n');
+  run(dir, 'stack-fill', { testsNeed: 'none' });
+  assert.strictEqual(read('.tdd-flow/stack.md'), 'test command (all): `npm test`\ntests need: none\n');
+  write('.tdd-flow/stack.md', 'test command (all): `npm test`');
+  run(dir, 'stack-fill', { testsNeed: 'database (local PostgreSQL)' });
+  assert.strictEqual(read('.tdd-flow/stack.md'), 'test command (all): `npm test`\ntests need: database (local PostgreSQL)\n');
+  assert.match(run(dir, 'stack-fill', {}).error, /testsNeed is required/);
+  fs.rmSync(path.join(dir, '.tdd-flow/stack.md'));
+  assert.deepStrictEqual(run(dir, 'stack-fill', { testsNeed: 'none' }).result, { added: false, reason: '.tdd-flow/stack.md is missing' });
 });

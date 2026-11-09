@@ -866,6 +866,33 @@ function specs(inp) {
   return { base, runnable, skipped, ...(id.warning ? { warnings: [id.warning] } : {}) };
 }
 
+// ---------- stack profile ----------
+const TESTS_NEED_LINE = /^([-*]?[ \t]*tests need[ \t]*:)[ \t]*(.*)$/mi;
+
+/**
+ * Writes the `tests need:` value stack-detector returned into .tdd-flow/stack.md when the file lacks the line or kept
+ * the template hint. Input: {testsNeed}. Output: {added: true|false, reason?}.
+ */
+function stackFill(inp) {
+  const value = String(inp.testsNeed || '').trim().split('\n')[0].trim();
+  if (!value) throw new Error('testsNeed is required (none, docker (...), database (...) or services (...))');
+  const file = '.tdd-flow/stack.md';
+  const txt = read(file);
+  if (txt == null) return { added: false, reason: `${file} is missing` };
+  const m = txt.match(TESTS_NEED_LINE);
+  if (m && m[2].trim() && !m[2].trim().startsWith('(')) return { added: false, reason: 'stack.md already has tests need' };
+  let next;
+  if (m) next = txt.replace(TESTS_NEED_LINE, `$1 ${value}`);
+  else {
+    const lines = txt.replace(/\n$/, '').split('\n');
+    const ci = lines.findIndex((l) => /^[-*]?[ \t]*ci system[ \t]*:/i.test(l));
+    lines.splice(ci >= 0 ? ci : lines.length, 0, `tests need: ${value}`);
+    next = lines.join('\n') + '\n';
+  }
+  fs.writeFileSync(file, next);
+  return { added: true };
+}
+
 // ---------- autopilot pre-flight ----------
 const PARALLEL_DEFAULT = 3;
 const DOCKER_TIMEOUT_MS = 20000;
@@ -981,7 +1008,7 @@ async function autopilotCheck(inp) {
   if (outside) {
     const how = stack.testsNeedInferred ? ' (inferred from the test lines of .tdd-flow/stack.md)' : '';
     checks.push({
-      name: 'tests need', status: 'warn', details: `${need}${how}: parallel sessions share it`,
+      name: 'tests need', status: stack.testsNeedInferred ? 'warn' : 'ok', details: `${need}${how}: parallel sessions share it`,
       ...(stack.testsNeedInferred ? { fix: 'add a `tests need:` line to .tdd-flow/stack.md (`none` if they need nothing)' } : {}),
     });
   }
@@ -996,7 +1023,7 @@ async function autopilotCheck(inp) {
   checks.push(await baseSuiteCheck(base, runnable, stack));
 
   const parallel = inp.parallel || (outside ? 1 : PARALLEL_DEFAULT);
-  if (outside && !inp.parallel) checks.push({ name: 'parallel', status: 'warn', details: `1 at a time, because the tests need ${need}; pass --parallel N to run more` });
+  if (outside && !inp.parallel) checks.push({ name: 'parallel', status: 'ok', details: `1 at a time, because the tests need ${need}; pass --parallel N to run more` });
   else if (outside && parallel > 1) checks.push({ name: 'parallel', status: 'warn', details: `${parallel} at a time although the tests need ${need}: their tests may collide` });
   else checks.push({ name: 'parallel', status: 'ok', details: `${parallel} at a time` });
 
@@ -1459,7 +1486,7 @@ async function suite() {
 
 const COMMANDS = {
   plan, suite, branch, block, commit, 'close-out': closeOut, 'add-secret-scan': addSecretScan, preflight,
-  'ci-watch': ciWatch, 'ci-rerun': ciRerun, context, specs, 'autopilot-check': autopilotCheck, worktree, cleanup, 'run-report': runReport, 'runs-wait': runsWait, board,
+  'ci-watch': ciWatch, 'ci-rerun': ciRerun, context, 'stack-fill': stackFill, specs, 'autopilot-check': autopilotCheck, worktree, cleanup, 'run-report': runReport, 'runs-wait': runsWait, board,
   areas, 'simplify-spec': simplifySpec, 'spec-branch': specBranch, 'set-aside': setAside,
 };
 
