@@ -468,12 +468,28 @@ async function commit(inp) {
       if (!t.pass) return { committed: false, ticked, reason: `full test suite failed (\`${t.command}\`):\n${t.summary}` };
     }
   }
-  // Tracked files are staged (changes and deletions). Untracked ones only if they exist, are not ignored and are
-  // not tdd-flow bookkeeping (.tdd-flow/ is committed only in repos that already track it).
-  const stage = files.filter((p) => {
+  // Tracked files are staged (changes and deletions). Untracked ones only if they exist and are not ignored. A new
+  // file under .tdd-flow/ (review.md, tdd-log.md) only next to tracked files: .tdd-flow/ is committed only in repos
+  // that already track it, and state.json never is.
+  const bookkeepingOk = (p) => !p.startsWith('.tdd-flow/') || (p !== STATE && gitOut('ls-files', '--', path.posix.dirname(p)) !== '');
+  const listed = files.filter((p) => {
     if (git('ls-files', '--error-unmatch', '--', p).code === 0) return true;
-    return fs.existsSync(p) && !p.startsWith('.tdd-flow/') && git('check-ignore', '-q', '--', p).code !== 0;
+    return fs.existsSync(p) && bookkeepingOk(p) && git('check-ignore', '-q', '--', p).code !== 0;
   });
+  // stageChanged (task commits): agents forget to list files, so every changed tracked file goes in, plus new files
+  // whose own directory the task touched (never the repo root: a changed lockfile must not pull in loose root files).
+  // The other new files are left out and reported as `unstaged`.
+  const changes = {};
+  if (inp.stageChanged) {
+    const z = (...a) => exec('git', a, undefined, true).out.split('\0').filter(Boolean);
+    const changed = z('diff', '--name-only', '-z', 'HEAD').filter((p) => p !== STATE);
+    const dirs = new Set([...listed, ...changed].map((p) => path.posix.dirname(p)).filter((d) => d !== '.'));
+    const untracked = z('ls-files', '--others', '--exclude-standard', '-z').filter((p) => p !== STATE && !listed.includes(p));
+    const near = untracked.filter((p) => dirs.has(path.posix.dirname(p)) && bookkeepingOk(p));
+    changes.extraStaged = [...changed.filter((p) => !listed.includes(p)), ...near];
+    changes.unstaged = untracked.filter((p) => !near.includes(p));
+  }
+  const stage = [...listed, ...(changes.extraStaged || [])];
   if (stage.length) {
     const a = git('add', '--', ...stage);
     if (a.code !== 0) return { committed: false, ticked, reason: `git add failed: ${a.err}` };
@@ -483,7 +499,7 @@ async function commit(inp) {
     .map((l) => l.slice(3).replace(/^.* -> /, '').replace(/^"|"$/g, ''))
     .filter((p) => !staged.includes(p) && !stage.includes(p));
   // An ignored .tdd-flow/ is never staged: the spec status then lives only in the file, which is still reported.
-  const status = { ...(specStatus ? { specStatus } : {}), ...(specStatusSkipped ? { specStatusSkipped } : {}) };
+  const status = { ...(specStatus ? { specStatus } : {}), ...(specStatusSkipped ? { specStatusSkipped } : {}), ...changes };
   if (!staged.length) {
     // A rerun after a commit whose result got lost: HEAD is that commit, so report it instead of nothing.
     const already = isHeadSubject(inp.message) ? { already: true, sha: gitOut('rev-parse', '--short', 'HEAD') } : {};

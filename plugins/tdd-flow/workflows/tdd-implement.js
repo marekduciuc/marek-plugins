@@ -121,7 +121,7 @@ const REFAC = {
   },
 }
 const BRANCH = { type: 'object', required: ['branch'], properties: { branch: str } }
-const COMMIT = { type: 'object', required: ['committed'], properties: { committed: { type: 'boolean' }, nothingToCommit: { type: 'boolean' }, ticked: { type: 'boolean' }, specStatus: str, specStatusSkipped: str, sha: str, reason: str, unexpected: strs, already: { type: 'boolean' } } }
+const COMMIT = { type: 'object', required: ['committed'], properties: { committed: { type: 'boolean' }, nothingToCommit: { type: 'boolean' }, ticked: { type: 'boolean' }, specStatus: str, specStatusSkipped: str, sha: str, reason: str, unexpected: strs, extraStaged: strs, unstaged: strs, already: { type: 'boolean' } } }
 const SUITE = { type: 'object', required: ['ran', 'pass'], properties: { ran: { type: 'boolean' }, pass: { type: 'boolean' }, command: str, cached: { type: 'boolean' }, summary: str } }
 const BLOCK = { type: 'object', required: ['logged'], properties: { logged: { type: 'boolean' }, unticked: { type: 'boolean' }, alreadyCommitted: { type: 'boolean' } } }
 
@@ -657,7 +657,9 @@ try {
     // secrets and files over 5 MB, and commits. It never pushes.
     const message = skipReason ? `chore(${plan.slug}): ${task.id} skipped - ${skipReason.split('\n')[0].slice(0, 100)}` : `${type}(${plan.slug}): ${task.id} ${task.title}`
     const commitInput = {
-      message, files: commitFiles, state, includeDeletions: isRefactor && !skipReason,
+      // stageChanged: every changed tracked file and new files next to the task's files go in, so a file an agent
+      // forgot to list cannot be left behind. Not for a skipped task: its commit only ticks the line.
+      message, files: commitFiles, state, includeDeletions: isRefactor && !skipReason, stageChanged: !skipReason,
       tick: needsTick ? { file: `${dir}/tasks.md`, task: task.id } : null,
       specStatus: finishesSpec ? { file: `${dir}/spec.md`, value: 'implemented' } : null,
     }
@@ -676,10 +678,12 @@ try {
       return await blocked(task, 'TICK', `${task.id} was committed (${commit.sha || 'no sha'}), but its checkbox in ${dir}/tasks.md was not ticked.`, false,
         `Tick ${task.id} in ${dir}/tasks.md by hand, then rerun /tdd-flow:tdd-implement to continue with the next task.`)
     }
-    if (commit.unexpected && commit.unexpected.length) log(`${task.id}: not committed (unexpected): ${commit.unexpected.join(', ')}`)
+    if (commit.extraStaged && commit.extraStaged.length) log(`${task.id}: also committed (not listed by the agents): ${commit.extraStaged.join(', ')}`)
+    if (commit.unstaged && commit.unstaged.length) log(`${task.id}: new files outside the task's directories, not committed: ${commit.unstaged.join(', ')}`)
     if (finishesSpec && commit.specStatus !== 'implemented') log(`${task.id}: spec status not set to implemented - ${commit.specStatusSkipped || commit.reason || 'no "Status:" line in spec.md'}`)
     if (finishesSpec && commit.specStatus === 'implemented') specStatus = 'implemented'
-    done.push({ task: task.id, title: task.title, commit: commit.sha || '', ...(skipReason ? { skipped: skipReason } : {}) })
+    done.push({ task: task.id, title: task.title, commit: commit.sha || '', ...(skipReason ? { skipped: skipReason } : {}),
+      ...(commit.unstaged && commit.unstaged.length ? { unstaged: commit.unstaged } : {}) })
   }
 } catch (e) {
   if (!limitHit) throw e

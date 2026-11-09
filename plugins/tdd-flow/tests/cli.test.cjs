@@ -758,3 +758,48 @@ test('block keeps the tick when the task commit is already HEAD', () => {
   const other = run(dir, 'block', { ...inp, commitMessage: 'feat(12-csv): T-3 Something else' });
   assert.deepStrictEqual(other.result, { logged: true, unticked: true });
 });
+
+/** trackedRepo on feature/12-csv with tracked src/a.js, src/b.js and a root testreport.md. */
+function taskRepo() {
+  const r = trackedRepo();
+  r.write('src/a.js', 'a\n');
+  r.write('src/b.js', 'b\n');
+  r.write('testreport.md', 'old\n');
+  r.g('add', 'src', 'testreport.md');
+  r.g('commit', '-qm', 'src');
+  r.g('switch', '-q', '-c', 'feature/12-csv');
+  return r;
+}
+const committedFiles = (g) => g('show', '--name-only', '--format=', 'HEAD').toString().trim().split('\n').sort();
+
+test('commit with stageChanged also stages unlisted changes and new files in the directories the task touched', () => {
+  const { dir, g, write } = taskRepo();
+  write('src/a.js', 'a2\n');
+  write('src/b.js', 'b2\n');
+  write('src/new file.js', 'n\n');
+  write('testreport.md', 'new\n');
+  write('.tdd-flow/features/12-csv/review.md', 'approved\n');
+  write('notes.md', 'loose note\n');
+  write('other/x.js', 'x\n');
+  write('.tdd-flow/state.json', '{"phase":"IDLE"}\n');
+  const r = run(dir, 'commit', { message: 'feat(12-csv): T-2 Export header', files: ['src/a.js', '.tdd-flow/features/12-csv/tasks.md'],
+    tick: { file: '.tdd-flow/features/12-csv/tasks.md', task: 'T-2' }, stageChanged: true });
+  assert.strictEqual(r.ok, true, r.error);
+  assert.strictEqual(r.result.committed, true);
+  assert.deepStrictEqual(committedFiles(g), ['.tdd-flow/features/12-csv/review.md', '.tdd-flow/features/12-csv/tasks.md', 'src/a.js', 'src/b.js', 'src/new file.js', 'testreport.md']);
+  assert.deepStrictEqual(r.result.extraStaged.sort(), ['.tdd-flow/features/12-csv/review.md', 'src/b.js', 'src/new file.js', 'testreport.md']);
+  assert.deepStrictEqual(r.result.unstaged.sort(), ['notes.md', 'other/x.js']);
+  assert.match(r.shape, /extraStaged=4/);
+});
+
+test('commit without stageChanged stages only listed files, but a listed new file in a tracked .tdd-flow/ folder too', () => {
+  const { dir, g, write } = taskRepo();
+  write('src/a.js', 'a2\n');
+  write('src/b.js', 'b2\n');
+  write('.tdd-flow/features/12-csv/review.md', 'approved\n');
+  write('.tdd-flow/features/99-new/spec.md', 'not tracked yet\n');
+  const r = run(dir, 'commit', { message: 'feat(12-csv): T-2', files: ['src/a.js', '.tdd-flow/features/12-csv/review.md', '.tdd-flow/features/99-new/spec.md', '.tdd-flow/state.json'] });
+  assert.strictEqual(r.result.committed, true);
+  assert.deepStrictEqual(committedFiles(g), ['.tdd-flow/features/12-csv/review.md', 'src/a.js']);
+  assert.strictEqual(r.result.extraStaged, undefined);
+});
