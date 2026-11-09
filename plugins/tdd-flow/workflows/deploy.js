@@ -41,7 +41,7 @@ const PRE = {
   required: ['slug', 'base', 'branch', 'cliReady', 'hasCi', 'openTasks'],
   properties: {
     slug: str, base: str, branch: str, issueId: str, cliReady: { type: 'boolean' }, cliFix: str,
-    hasCi: { type: 'boolean' }, openTasks: strs,
+    hasCi: { type: 'boolean' }, openTasks: strs, warnings: strs,
     secretScan: { type: 'string', enum: ['present', 'missing', 'not_github'] }, workflowScope: { type: 'boolean' }, existingPr: str, testSingle: str, testAll: str,
     reviewDecision: { type: 'string', enum: ['APPROVED', 'CHANGES_REQUESTED', 'REVIEW_REQUIRED', 'NONE'] },
   },
@@ -78,7 +78,8 @@ const CAUSE = { type: 'object', required: ['category', 'rootCause'], properties:
 // (scripts cannot import; tests/cli.test.cjs checks the copies match).
 // The relay agent retypes the JSON and can drop array items: the CLI prints `shape` (sizes of the result's arrays),
 // cli() recomputes it over the schema's paths, plus an optional o.check(result) -> problem, and on a mismatch has the
-// worker model relay the saved output again (`tdd-flow replay`, the command does not run twice).
+// worker model relay the saved output again (`tdd-flow replay`, the command does not run twice). A relay that still
+// fails returns `relayFailed: true`: the command may have run, so the caller must not treat it as a CLI error.
 const cliSchema = (schema) => ({ type: 'object', required: ['ok', 'shape'], properties: {
   ok: { type: 'boolean' }, shape: str, error: str, fallback: { type: 'boolean' }, again: { type: 'boolean' }, result: schema } })
 function shapeOf(v, p = '', out = []) {
@@ -93,6 +94,7 @@ function shapeOf(v, p = '', out = []) {
 const inSchema = (schema, p) => !!p.split('.').reduce((s, seg) => s && (/^\d+$/.test(seg) ? s.items : s.properties && s.properties[seg]), schema)
 function relayProblem(r, schema, check) {
   if (typeof r.shape !== 'string') return 'no shape in the relayed output'
+  if (r.ok && (!r.result || typeof r.result !== 'object')) return 'no result in the relayed output'
   const pick = (entries) => entries.filter(e => inSchema(schema, e.slice(0, e.lastIndexOf('='))))
   const want = pick(r.shape.split(' ').filter(Boolean)), got = pick(shapeOf(r.result || {}))
   const missing = want.filter(e => !got.includes(e)), extra = got.filter(e => !want.includes(e))
@@ -109,15 +111,15 @@ async function cli(cmd, input, schema, o = {}) {
     { agentType: A('script-runner'), model, effort: 'low', schema: cliSchema(schema), label: lbl, phase: o.phase, ...(o.stallMs ? { stallMs: o.stallMs } : {}) },
     o.final)
   let r = await relay(cmd, { ...input, _relay: id }, o.model || M.light, label)
-  if (!r) return { ok: false, error: 'script-runner agent failed' }
+  if (!r) return { ok: false, relayFailed: true, error: 'script-runner agent failed' }
   let problem = relayProblem(r, schema, o.check)
   if (problem) {
     log(`${label}: ${problem} - relaying the saved output again on ${M.worker}`)
     r = await relay('replay', { id }, M.worker, `${label} (relay retry)`)
     problem = r ? relayProblem(r, schema, o.check) : 'script-runner agent failed'
-    if (problem) return { ok: false, error: `the output of tdd-flow ${cmd} was not relayed completely: ${problem}` }
+    if (problem) return { ok: false, relayFailed: true, error: `the output of tdd-flow ${cmd} was not relayed completely: ${problem}` }
   }
-  return r.ok && !r.result ? { ok: false, error: 'the command returned no result' } : r
+  return r
 }
 
 try {
@@ -138,6 +140,9 @@ try {
   if (!pre) throw new Error('tdd-flow: preflight failed.')
   if (!pre.cliReady) throw new Error(`tdd-flow: tracker CLI not ready. Run: ${pre.cliFix || 'gh auth login / az login'}`)
   if (pre.branch === pre.base) throw new Error(`tdd-flow: you are on ${pre.base}. Deploy works from a feature branch.`)
+  // An identity problem (none, or one git made up from the hostname) is shown, not fatal: deploy commits only CI fixes.
+  const warnings = pre.warnings || []
+  warnings.forEach(w => log(`warning: ${w}`))
 
   // CI watch. GitHub: the CLI polls (the runner repeats the call every ~8.5 minutes up to 30 minutes, cheap
   // because each call prints one line), and an agent reads the failure log only when a check failed.
@@ -284,13 +289,14 @@ try {
 
   if (!ci || ci.status !== 'passed') {
     return {
-      status: 'ci_not_green', prUrl: pr.prUrl, ci,
+      status: 'ci_not_green', prUrl: pr.prUrl, ci, ...(warnings.length ? { warnings } : {}),
       next: 'Show the CI root cause to the user and decide together (fix via /tdd-flow:tdd-implement with findings, re-run, or investigate).',
     }
   }
   return {
     status: 'ready_to_merge',
     prUrl: pr.prUrl,
+    ...(warnings.length ? { warnings } : {}),
     ciRun: ci.runUrl,
     onMerge: ci.onMerge,
     reviewDecision: ci.reviewDecision || 'NONE',

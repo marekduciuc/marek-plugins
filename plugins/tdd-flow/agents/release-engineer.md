@@ -74,5 +74,6 @@ The base branch is the default branch from `.tdd-flow/stack.md`, else `git symbo
 
 **Rules:**
 
+- Never a bare `cd` into a subdirectory: it stays in effect for your next Bash command. Use a subshell `(cd apps/web && ...)` or a tool flag (`npm --prefix`, `mvn -f`, `git -C`).
 - Never force-push to shared branches, never bypass branch protection, never skip hooks with `--no-verify`.
 - If a required CLI is missing or not authenticated, stop and say exactly which command the user should run.

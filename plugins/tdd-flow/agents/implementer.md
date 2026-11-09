@@ -22,6 +22,8 @@ You make failing tests pass with the least code necessary, then refactor safely.
 
 **Running tests:** run test commands through `tdd-flow test -- '<command>'` (plain `tdd-flow test` runs the full suite from the stack profile). It prints PASS/FAIL, the exit code and only the tail of a failure, which keeps your context small. A command that already passed on the same files prints `PASS (cached: ...)` without running again. Run the command directly only when you need the full output.
 
+**Shell:** your Bash commands share one shell, so a `cd` stays in effect for the next command. Run everything from the repo root. For a subdirectory use a subshell `(cd apps/web && npm test)` or a tool flag (`npm --prefix`, `mvn -f`, `git -C`), never a bare `cd`.
+
 **GREEN mode:**
 
 0. If `.tdd-flow/state.json` exists, set its `phase` to `"GREEN"` (keep the other fields).
@@ -44,7 +46,7 @@ You make failing tests pass with the least code necessary, then refactor safely.
 1. Apply the proposal and nothing else. Behaviour must stay the same, including edge cases and error paths.
 2. Never edit the pinned tests: they were committed before the change and are the evidence. Fix production code instead.
 3. A test that exercises nothing but code the proposal removes may be deleted or adapted; report each in `tests removed` with the reason. Everything else in the rule "never delete a test" still holds.
-4. Run the full suite, lint and the type check or build (the `typecheck` script or `tsc --noEmit` for TypeScript, the compile step of a compiled language). All must pass.
+4. Run the full suite, lint and the type check or build (the type check command the caller gives; without one, the `typecheck` script or `tsc --noEmit` for TypeScript, the compile step of a compiled language). All must pass.
 5. Report every changed, created and deleted file, both paths of a rename.
 6. If the proposal cannot be done without changing behaviour, or no longer fits the code, restore the files you changed and report `applicable: false` with the reason.
 

@@ -38,7 +38,7 @@ TDD_FLOW_JSON
 
 Pass the slugs from the input in `slugs` (naming a spec also restarts it after a `blocked` run). On `ok: false` show the error and stop; it says what to fix: `.tdd-flow/` git-ignored, `state.json` tracked, not the main checkout.
 
-Show `runnable` and `skipped` (one line each: slug - reason). Specs are runnable when their status on `feature/<slug>`, or on the base branch if that branch does not exist yet, is `approved`. They must also be committed on the base branch without local changes. The exception is a spec that exists only on `feature/<slug>`, which `/tdd-flow:simplify-codebase --implement` creates: it runs when it is named in the slugs. If nothing is runnable, stop.
+Show `runnable` and `skipped` (one line each: slug - reason), and every entry of `warnings` (for example a git identity made up from the hostname) with its fix command. An error that there is no git identity stops the autopilot: show the fix command. Specs are runnable when their status on `feature/<slug>`, or on the base branch if that branch does not exist yet, is `approved`. They must also be committed on the base branch without local changes. The exception is a spec that exists only on `feature/<slug>`, which `/tdd-flow:simplify-codebase --implement` creates: it runs when it is named in the slugs. If nothing is runnable, stop.
 
 Before starting, check `gh auth status`; if it fails, tell the user to run `! gh auth login` and stop.
 

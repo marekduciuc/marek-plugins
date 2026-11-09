@@ -695,3 +695,187 @@ test('commit with includeDeletions also commits tracked files the agent did not 
   assert.strictEqual(r.result.committed, true);
   assert.strictEqual(g('status', '--porcelain').toString(), '');
 });
+
+/** The shared cli() helper of a workflow, run against scripted script-runner replies (null = agent failed). */
+function cliWithReplies(replies) {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'workflows', 'tdd-implement.js'), 'utf8');
+  const block = src.match(/\/\/ Deterministic steps[\s\S]*?\nasync function cli\([\s\S]*?\n}\n/)[0];
+  const labels = [];
+  const fakeRun = async (prompt, opts) => { labels.push(opts.label); return replies.shift(); };
+  const cli = new Function('str', 'run', 'log', 'A', 'M', `${block}\nreturn cli;`)({ type: 'string' }, fakeRun, () => {}, (n) => n, { light: 'haiku', worker: 'sonnet' });
+  return { cli, labels };
+}
+const COMMIT_SCHEMA = { type: 'object', properties: { committed: { type: 'boolean' }, unexpected: { type: 'array' } } };
+
+test('cli() relays the saved output again when the relay drops the result', async () => {
+  const { cli, labels } = cliWithReplies([{ ok: true, shape: '' }, { ok: true, shape: '', result: { committed: true } }]);
+  const r = await cli('commit', {}, COMMIT_SCHEMA, { label: 'T-2 commit' });
+  assert.strictEqual(r.ok, true);
+  assert.strictEqual(r.result.committed, true);
+  assert.deepStrictEqual(labels, ['T-2 commit', 'T-2 commit (relay retry)']);
+});
+
+test('cli() marks a relay that never brings the result as relayFailed, but not an error the CLI reported', async () => {
+  const dropped = await cliWithReplies([{ ok: true, shape: '' }, { ok: true, shape: '' }]).cli('commit', {}, COMMIT_SCHEMA);
+  assert.strictEqual(dropped.ok, false);
+  assert.strictEqual(dropped.relayFailed, true);
+  const agentDied = await cliWithReplies([null]).cli('commit', {}, COMMIT_SCHEMA);
+  assert.strictEqual(agentDied.relayFailed, true);
+  const cliError = await cliWithReplies([{ ok: false, shape: '', error: 'git commit failed' }]).cli('commit', {}, COMMIT_SCHEMA);
+  assert.strictEqual(cliError.ok, false);
+  assert.strictEqual(cliError.relayFailed, undefined);
+});
+
+test('commit run again after it went through reports the existing commit and keeps the tick', () => {
+  const { dir, g, write } = repo();
+  g('switch', '-q', '-c', 'feature/12-csv');
+  write('a.js', 'x\n');
+  const input = { message: 'feat(12-csv): T-2 Export header\n\nbody', files: ['a.js'], tick: { file: '.tdd-flow/features/12-csv/tasks.md', task: 'T-2' } };
+  const first = run(dir, 'commit', input);
+  assert.strictEqual(first.result.committed, true);
+  const again = run(dir, 'commit', input);
+  assert.strictEqual(again.result.nothingToCommit, true);
+  assert.strictEqual(again.result.ticked, true);
+  assert.strictEqual(again.result.already, true);
+  assert.strictEqual(again.result.sha, first.result.sha);
+  write('b.js', 'y\n');
+  g('add', 'b.js');
+  g('commit', '-qm', 'other');
+  assert.strictEqual(run(dir, 'commit', input).result.already, undefined, 'only HEAD counts, not an older commit');
+});
+
+test('block keeps the tick when the task commit is already HEAD', () => {
+  const { dir, g, read, write } = repo();
+  g('switch', '-q', '-c', 'feature/12-csv');
+  write('a.js', 'x\n');
+  g('add', 'a.js');
+  g('commit', '-qm', 'feat(12-csv): T-2 Export header');
+  write('.tdd-flow/features/12-csv/tasks.md', TASKS.replace('[ ] T-2', '[x] T-2'));
+  const inp = { dir: '.tdd-flow/features/12-csv', task: 'T-2', step: 'COMMIT', details: 'relay failed', untick: true };
+  const kept = run(dir, 'block', { ...inp, commitMessage: 'feat(12-csv): T-2 Export header' });
+  assert.deepStrictEqual(kept.result, { logged: true, unticked: false, alreadyCommitted: true });
+  assert.match(read('.tdd-flow/features/12-csv/tasks.md'), /\[x\] T-2/);
+  const other = run(dir, 'block', { ...inp, commitMessage: 'feat(12-csv): T-3 Something else' });
+  assert.deepStrictEqual(other.result, { logged: true, unticked: true });
+});
+
+/** trackedRepo on feature/12-csv with tracked src/a.js, src/b.js and a root testreport.md. */
+function taskRepo() {
+  const r = trackedRepo();
+  r.write('src/a.js', 'a\n');
+  r.write('src/b.js', 'b\n');
+  r.write('testreport.md', 'old\n');
+  r.g('add', 'src', 'testreport.md');
+  r.g('commit', '-qm', 'src');
+  r.g('switch', '-q', '-c', 'feature/12-csv');
+  return r;
+}
+const committedFiles = (g) => g('show', '--name-only', '--format=', 'HEAD').toString().trim().split('\n').sort();
+
+test('commit with stageChanged also stages unlisted changes and new files in the directories the task touched', () => {
+  const { dir, g, write } = taskRepo();
+  write('src/a.js', 'a2\n');
+  write('src/b.js', 'b2\n');
+  write('src/new file.js', 'n\n');
+  write('testreport.md', 'new\n');
+  write('.tdd-flow/features/12-csv/review.md', 'approved\n');
+  write('notes.md', 'loose note\n');
+  write('other/x.js', 'x\n');
+  write('.tdd-flow/state.json', '{"phase":"IDLE"}\n');
+  const r = run(dir, 'commit', { message: 'feat(12-csv): T-2 Export header', files: ['src/a.js', '.tdd-flow/features/12-csv/tasks.md'],
+    tick: { file: '.tdd-flow/features/12-csv/tasks.md', task: 'T-2' }, stageChanged: true });
+  assert.strictEqual(r.ok, true, r.error);
+  assert.strictEqual(r.result.committed, true);
+  assert.deepStrictEqual(committedFiles(g), ['.tdd-flow/features/12-csv/review.md', '.tdd-flow/features/12-csv/tasks.md', 'src/a.js', 'src/b.js', 'src/new file.js', 'testreport.md']);
+  assert.deepStrictEqual(r.result.extraStaged.sort(), ['.tdd-flow/features/12-csv/review.md', 'src/b.js', 'src/new file.js', 'testreport.md']);
+  assert.deepStrictEqual(r.result.unstaged.sort(), ['notes.md', 'other/x.js']);
+  assert.match(r.shape, /extraStaged=4/);
+});
+
+test('commit without stageChanged stages only listed files, but a listed new file in a tracked .tdd-flow/ folder too', () => {
+  const { dir, g, write } = taskRepo();
+  write('src/a.js', 'a2\n');
+  write('src/b.js', 'b2\n');
+  write('.tdd-flow/features/12-csv/review.md', 'approved\n');
+  write('.tdd-flow/features/99-new/spec.md', 'not tracked yet\n');
+  const r = run(dir, 'commit', { message: 'feat(12-csv): T-2', files: ['src/a.js', '.tdd-flow/features/12-csv/review.md', '.tdd-flow/features/99-new/spec.md', '.tdd-flow/state.json'] });
+  assert.strictEqual(r.result.committed, true);
+  assert.deepStrictEqual(committedFiles(g), ['.tdd-flow/features/12-csv/review.md', 'src/a.js']);
+  assert.strictEqual(r.result.extraStaged, undefined);
+});
+
+test('commands called from a subdirectory work from the repo root', () => {
+  const { dir, g, read, write } = repo();
+  g('switch', '-q', '-c', 'feature/12-csv');
+  write('a.js', 'x\n');
+  fs.mkdirSync(path.join(dir, 'apps/web'), { recursive: true });
+  const r = run(path.join(dir, 'apps/web'), 'commit', {
+    message: 'feat(12-csv): T-2 Export header', files: ['a.js'], tick: { file: '.tdd-flow/features/12-csv/tasks.md', task: 'T-2' },
+    state: { feature: '12-csv', phase: 'IDLE', task: 'T-20' },
+  });
+  assert.strictEqual(r.ok, true, r.error);
+  assert.strictEqual(r.result.committed, true);
+  assert.strictEqual(r.result.ticked, true);
+  assert.deepStrictEqual(JSON.parse(read('.tdd-flow/state.json')), { feature: '12-csv', phase: 'IDLE', task: 'T-20' });
+  assert.ok(!fs.existsSync(path.join(dir, 'apps/web/.tdd-flow')), 'nothing written below the subdirectory');
+});
+
+test('test runs the stack.md command at the repo root and a command after -- in the caller directory', () => {
+  const { dir, write } = repo();
+  const mark = 'node -e "require(\'fs\').writeFileSync(\'ran-here.txt\', \'x\')"';
+  write('.tdd-flow/stack.md', `test command (all): \`${mark}\`\ndefault branch: main\n`);
+  const sub = path.join(dir, 'apps/web');
+  fs.mkdirSync(sub, { recursive: true });
+  const env = { ...process.env, TDD_FLOW_TEST_CACHE: 'off' };
+  const own = spawnSync(process.execPath, [CLI, 'test'], { cwd: sub, encoding: 'utf8', env });
+  assert.match(own.stdout, /^PASS/, own.stdout);
+  assert.ok(fs.existsSync(path.join(dir, 'ran-here.txt')) && !fs.existsSync(path.join(sub, 'ran-here.txt')));
+  fs.rmSync(path.join(dir, 'ran-here.txt'));
+  const given = spawnSync(process.execPath, [CLI, 'test', '--', mark], { cwd: sub, encoding: 'utf8', env });
+  assert.match(given.stdout, /^PASS/, given.stdout);
+  assert.ok(fs.existsSync(path.join(sub, 'ran-here.txt')) && !fs.existsSync(path.join(dir, 'ran-here.txt')));
+});
+
+test('plan passes the stack profile type check command on, and leaves it out when there is none', () => {
+  const { dir, read, write } = repo();
+  write('.tdd-flow/stack.md', read('.tdd-flow/stack.md') + 'type check command: `(cd apps/web && npx tsc --noEmit)`\n');
+  assert.strictEqual(run(dir, 'plan', {}).result.typeCheck, '(cd apps/web && npx tsc --noEmit)');
+  write('.tdd-flow/stack.md', read('.tdd-flow/stack.md').replace(/type check command: .*\n/, 'type check command: none (Python)\n'));
+  assert.strictEqual(run(dir, 'plan', {}).result.typeCheck, undefined);
+});
+
+/** Runs the CLI with no git identity from config or the environment (git then falls back to user@hostname). */
+function runWithoutIdentity(dir, cmd, input, env) {
+  const clean = { ...process.env, ...env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' };
+  ['EMAIL', 'GIT_COMMITTER_EMAIL', 'GIT_AUTHOR_EMAIL', 'GIT_COMMITTER_NAME', 'GIT_AUTHOR_NAME'].forEach((k) => delete clean[k]);
+  const r = spawnSync(process.execPath, [CLI, cmd], { cwd: dir, input: JSON.stringify(input || {}), encoding: 'utf8', env: clean });
+  return JSON.parse(r.stdout.trim());
+}
+
+test('specs warns about an automatic git identity and stops when git has none', () => {
+  const { dir, g } = trackedRepo();
+  assert.strictEqual(run(dir, 'specs', {}, fakeClaude([])).result.warnings, undefined);
+  g('config', '--unset', 'user.email');
+  g('config', '--unset', 'user.name');
+  const auto = runWithoutIdentity(dir, 'specs', {}, fakeClaude([]));
+  assert.strictEqual(auto.ok, true, auto.error);
+  assert.match(auto.result.warnings.join('\n'), /user\.email is not set.*git config --global user\.email/);
+  g('config', 'user.useConfigOnly', 'true');
+  const none = runWithoutIdentity(dir, 'specs', {}, fakeClaude([]));
+  assert.strictEqual(none.ok, false);
+  assert.match(none.error, /no git identity.*git config --global user\.email/);
+});
+
+test('commit with stageChanged commits a staged deletion and leaves a new secret-looking file out', () => {
+  const { dir, g, write } = taskRepo();
+  g('rm', '-q', 'src/b.js');
+  write('src/a.js', 'a2\n');
+  write('src/.env.local', 'TOKEN=x\n');
+  const r = run(dir, 'commit', { message: 'feat(12-csv): T-2', files: ['src/a.js'], stageChanged: true });
+  assert.strictEqual(r.ok, true, r.error);
+  assert.strictEqual(r.result.committed, true, r.result.reason);
+  assert.deepStrictEqual(committedFiles(g), ['src/a.js', 'src/b.js']);
+  assert.ok(!fs.existsSync(path.join(dir, 'src/b.js')));
+  assert.strictEqual(g('ls-files', 'src/b.js').toString(), '');
+  assert.deepStrictEqual(r.result.unstaged, ['src/.env.local']);
+});
