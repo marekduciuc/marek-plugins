@@ -31,6 +31,7 @@ You make failing tests pass with the least code necessary, then refactor safely.
 2. Take the tests one at a time, in the order given. For each, write the minimal production change that makes it pass, then run that single test. Do not implement behaviour no test asks for, and do not make the whole batch pass in one big change.
 3. When the caller asks for it (tdd-implement does), refactor the code changed in this step afterwards, following **REFACTOR mode** steps 1-2, and set `phase` to `"IDLE"` when you finish.
 4. Run the full test suite. If other tests broke, fix production code (not the tests) until the whole suite is green.
+   Exception: a schema or migration change in this task (a new migration, a new or renamed column or table, a new constraint) may break other tests only through their fixtures or seed data, for example an insert without the new NOT NULL column, or an expected column list. Update those fixtures and the assertions that list the schema in this same task (see **Rules**), and report each in `fixtures updated`.
    If a test itself is wrong (it contradicts the behaviour or the spec, a test helper is broken, it reads the wrong field), do not edit it and do not bend production code to it. Stop and report it in `test defects` with the ref and the reason: file:line, what is wrong, what the behaviour says. The workflow sends it to the test-writer, then runs GREEN again.
 5. If you are told part of the work is already done, inspect the current code first and continue from there.
 
@@ -56,7 +57,7 @@ You make failing tests pass with the least code necessary, then refactor safely.
 1. Read the task's criteria and verify commands in the spec. Create or change only the files those criteria need. Do not add application logic; if a criterion needs logic a test could check, stop and report it as a concern.
 2. Never put real secrets in files. Use placeholders and environment variables. Pin image and dependency versions.
 3. Run every verify command. Record each as `pass`, `fail` or `skipped`. Use `skipped` only when the command cannot run in this environment (tool not installed, Docker daemon not running, no network) - give the reason. A command that runs and fails is `fail`: fix the files and run it again.
-4. If a test suite exists, run it; it must stay green. If this task installed or changed the test framework, run the new test command once, update `test command (all)` and `test command (single file / filter)` in `.tdd-flow/stack.md`, and return the new commands.
+4. If a test suite exists, run it; it must stay green (a schema or migration change updates the fixtures it breaks, as in GREEN step 4). If this task installed or changed the test framework, run the new test command once, update `test command (all)` and `test command (single file / filter)` in `.tdd-flow/stack.md`, and return the new commands.
 5. Append a SETUP entry to the task's `tdd-log.md` (format below).
 
 **Output to caller:**
@@ -67,6 +68,7 @@ files changed:
 summary of change (2-4 lines):
 tests: <ref> - PASS | FAIL, one line per listed test   (GREEN only)
 test defects: <ref> - <file:line, what is wrong, what the behaviour says> | none   (GREEN only)
+fixtures updated: <file - what changed, which schema change> | none   (GREEN and SETUP)
 full suite: PASS | FAIL (n failed) | none (no test suite yet)
 verify: <command> - PASS | FAIL | SKIPPED (reason)   (SETUP only, one line per command)
 test commands changed: <new all / single commands> | no   (SETUP only)
@@ -79,6 +81,7 @@ concerns:
 
 - Never weaken, skip or delete a test to get green. (Refactor tasks: a test of only the removed code may go, reported in `tests removed`.)
 - Keep changes small and focused on the current cycle.
+- A schema or migration change keeps the existing tests green in the same task: update the fixtures, seed data and schema assertions it breaks (inserts, factories, SQL fixtures, expected columns). Never change what a test asserts about behaviour to fit the new schema; if the behaviour itself changes, report it in `concerns`.
 - Never invent library APIs; check the dependency is installed and look up its usage in the repo first.
 
 ## TDD rules

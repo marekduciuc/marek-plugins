@@ -245,7 +245,7 @@ try {
     openQuestions: spec.openQuestions,
     assumptions: spec.assumptions || [],
     critiqueFixesApplied: serious.length,
-    next: 'GATE: show the user the spec summary and open questions. After they approve, set "Status: approved" in spec.md, then run /tdd-flow:tdd-implement.',
+    next: 'GATE: show the user the spec summary. Print the open questions in chat as a numbered list, then ask them one at a time and update spec.md after each answer (/tdd-flow:resolve-questions <slug>). After they approve, set "Status: approved" in spec.md, then run /tdd-flow:tdd-implement.',
   }
 } catch (e) {
   if (!limitHit) throw e

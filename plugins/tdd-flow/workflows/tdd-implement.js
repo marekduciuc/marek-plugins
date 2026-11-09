@@ -83,6 +83,7 @@ const GREEN = {
     tests: { type: 'array', items: { type: 'object', required: ['ref', 'pass'], properties: { ref: str, pass: { type: 'boolean' } } } },
     suitePass: { type: 'boolean' }, filesChanged: strs, summary: str, failures: str, concerns: str,
     testDefects: { type: 'array', items: { type: 'object', required: ['ref', 'reason'], properties: { ref: str, reason: str } } },
+    fixturesUpdated: strs,
   },
 }
 const CODE = {
@@ -341,13 +342,19 @@ async function tddStep(task, items, structural = []) {
         (withStructural ? `Also address these non-behavioural review findings without changing behaviour:\n${JSON.stringify(structural, null, 1)}\n` : '') +
         (verdicts ? `The test-writer has reviewed the tests you reported as wrong; the tests on disk are now authoritative:\n${verdicts}\n`
           : 'If a test itself is wrong (it contradicts the behaviour, a test helper is broken, it reads the wrong field), do not edit it and do not bend production code to it: report it in testDefects with its ref and the reason (file:line, what is wrong, what the behaviour says), and stop.\n') +
+        'If this change touches the schema or a migration, update the fixtures, seed data and schema assertions of other tests it breaks in this same step (never what they assert about behaviour) and list each in fixturesUpdated.\n' +
         `Append one entry per behaviour (RED + GREEN lines) and one REFACTOR line for ${task.id} to ${dir}/tdd-log.md. Report each test by ref.` + extra,
         { agentType: A('implementer'), model, schema: GREEN, label, phase: 'Implement' }),
       r => !greenProblems(r).length,
-      r => `Not done yet:\n${greenProblems(r).join('\n')}\n${r.failures || r.summary}\nThe work already done is on disk: inspect the current code first. Fix production code, never the tests.`,
+      r => `Not done yet:\n${greenProblems(r).join('\n')}\n${r.failures || r.summary}\nThe work already done is on disk: inspect the current code first. Fix production code, never the tests (except fixtures a schema or migration change breaks, listed in fixturesUpdated).`,
       stop)
+    const logFixtures = (g) => {
+      const fixtures = g.attempts.flatMap(a => a.fixturesUpdated || [])
+      if (fixtures.length) log(`${tag}: fixtures updated for a schema change - ${fixtures.join('; ')}`)
+    }
     let green = await greenRun('', r => defectsIn(r).length > 0)
     files.push(...changedFiles(green.attempts))
+    logFixtures(green)
     if (green.stopped) {
       // One test-fix round per batch: the test-writer fixes the named tests or confirms them. A test it leaves
       // unchanged goes to an arbiter (strong model, read-only); a test the arbiter finds wrong is fixed on the strong
@@ -411,6 +418,7 @@ async function tddStep(task, items, structural = []) {
         .forEach(ref => { const n = reports.get(ref); testFixes.push(`${ref}: ${n.testFile} :: ${n.testName} - ${n.reason}`) })
       green = await greenRun(fixRefs.map(ref => `- ${ref}: ${verdicts.get(ref)}`).join('\n'))
       files.push(...changedFiles(green.attempts))
+      logFixtures(green)
     }
     if (!green.ok) return { ok: false, step: `GREEN ${refs.join(', ')}`, details: green.result ? [...greenProblems(green.result), ...defectsIn(green.result).map(d => `${d.ref}: reported as a wrong test - ${d.reason}`)].join('\n') + '\n' + (green.result.failures || green.result.summary) : 'agent failed' }
     greenRan = true
