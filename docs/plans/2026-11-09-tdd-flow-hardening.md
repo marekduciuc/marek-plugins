@@ -4,7 +4,9 @@ Source: the "Where Things Go Wrong" to "On the Horizon" sections of the Claude C
 
 Goal: a user installs tdd-flow and it works without changing their whole environment. Fixes go into the plugin, not into the user's rules or repo CLAUDE.md.
 
-Status: phase 1 implemented in tdd-flow 0.13.0 (54 tests pass). Phases 2 and 3 not started.
+Status: phase 1 implemented in tdd-flow 0.13.0. Phase 2: autopilot pre-flight and external test state (F6) implemented in tdd-flow 0.14.0; the rest of phase 2 and phase 3 not started.
+
+Phase 2 (0.14.0) as built: a separate `tdd-flow autopilot-check` command. The base suite runs only for 2 or more specs and only in a clean main checkout on the base. Permissions come from managed settings, the user settings, the main checkout's `settings.local.json` (worktree sessions use it) and the base's `settings.json`. No rules are needed in `auto` mode, which is the default since Claude Code 2.1.283. `tests need:` in stack.md is inferred from the test lines only for older profiles. It sets parallel to 1. The test cache stays on (user decision after the architecture review: Testcontainers start fresh, and one session at a time already avoids shared state); `TDD_FLOW_TEST_CACHE=off` covers a shared local database.
 
 Phase 1 as built, after the architecture review: the relay returns `relayFailed` and the task commit retries on that flag only; `block` keeps the tick when HEAD already is the task commit; `stageChanged` is opt-in and set only on task commits (not CHARACTERIZE, docs, mark-implemented or skipped-task commits); `tdd-flow test -- <cmd>` keeps the caller's directory; the type check comes from a new `type check command` field in `stack.md`; the identity check uses `git var GIT_COMMITTER_IDENT` and stops the autopilot when git has no identity.
 
@@ -50,7 +52,7 @@ Seen: `npm ci` left the shell in `apps/web`, T-1 started from the wrong director
 ## Phase 2: fewer stalls
 
 - **Autopilot pre-flight**, once in the main checkout before any worktree: base suite green, `gh` auth, Docker if the stack needs it, the permissions background sessions need (they pause at prompts until you attach), git identity.
-- **External test state (F6):** stack-detector records "tests need a database or Docker". The autopilot then warns, defaults to `--parallel 1` and turns the test cache off for the repo.
+- **External test state (F6):** stack-detector records "tests need a database or Docker". The autopilot then warns and defaults to `--parallel 1` (the test cache stays on, decided 09.11.2026).
 - **Migrations (F7):** implementer rule: a schema or migration change updates the dependent tests and fixtures in the same task. Then remove the migration line from the symple-crm CLAUDE.md.
 - **Meta-tests (F8):** test-writer and implementer follow repo tests that check other tests (comment metadata, naming), e.g. `TestClaimCommentsTest`.
 - **Questions in chat (F4):** the `ship-feature` Gate 1 and the `analyze-requirements` handoff print open questions numbered in chat and ask them one at a time.

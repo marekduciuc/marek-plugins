@@ -879,3 +879,100 @@ test('commit with stageChanged commits a staged deletion and leaves a new secret
   assert.strictEqual(g('ls-files', 'src/b.js').toString(), '');
   assert.deepStrictEqual(r.result.unstaged, ['src/.env.local']);
 });
+
+/** Executable `name` in a temp dir running the given shell body. */
+function fakeBin(name, body) {
+  const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), `tdd-flow-${name}-`)), name);
+  fs.writeFileSync(f, `#!/bin/sh\n${body}\n`, { mode: 0o755 });
+  return f;
+}
+/** autopilot-check with a logged-in gh, a claude of the given version and HOME holding the given user settings. */
+function autopilotCheck(dir, input, { settings, version = '2.1.200', env = {} } = {}) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'tdd-flow-home-'));
+  if (settings) { fs.mkdirSync(path.join(home, '.claude')); fs.writeFileSync(path.join(home, '.claude', 'settings.json'), JSON.stringify(settings)); }
+  const r = run(dir, 'autopilot-check', input, { HOME: home, ...fakeGh([]), TDD_FLOW_CLAUDE_BIN: fakeBin('claude', `echo '${version} (Claude Code)'`), ...env });
+  assert.strictEqual(r.ok, true, r.error);
+  return { ...r.result, check: (name) => r.result.checks.find((c) => c.name === name) };
+}
+const SESSION_ALLOW = ['Workflow', 'Bash(tdd-flow:*)', 'Bash(git *)', 'Bash(gh pr:*)', 'Edit'];
+
+test('autopilot-check: tests need from the stack.md field, else inferred from its test lines only', () => {
+  const { dir, write } = repo();
+  const need = (txt) => {
+    write('.tdd-flow/stack.md', txt);
+    const r = autopilotCheck(dir, { runnable: 1 }, { settings: { permissions: { defaultMode: 'auto' } }, env: { TDD_FLOW_DOCKER_BIN: fakeBin('docker', 'exit 0') } });
+    return [r.testsNeed, /inferred/.test((r.check('tests need') || {}).details || '')];
+  };
+  assert.deepStrictEqual(need('tests need: docker (Testcontainers)\n'), ['docker (Testcontainers)', false]);
+  assert.deepStrictEqual(need('tests need: none\ntest command (all): ./mvnw verify\n  note: needs Docker\n'), ['none', false]);
+  assert.deepStrictEqual(need('test command (all): ./mvnw verify\n  note: ITs use Testcontainers, need Docker\nbuild command: npm run build\n'), ['docker', true]);
+  assert.deepStrictEqual(need('test command (all): npm test\nbuild command: docker build .\nci system: GitHub Actions builds a docker image\n'), ['none', false]);
+});
+
+test('autopilot-check: gh login is required', () => {
+  const { dir } = trackedRepo();
+  const r = run(dir, 'autopilot-check', { runnable: 1 }, { ...fakeGh(null), TDD_FLOW_CLAUDE_BIN: fakeBin('claude', 'echo 2.1.300') });
+  assert.strictEqual(r.result.ok, false);
+  assert.deepStrictEqual(r.result.checks.find((c) => c.name === 'gh'), { name: 'gh', status: 'fail', details: 'not logged in; every session opens its PR with it', fix: 'run `! gh auth login`' });
+  assert.strictEqual(autopilotCheck(dir, { runnable: 1 }, { settings: { permissions: { allow: SESSION_ALLOW } } }).ok, true);
+});
+
+test('autopilot-check: permissions from user and local settings, broader rules cover, auto mode needs no rules', () => {
+  const { dir, write } = trackedRepo();
+  const perms = (opts) => autopilotCheck(dir, { runnable: 1 }, opts).check('permissions');
+  const missing = perms({ settings: { permissions: { allow: ['Bash(git push *)', 'Edit(src/**)'] } } });
+  assert.strictEqual(missing.status, 'warn');
+  assert.match(missing.details, /stop at a permission prompt until you attach for: Workflow, Bash\(tdd-flow \*\), Bash\(git \*\), Bash\(gh pr \*\), Edit \(mode default, Claude Code default\)/);
+  assert.match(missing.fix, /settings\.local\.json or ~\/\.claude\/settings\.json/);
+  assert.strictEqual(perms({ settings: { permissions: { allow: ['Workflow', 'Bash', 'Edit'] } } }).status, 'ok');
+  assert.strictEqual(perms({ settings: { permissions: { allow: ['Workflow', 'Bash(*)'], defaultMode: 'acceptEdits' } } }).status, 'ok');
+  assert.match(perms({ settings: { permissions: { allow: ['Workflow'], defaultMode: 'dontAsk' } } }).details, /deny without asking for: Bash/);
+  assert.strictEqual(perms({ settings: { permissions: { defaultMode: 'auto' } } }).status, 'ok');
+  assert.match(perms({ version: '2.1.300' }).details, /^mode auto \(Claude Code default\)/);
+  // The main checkout's settings.local.json applies to worktree sessions, but cannot switch to auto mode.
+  write('.claude/settings.local.json', JSON.stringify({ permissions: { allow: SESSION_ALLOW, defaultMode: 'auto' } }));
+  assert.match(perms({}).details, /rules background sessions need are allowed/);
+  write('.claude/settings.local.json', JSON.stringify({ permissions: { defaultMode: 'auto' } }));
+  assert.strictEqual(perms({}).status, 'warn');
+  write('.claude/settings.local.json', '{ not json');
+  assert.match(perms({ settings: { permissions: { defaultMode: 'auto' } } }).details, /settings\.local\.json is not valid JSON/);
+});
+
+test('autopilot-check: tests that need Docker check the engine and run one spec at a time', () => {
+  const { dir, write, g } = trackedRepo();
+  write('.tdd-flow/stack.md', 'test command (all): `node -e 0`\ntests need: docker (Testcontainers)\n');
+  g('commit', '-qam', 'docker');
+  const opts = (code) => ({ settings: { permissions: { defaultMode: 'auto' } }, env: { TDD_FLOW_DOCKER_BIN: fakeBin('docker', `exit ${code}`) } });
+  const up = autopilotCheck(dir, { runnable: 1 }, opts(0));
+  assert.deepStrictEqual([up.ok, up.parallel, up.testsNeed, up.check('docker').status], [true, 1, 'docker (Testcontainers)', 'ok']);
+  assert.match(up.check('tests need').details, /parallel sessions share it/);
+  assert.match(up.check('parallel').details, /^1 at a time, because the tests need docker/);
+  const down = autopilotCheck(dir, { runnable: 1 }, opts(1));
+  assert.deepStrictEqual([down.ok, down.check('docker').status], [false, 'fail']);
+  assert.match(down.check('docker').fix, /start Docker Desktop/);
+  const given = autopilotCheck(dir, { runnable: 1, parallel: 2 }, opts(0));
+  assert.deepStrictEqual([given.parallel, given.check('parallel').status], [2, 'warn']);
+  write('.tdd-flow/stack.md', 'test command (all): `node -e 0`\n');
+  g('commit', '-qam', 'no docker');
+  const plain = autopilotCheck(dir, { runnable: 1 }, opts(1));
+  assert.deepStrictEqual([plain.ok, plain.parallel, plain.check('docker'), plain.check('tests need')], [true, 3, undefined, undefined]);
+  const bad = run(dir, 'autopilot-check', { parallel: 0 }, fakeGh([]));
+  assert.match(bad.error, /parallel must be a positive whole number/);
+});
+
+test('autopilot-check: base suite runs once for two or more specs on a clean base checkout', () => {
+  const { dir, write, g } = trackedRepo();
+  const suite = (runnable) => autopilotCheck(dir, { runnable }, { settings: { permissions: { defaultMode: 'auto' } } });
+  assert.match(suite(1).check('base suite').details, /^one spec; each session runs its own baseline/);
+  assert.deepStrictEqual([suite(2).check('base suite').status, suite(2).ok], ['ok', true]);
+  write('scratch.txt', 'x\n');
+  assert.match(suite(2).check('base suite').details, /local changes/);
+  fs.rmSync(path.join(dir, 'scratch.txt'));
+  write('.tdd-flow/stack.md', 'test command (all): `node -e "process.exit(1)"`\n');
+  g('commit', '-qam', 'red');
+  const red = suite(2);
+  assert.deepStrictEqual([red.ok, red.check('base suite').status], [false, 'fail']);
+  assert.match(red.check('base suite').details, /fails on main, so every session would stop at its baseline/);
+  g('switch', '-qc', 'other');
+  assert.match(suite(2).check('base suite').details, /main checkout is on other, not main/);
+});
