@@ -1181,7 +1181,9 @@ function taskProgress(slug, root, base) {
 function knownRuns(root) {
   const names = (dir, keep) => { try { return fs.readdirSync(dir).filter(keep); } catch { return []; } };
   const worktrees = names(path.join(root, WORKTREES), (n) => fs.statSync(path.join(root, WORKTREES, n)).isDirectory());
-  const runs = names(path.dirname(runFile('x')), (n) => n.endsWith('.json')).map((n) => n.slice(0, -5));
+  // A done run whose worktree is gone is finished: its PR was merged and cleaned up (or the worktree removed by hand).
+  const runs = names(path.dirname(runFile('x')), (n) => n.endsWith('.json')).map((n) => n.slice(0, -5))
+    .filter((s) => worktrees.includes(s) || (readRun(s) || {}).status !== 'done');
   return [...new Set([...worktrees, ...runs])].filter((s) => SLUG.test(s)).sort();
 }
 
