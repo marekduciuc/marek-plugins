@@ -865,3 +865,17 @@ test('specs warns about an automatic git identity and stops when git has none', 
   assert.strictEqual(none.ok, false);
   assert.match(none.error, /no git identity.*git config --global user\.email/);
 });
+
+test('commit with stageChanged commits a staged deletion and leaves a new secret-looking file out', () => {
+  const { dir, g, write } = taskRepo();
+  g('rm', '-q', 'src/b.js');
+  write('src/a.js', 'a2\n');
+  write('src/.env.local', 'TOKEN=x\n');
+  const r = run(dir, 'commit', { message: 'feat(12-csv): T-2', files: ['src/a.js'], stageChanged: true });
+  assert.strictEqual(r.ok, true, r.error);
+  assert.strictEqual(r.result.committed, true, r.result.reason);
+  assert.deepStrictEqual(committedFiles(g), ['src/a.js', 'src/b.js']);
+  assert.ok(!fs.existsSync(path.join(dir, 'src/b.js')));
+  assert.strictEqual(g('ls-files', 'src/b.js').toString(), '');
+  assert.deepStrictEqual(r.result.unstaged, ['src/.env.local']);
+});

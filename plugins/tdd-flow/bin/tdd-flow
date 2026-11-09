@@ -486,13 +486,17 @@ async function commit(inp) {
     const changed = z('diff', '--name-only', '-z', 'HEAD').filter((p) => p !== STATE);
     const dirs = new Set([...listed, ...changed].map((p) => path.posix.dirname(p)).filter((d) => d !== '.'));
     const untracked = z('ls-files', '--others', '--exclude-standard', '-z').filter((p) => p !== STATE && !listed.includes(p));
-    const near = untracked.filter((p) => dirs.has(path.posix.dirname(p)) && bookkeepingOk(p));
+    // A secret-looking new file (.env.local) is never pulled in: the secret check would block a task that never touched it.
+    const near = untracked.filter((p) => dirs.has(path.posix.dirname(p)) && bookkeepingOk(p) && !SECRET_FILE.test(p));
     changes.extraStaged = [...changed.filter((p) => !listed.includes(p)), ...near];
     changes.unstaged = untracked.filter((p) => !near.includes(p));
   }
   const stage = [...listed, ...(changes.extraStaged || [])];
-  if (stage.length) {
-    const a = git('add', '--', ...stage);
+  // A deletion that is already staged (`git rm`) has no file and no index entry left: `git add` would reject the
+  // path, while the diff and the commit below still take it.
+  const addable = stage.filter((p) => fs.existsSync(p) || git('ls-files', '--error-unmatch', '--', p).code === 0);
+  if (addable.length) {
+    const a = git('add', '--', ...addable);
     if (a.code !== 0) return { committed: false, ticked, reason: `git add failed: ${a.err}` };
   }
   const staged = stage.length ? gitOut('diff', '--cached', '--name-only', '--no-renames', '--', ...stage).split('\n').filter(Boolean) : [];
