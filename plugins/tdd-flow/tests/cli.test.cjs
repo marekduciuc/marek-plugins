@@ -394,6 +394,17 @@ test('board without slugs reports that nothing ran yet', () => {
   assert.match(run(dir, 'board', {}).error, /no specs to show/);
 });
 
+test('board without slugs leaves out done runs whose worktree is gone, but shows them when named', () => {
+  const { dir } = trackedRepo();
+  const env = fakeClaude([]);
+  run(dir, 'run-report', { slug: '22-old', status: 'done', prUrl: 'https://github.com/o/r/pull/22' });
+  run(dir, 'run-report', { slug: '23-blocked', status: 'blocked', details: 'red baseline' });
+  run(dir, 'run-report', { slug: '12-csv', status: 'done', prUrl: 'https://github.com/o/r/pull/7' });
+  run(dir, 'worktree', { slug: '12-csv' });
+  assert.deepStrictEqual(run(dir, 'board', {}, env).result.rows.map((r) => [r.slug, r.status]), [['12-csv', 'done'], ['23-blocked', 'blocked']]);
+  assert.deepStrictEqual(run(dir, 'board', { slugs: ['22-old'] }, env).result.rows.map((r) => [r.slug, r.status]), [['22-old', 'done']]);
+});
+
 test('runs-wait returns when a running spec ticks a task, with a baseline from the first poll for unknown slugs', () => {
   const { dir } = trackedRepo();
   const env = fakeClaude([{ id: 's-1', kind: 'background', name: 'csv-export-flow', state: 'working' }]);

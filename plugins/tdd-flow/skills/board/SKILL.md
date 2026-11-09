@@ -6,7 +6,7 @@ argument-hint: "[slug ...]"
 
 # Board: status of the autopilot specs
 
-Input: $ARGUMENTS - optional feature slugs (default: every spec with a worktree in `.claude/worktrees/` or a recorded autopilot run).
+Input: $ARGUMENTS - optional feature slugs (default: every spec with a worktree in `.claude/worktrees/`, or a recorded autopilot run that is not done).
 
 Read-only: this starts, stops and changes nothing.
 
