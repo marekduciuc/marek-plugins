@@ -378,6 +378,12 @@ function branch(inp) {
   return { branch: name };
 }
 
+/** True when HEAD's subject is the first line of `message` (HEAD only, never older commits). */
+const isHeadSubject = (message) => {
+  const subject = String(message || '').split('\n')[0].trim();
+  return !!subject && gitOut('log', '-1', '--format=%s') === subject;
+};
+
 function block(inp) {
   const st = readJSON(STATE) || {};
   writeJSON(STATE, { ...st, phase: 'IDLE', task: inp.task });
@@ -385,6 +391,8 @@ function block(inp) {
   fs.mkdirSync(inp.dir, { recursive: true });
   fs.appendFileSync(log, `\n## ${inp.task} - BLOCKED at ${inp.step}\n${inp.details}\n`);
   let unticked = false;
+  // The task commit may have gone through although its result was lost: then the tick stays.
+  if (inp.untick && isHeadSubject(inp.commitMessage)) return { logged: true, unticked, alreadyCommitted: true };
   if (inp.untick) {
     const f = `${inp.dir}/tasks.md`;
     const md = read(f);
@@ -476,7 +484,11 @@ async function commit(inp) {
     .filter((p) => !staged.includes(p) && !stage.includes(p));
   // An ignored .tdd-flow/ is never staged: the spec status then lives only in the file, which is still reported.
   const status = { ...(specStatus ? { specStatus } : {}), ...(specStatusSkipped ? { specStatusSkipped } : {}) };
-  if (!staged.length) return { committed: false, nothingToCommit: true, ticked, unexpected, ...status };
+  if (!staged.length) {
+    // A rerun after a commit whose result got lost: HEAD is that commit, so report it instead of nothing.
+    const already = isHeadSubject(inp.message) ? { already: true, sha: gitOut('rev-parse', '--short', 'HEAD') } : {};
+    return { committed: false, nothingToCommit: true, ticked, unexpected, ...status, ...already };
+  }
   const bad = riskyStaged(staged);
   if (bad.length) {
     const own = bad.map((b) => b.path).filter((p) => staged.includes(p));

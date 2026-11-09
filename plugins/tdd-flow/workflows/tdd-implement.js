@@ -121,16 +121,17 @@ const REFAC = {
   },
 }
 const BRANCH = { type: 'object', required: ['branch'], properties: { branch: str } }
-const COMMIT = { type: 'object', required: ['committed'], properties: { committed: { type: 'boolean' }, nothingToCommit: { type: 'boolean' }, ticked: { type: 'boolean' }, specStatus: str, specStatusSkipped: str, sha: str, reason: str, unexpected: strs } }
+const COMMIT = { type: 'object', required: ['committed'], properties: { committed: { type: 'boolean' }, nothingToCommit: { type: 'boolean' }, ticked: { type: 'boolean' }, specStatus: str, specStatusSkipped: str, sha: str, reason: str, unexpected: strs, already: { type: 'boolean' } } }
 const SUITE = { type: 'object', required: ['ran', 'pass'], properties: { ran: { type: 'boolean' }, pass: { type: 'boolean' }, command: str, cached: { type: 'boolean' }, summary: str } }
-const BLOCK = { type: 'object', required: ['logged'], properties: { logged: { type: 'boolean' }, unticked: { type: 'boolean' } } }
+const BLOCK = { type: 'object', required: ['logged'], properties: { logged: { type: 'boolean' }, unticked: { type: 'boolean' }, alreadyCommitted: { type: 'boolean' } } }
 
 // Deterministic steps run in the plugin's CLI (bin/tdd-flow) through the script-runner agent (haiku, Bash only)
 // instead of a reasoning agent. Returns {ok, result} or {ok: false, error, fallback}. Identical in every workflow
 // (scripts cannot import; tests/cli.test.cjs checks the copies match).
 // The relay agent retypes the JSON and can drop array items: the CLI prints `shape` (sizes of the result's arrays),
 // cli() recomputes it over the schema's paths, plus an optional o.check(result) -> problem, and on a mismatch has the
-// worker model relay the saved output again (`tdd-flow replay`, the command does not run twice).
+// worker model relay the saved output again (`tdd-flow replay`, the command does not run twice). A relay that still
+// fails returns `relayFailed: true`: the command may have run, so the caller must not treat it as a CLI error.
 const cliSchema = (schema) => ({ type: 'object', required: ['ok', 'shape'], properties: {
   ok: { type: 'boolean' }, shape: str, error: str, fallback: { type: 'boolean' }, again: { type: 'boolean' }, result: schema } })
 function shapeOf(v, p = '', out = []) {
@@ -145,6 +146,7 @@ function shapeOf(v, p = '', out = []) {
 const inSchema = (schema, p) => !!p.split('.').reduce((s, seg) => s && (/^\d+$/.test(seg) ? s.items : s.properties && s.properties[seg]), schema)
 function relayProblem(r, schema, check) {
   if (typeof r.shape !== 'string') return 'no shape in the relayed output'
+  if (r.ok && (!r.result || typeof r.result !== 'object')) return 'no result in the relayed output'
   const pick = (entries) => entries.filter(e => inSchema(schema, e.slice(0, e.lastIndexOf('='))))
   const want = pick(r.shape.split(' ').filter(Boolean)), got = pick(shapeOf(r.result || {}))
   const missing = want.filter(e => !got.includes(e)), extra = got.filter(e => !want.includes(e))
@@ -161,15 +163,15 @@ async function cli(cmd, input, schema, o = {}) {
     { agentType: A('script-runner'), model, effort: 'low', schema: cliSchema(schema), label: lbl, phase: o.phase, ...(o.stallMs ? { stallMs: o.stallMs } : {}) },
     o.final)
   let r = await relay(cmd, { ...input, _relay: id }, o.model || M.light, label)
-  if (!r) return { ok: false, error: 'script-runner agent failed' }
+  if (!r) return { ok: false, relayFailed: true, error: 'script-runner agent failed' }
   let problem = relayProblem(r, schema, o.check)
   if (problem) {
     log(`${label}: ${problem} - relaying the saved output again on ${M.worker}`)
     r = await relay('replay', { id }, M.worker, `${label} (relay retry)`)
     problem = r ? relayProblem(r, schema, o.check) : 'script-runner agent failed'
-    if (problem) return { ok: false, error: `the output of tdd-flow ${cmd} was not relayed completely: ${problem}` }
+    if (problem) return { ok: false, relayFailed: true, error: `the output of tdd-flow ${cmd} was not relayed completely: ${problem}` }
   }
-  return r.ok && !r.result ? { ok: false, error: 'the command returned no result' } : r
+  return r
 }
 
 // ---------- Plan ----------
@@ -249,8 +251,9 @@ if (!tasks.length) {
 log(`${tasks.length} task(s) to implement on ${br.branch}`)
 
 // ---------- helpers ----------
-async function blocked(task, step, details, untick = false, next = '') {
-  const rec = await cli('block', { dir, task: task.id, step, details, untick }, BLOCK, { label: 'record-block', phase: 'Review', final: true })
+// commitMessage: with untick, the CLI keeps the tick when HEAD already is that commit (its result was lost in the relay).
+async function blocked(task, step, details, untick = false, next = '', commitMessage = '') {
+  const rec = await cli('block', { dir, task: task.id, step, details, untick, commitMessage }, BLOCK, { label: 'record-block', phase: 'Review', final: true })
   if (!rec.ok) log(`record-block failed: ${rec.error}`)
   return { status: 'blocked', slug: plan.slug, task: task.id, step, details,
     escalationsToStrongModel: escalations, unverified: [...unverified.values()],
@@ -652,15 +655,22 @@ try {
     const type = task.id === 'FIX' ? 'fix' : isSetup || skipReason ? 'chore' : isRefactor ? 'refactor' : 'feat'
     // The CLI ticks the task line (T-1 never matches T-10), writes state.json, stages only these files, refuses
     // secrets and files over 5 MB, and commits. It never pushes.
-    const committed = await cli('commit', {
-      message: skipReason ? `chore(${plan.slug}): ${task.id} skipped - ${skipReason.split('\n')[0].slice(0, 100)}` : `${type}(${plan.slug}): ${task.id} ${task.title}`,
-      files: commitFiles, state, includeDeletions: isRefactor && !skipReason,
+    const message = skipReason ? `chore(${plan.slug}): ${task.id} skipped - ${skipReason.split('\n')[0].slice(0, 100)}` : `${type}(${plan.slug}): ${task.id} ${task.title}`
+    const commitInput = {
+      message, files: commitFiles, state, includeDeletions: isRefactor && !skipReason,
       tick: needsTick ? { file: `${dir}/tasks.md`, task: task.id } : null,
       specStatus: finishesSpec ? { file: `${dir}/spec.md`, value: 'implemented' } : null,
-    }, COMMIT, { label: `${task.id} commit`, phase: 'Review' })
+    }
+    let committed = await cli('commit', commitInput, COMMIT, { label: `${task.id} commit`, phase: 'Review' })
+    // A lost relay says nothing about the commit: run it once more. A rerun after a commit that went through
+    // stages nothing and reports that commit (`already`), so it never commits twice.
+    if (committed.relayFailed) {
+      log(`${task.id} commit: ${committed.error} - running the commit once more`)
+      committed = await cli('commit', commitInput, COMMIT, { label: `${task.id} commit (retry)`, phase: 'Review' })
+    }
     const commit = committed.ok ? committed.result : null
     if (!commit || (!commit.committed && !commit.nothingToCommit)) {
-      return await blocked(task, 'COMMIT', commit ? commit.reason || 'commit failed' : committed.error, needsTick)
+      return await blocked(task, 'COMMIT', commit ? commit.reason || 'commit failed' : committed.error, needsTick, '', message)
     }
     if (needsTick && !commit.ticked) {
       return await blocked(task, 'TICK', `${task.id} was committed (${commit.sha || 'no sha'}), but its checkbox in ${dir}/tasks.md was not ticked.`, false,

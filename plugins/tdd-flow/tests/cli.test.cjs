@@ -695,3 +695,66 @@ test('commit with includeDeletions also commits tracked files the agent did not 
   assert.strictEqual(r.result.committed, true);
   assert.strictEqual(g('status', '--porcelain').toString(), '');
 });
+
+/** The shared cli() helper of a workflow, run against scripted script-runner replies (null = agent failed). */
+function cliWithReplies(replies) {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'workflows', 'tdd-implement.js'), 'utf8');
+  const block = src.match(/\/\/ Deterministic steps[\s\S]*?\nasync function cli\([\s\S]*?\n}\n/)[0];
+  const labels = [];
+  const fakeRun = async (prompt, opts) => { labels.push(opts.label); return replies.shift(); };
+  const cli = new Function('str', 'run', 'log', 'A', 'M', `${block}\nreturn cli;`)({ type: 'string' }, fakeRun, () => {}, (n) => n, { light: 'haiku', worker: 'sonnet' });
+  return { cli, labels };
+}
+const COMMIT_SCHEMA = { type: 'object', properties: { committed: { type: 'boolean' }, unexpected: { type: 'array' } } };
+
+test('cli() relays the saved output again when the relay drops the result', async () => {
+  const { cli, labels } = cliWithReplies([{ ok: true, shape: '' }, { ok: true, shape: '', result: { committed: true } }]);
+  const r = await cli('commit', {}, COMMIT_SCHEMA, { label: 'T-2 commit' });
+  assert.strictEqual(r.ok, true);
+  assert.strictEqual(r.result.committed, true);
+  assert.deepStrictEqual(labels, ['T-2 commit', 'T-2 commit (relay retry)']);
+});
+
+test('cli() marks a relay that never brings the result as relayFailed, but not an error the CLI reported', async () => {
+  const dropped = await cliWithReplies([{ ok: true, shape: '' }, { ok: true, shape: '' }]).cli('commit', {}, COMMIT_SCHEMA);
+  assert.strictEqual(dropped.ok, false);
+  assert.strictEqual(dropped.relayFailed, true);
+  const agentDied = await cliWithReplies([null]).cli('commit', {}, COMMIT_SCHEMA);
+  assert.strictEqual(agentDied.relayFailed, true);
+  const cliError = await cliWithReplies([{ ok: false, shape: '', error: 'git commit failed' }]).cli('commit', {}, COMMIT_SCHEMA);
+  assert.strictEqual(cliError.ok, false);
+  assert.strictEqual(cliError.relayFailed, undefined);
+});
+
+test('commit run again after it went through reports the existing commit and keeps the tick', () => {
+  const { dir, g, write } = repo();
+  g('switch', '-q', '-c', 'feature/12-csv');
+  write('a.js', 'x\n');
+  const input = { message: 'feat(12-csv): T-2 Export header\n\nbody', files: ['a.js'], tick: { file: '.tdd-flow/features/12-csv/tasks.md', task: 'T-2' } };
+  const first = run(dir, 'commit', input);
+  assert.strictEqual(first.result.committed, true);
+  const again = run(dir, 'commit', input);
+  assert.strictEqual(again.result.nothingToCommit, true);
+  assert.strictEqual(again.result.ticked, true);
+  assert.strictEqual(again.result.already, true);
+  assert.strictEqual(again.result.sha, first.result.sha);
+  write('b.js', 'y\n');
+  g('add', 'b.js');
+  g('commit', '-qm', 'other');
+  assert.strictEqual(run(dir, 'commit', input).result.already, undefined, 'only HEAD counts, not an older commit');
+});
+
+test('block keeps the tick when the task commit is already HEAD', () => {
+  const { dir, g, read, write } = repo();
+  g('switch', '-q', '-c', 'feature/12-csv');
+  write('a.js', 'x\n');
+  g('add', 'a.js');
+  g('commit', '-qm', 'feat(12-csv): T-2 Export header');
+  write('.tdd-flow/features/12-csv/tasks.md', TASKS.replace('[ ] T-2', '[x] T-2'));
+  const inp = { dir: '.tdd-flow/features/12-csv', task: 'T-2', step: 'COMMIT', details: 'relay failed', untick: true };
+  const kept = run(dir, 'block', { ...inp, commitMessage: 'feat(12-csv): T-2 Export header' });
+  assert.deepStrictEqual(kept.result, { logged: true, unticked: false, alreadyCommitted: true });
+  assert.match(read('.tdd-flow/features/12-csv/tasks.md'), /\[x\] T-2/);
+  const other = run(dir, 'block', { ...inp, commitMessage: 'feat(12-csv): T-3 Something else' });
+  assert.deepStrictEqual(other.result, { logged: true, unticked: true });
+});
