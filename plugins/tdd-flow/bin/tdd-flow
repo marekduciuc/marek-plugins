@@ -119,8 +119,8 @@ function testsNeed(txt, field) {
 }
 
 /** Fields of .tdd-flow/stack.md (see agents/stack-detector.md), or null if the file is missing. */
-function readStack(root = '.') {
-  const txt = read(path.join(root, '.tdd-flow', 'stack.md'));
+function readStack() {
+  const txt = read('.tdd-flow/stack.md');
   if (txt == null) return null;
   const get = (label, command) => {
     const m = txt.match(new RegExp(`^[ \\t]*[-*]?[ \\t]*${esc(label)}[ \\t]*:[ \\t]*(.*)$`, 'mi'));
@@ -171,8 +171,7 @@ function compact(out, passed) {
 // suite the implementer just ran, the commit's runTests). Key: the command, the directory it runs in and a tree hash
 // of the working tree (tracked + untracked, not ignored; .tdd-flow/ left out, agents write their logs there).
 // Gitignored inputs (node_modules, .env, build output) and outside state are not in the key; TDD_FLOW_TEST_CACHE=off
-// turns it off. Off in repos with submodules: edits inside a submodule do not change the tree hash. Off when stack.md
-// says the tests need Docker or a database (`tests need:`): a pass there also depends on state outside the tree.
+// turns it off. Off in repos with submodules: edits inside a submodule do not change the tree hash.
 const TEST_CACHE_ENTRIES = 20;
 const testCacheOff = () => /^(0|off|false|no)$/i.test(process.env.TDD_FLOW_TEST_CACHE || '');
 
@@ -199,8 +198,6 @@ function testCache(cmd) {
   if (testCacheOff()) return null;
   const top = gitOut('rev-parse', '--show-toplevel');
   if (!top || fs.existsSync(path.join(top, '.gitmodules'))) return null;
-  const stack = readStack(top); // from the root: `tdd-flow test -- <cmd>` runs in the caller's directory
-  if (stack && stack.testsNeed !== 'none') return null;
   const file = path.resolve(gitOut('rev-parse', '--git-path', 'tdd-flow-test-cache'));
   const prefix = gitOut('rev-parse', '--show-prefix');
   const key = () => {
@@ -984,7 +981,7 @@ async function autopilotCheck(inp) {
   if (outside) {
     const how = stack.testsNeedInferred ? ' (inferred from the test lines of .tdd-flow/stack.md)' : '';
     checks.push({
-      name: 'tests need', status: 'warn', details: `${need}${how}: parallel sessions share it, and the test cache is off`,
+      name: 'tests need', status: 'warn', details: `${need}${how}: parallel sessions share it`,
       ...(stack.testsNeedInferred ? { fix: 'add a `tests need:` line to .tdd-flow/stack.md (`none` if they need nothing)' } : {}),
     });
   }

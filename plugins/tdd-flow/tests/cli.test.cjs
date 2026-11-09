@@ -8,7 +8,7 @@ const path = require('path');
 const { execFileSync, spawnSync } = require('child_process');
 
 const CLI = path.join(__dirname, '..', 'bin', 'tdd-flow');
-const { parseSpec, parseTasks, parseTaskTable, compact, kebab, onMergeSummary, setSpecStatus, shapeOf, readStack } = require(CLI);
+const { parseSpec, parseTasks, parseTaskTable, compact, kebab, onMergeSummary, setSpecStatus, shapeOf } = require(CLI);
 
 const SPEC = `- Source: https://github.com/o/r/issues/12
 - Slug: 12-csv
@@ -880,27 +880,6 @@ test('commit with stageChanged commits a staged deletion and leaves a new secret
   assert.deepStrictEqual(r.result.unstaged, ['src/.env.local']);
 });
 
-test('readStack: tests need from the field, else inferred from the test lines only', () => {
-  const { dir, write } = repo();
-  const stack = (txt) => { write('.tdd-flow/stack.md', txt); return readStack(dir); };
-  assert.deepStrictEqual([stack('tests need: docker (Testcontainers)\n').testsNeed, stack('tests need: docker (Testcontainers)\n').testsNeedInferred], ['docker (Testcontainers)', false]);
-  assert.strictEqual(stack('tests need: none\ntest command (all): ./mvnw verify\n  note: needs Docker\n').testsNeed, 'none');
-  const old = stack('test command (all): ./mvnw verify\n  note: ITs use Testcontainers, need Docker\nbuild command: npm run build\n');
-  assert.deepStrictEqual([old.testsNeed, old.testsNeedInferred], ['docker', true]);
-  assert.strictEqual(stack('test command (all): npm test\nbuild command: docker build .\nci system: GitHub Actions builds a docker image\n').testsNeed, 'none');
-});
-
-test('test cache is off when stack.md says the tests need Docker', () => {
-  const { dir, write } = repo();
-  const t = () => spawnSync(process.execPath, [CLI, 'test'], { cwd: dir, encoding: 'utf8' }).stdout;
-  write('.tdd-flow/stack.md', 'test command (all): `node -e 0`\ntests need: docker (Testcontainers)\n');
-  t();
-  assert.match(t(), /^PASS \(exit 0\)/);
-  write('.tdd-flow/stack.md', 'test command (all): `node -e 0`\ntests need: none\n');
-  t();
-  assert.match(t(), /^PASS \(cached/);
-});
-
 /** Executable `name` in a temp dir running the given shell body. */
 function fakeBin(name, body) {
   const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), `tdd-flow-${name}-`)), name);
@@ -916,6 +895,19 @@ function autopilotCheck(dir, input, { settings, version = '2.1.200', env = {} } 
   return { ...r.result, check: (name) => r.result.checks.find((c) => c.name === name) };
 }
 const SESSION_ALLOW = ['Workflow', 'Bash(tdd-flow:*)', 'Bash(git *)', 'Bash(gh pr:*)', 'Edit'];
+
+test('autopilot-check: tests need from the stack.md field, else inferred from its test lines only', () => {
+  const { dir, write } = repo();
+  const need = (txt) => {
+    write('.tdd-flow/stack.md', txt);
+    const r = autopilotCheck(dir, { runnable: 1 }, { settings: { permissions: { defaultMode: 'auto' } }, env: { TDD_FLOW_DOCKER_BIN: fakeBin('docker', 'exit 0') } });
+    return [r.testsNeed, /inferred/.test((r.check('tests need') || {}).details || '')];
+  };
+  assert.deepStrictEqual(need('tests need: docker (Testcontainers)\n'), ['docker (Testcontainers)', false]);
+  assert.deepStrictEqual(need('tests need: none\ntest command (all): ./mvnw verify\n  note: needs Docker\n'), ['none', false]);
+  assert.deepStrictEqual(need('test command (all): ./mvnw verify\n  note: ITs use Testcontainers, need Docker\nbuild command: npm run build\n'), ['docker', true]);
+  assert.deepStrictEqual(need('test command (all): npm test\nbuild command: docker build .\nci system: GitHub Actions builds a docker image\n'), ['none', false]);
+});
 
 test('autopilot-check: gh login is required', () => {
   const { dir } = trackedRepo();
@@ -953,7 +945,7 @@ test('autopilot-check: tests that need Docker check the engine and run one spec 
   const opts = (code) => ({ settings: { permissions: { defaultMode: 'auto' } }, env: { TDD_FLOW_DOCKER_BIN: fakeBin('docker', `exit ${code}`) } });
   const up = autopilotCheck(dir, { runnable: 1 }, opts(0));
   assert.deepStrictEqual([up.ok, up.parallel, up.testsNeed, up.check('docker').status], [true, 1, 'docker (Testcontainers)', 'ok']);
-  assert.match(up.check('tests need').details, /test cache is off/);
+  assert.match(up.check('tests need').details, /parallel sessions share it/);
   assert.match(up.check('parallel').details, /^1 at a time, because the tests need docker/);
   const down = autopilotCheck(dir, { runnable: 1 }, opts(1));
   assert.deepStrictEqual([down.ok, down.check('docker').status], [false, 'fail']);
