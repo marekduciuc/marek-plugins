@@ -6,7 +6,7 @@ export const meta = {
     { title: 'Context', detail: 'detect stack, fetch requirement' },
     { title: 'Draft', detail: '3 analysts from different angles' },
     { title: 'Synthesize', detail: 'merge drafts into spec.md + tasks.md' },
-    { title: 'Critique', detail: 'testability and completeness critics, then revise' },
+    { title: 'Critique', detail: 'testability, completeness and existing-tests critics, then revise' },
   ],
 }
 
@@ -214,18 +214,28 @@ try {
   const CRITICS = [
     { key: 'testability', ask: 'Check every AC: is it unambiguous, observable, and automatable with the repo\'s test framework? Flag vague words ("fast", "user-friendly"), hidden multiple behaviours in one AC, and tasks too big for a few red-green cycles. Setup tasks ([setup] in tasks.md) are checked by verify commands instead of tests: flag a setup criterion without a Verify line or with a command that cannot tell pass from fail, and flag a setup task that contains logic a test could check (it must be a tdd task).' },
     { key: 'completeness', ask: 'Compare the spec against the RAW requirement below. Flag anything required but missing, anything in the spec NOT supported by the requirement (invented scope), and edge cases a careful engineer would expect.' },
+    {
+      key: 'existing-tests',
+      ask: `Stack: ${stack.language}; tests via \`${stack.testAll}\`. For every AC or task that changes, renames or removes something an existing test can observe (visible text, a glyph, markup, an attribute, a class name, a route, an API field, an error message, a behaviour), search the existing test files (git grep) for assertions on the OLD value. ` +
+        'Report a hit only when the test asserts the old value on the same element, component, endpoint or function the AC changes, not every file that contains the word. ' +
+        'A hit is a blocker unless the spec keeps the old value or already names that test (file:line) as one to update. Give where = the test file:line, problem = the assertion and the AC that changes it, fix = name the test in the AC and its task, or ask which wins when a criterion says existing tests stay unchanged.',
+    },
   ]
   const crits = (await parallel(CRITICS.map(c => () => run(
     `You are a skeptical reviewer of ${dir}/spec.md. ${c.ask}\nOnly report real problems; do not edit files.\n\nRaw requirement:\n"""${req.text}"""`,
     { schema: CRIT, model: M.worker, label: `critic:${c.key}`, phase: 'Critique', agentType: A('code-reviewer') },
-  )))).filter(Boolean)
+  )))).map((c, i) => c && { ...c, key: CRITICS[i].key }).filter(Boolean)
   if (limitHit) throw new Error(LIMIT)
   const serious = crits.flatMap(c => c.issues).filter(i => i.severity !== 'minor')
   const minor = crits.flatMap(c => c.issues).filter(i => i.severity === 'minor')
+  // Existing tests that assert what the spec changes: shown at the approval gate, since revise runs only once.
+  const testHits = crits.filter(c => c.key === 'existing-tests').flatMap(c => c.issues).filter(i => i.severity !== 'minor')
+  if (testHits.length) log(`Existing tests assert what the spec changes: ${testHits.map(i => i.where).join(', ')}`)
   if (serious.length) {
     log(`Critics raised ${serious.length} blocker/major issue(s) - revising the spec`)
     const revised = await run(
       `Revise ${dir}/spec.md and ${dir}/tasks.md to fix these review issues. Where an issue needs information only the user has, add it to Open questions with your assumption instead of guessing.\n` +
+      'An existing test that asserts what the spec changes: if no criterion says existing tests stay unchanged, name the test (file:line) and its new assertion in the AC and in the task that makes the change, so the test-writer updates it in RED. If a criterion says they stay unchanged, the spec contradicts itself: add an Open question (which wins), with your assumption; do not resolve it silently.\n' +
       JSON.stringify(serious, null, 1),
       { agentType: A('requirements-analyst'), model: M.strong, schema: SPEC, label: 'revise', phase: 'Critique' })
     if (revised) spec = revised
@@ -245,7 +255,8 @@ try {
     openQuestions: spec.openQuestions,
     assumptions: spec.assumptions || [],
     critiqueFixesApplied: serious.length,
-    next: 'GATE: show the user the spec summary. Print the open questions in chat as a numbered list, then ask them one at a time and update spec.md after each answer (/tdd-flow:resolve-questions <slug>). After they approve, set "Status: approved" in spec.md, then run /tdd-flow:tdd-implement.',
+    existingTestsChanged: testHits.map(i => `${i.where}: ${i.problem}`),
+    next: 'GATE: show the user the spec summary, including existingTestsChanged (existing tests the spec changes). Print the open questions in chat as a numbered list, then ask them one at a time and update spec.md after each answer (/tdd-flow:resolve-questions <slug>). After they approve, set "Status: approved" in spec.md, then run /tdd-flow:tdd-implement.',
   }
 } catch (e) {
   if (!limitHit) throw e

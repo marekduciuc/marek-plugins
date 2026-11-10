@@ -90,6 +90,12 @@ Seen: `npm ci` left the shell in `apps/web`, T-1 started from the wrong director
 - **sync-base on #34 (0.17.0) worked as designed**: a conflict in `testreport.md`, not a generated file, aborted the merge and blocked the spec with nothing pushed. The cause was in symple-crm: `testreport.md` was tracked although `.gitignore` lists it, so every PR rewrote it (untracked in symple-crm #95).
 - **Worktrees started from a stale local base.** The next autopilot run branched spec 69 from local `main`, 2 commits behind `origin/main`. Fix (0.18.0): the pre-flight check `base` fetches and fails when the local base is behind or diverged; the user pulls. Rejected: branching from `origin/<base>` (silent, the base-suite check would test other code, local-only specs would be missing).
 
+## Findings from pojistneudalosti v1-3 (10.11.2026, fixed in 0.19.0)
+
+- **Two decisions during implementation (Q-15, Q-16).** The spec removed the `⚠` glyph (AC-8, AC-15) and said existing tests stay unchanged (AC-19), while three existing tests asserted `⚠`. The analysis ran on the right base (v1-2 merged); no critic compared the criteria with existing test assertions. Fix: a third critic `existing-tests`; revise names the test to update in the AC and task, or adds an Open question when a criterion forbids test edits. The test-writer updates exactly the named assertion in RED. The hits are returned as `existingTestsChanged` for the approval gate.
+- **An answer left a Verify command stale.** The AC-19 allow-list of changed tests did not get the Q-15/Q-16 files, so T-17 failed. Fix: resolve-questions and the autopilot's Decisions step update Verify commands too.
+- **The full suite was only the backend.** `test command (all)` skipped the frontend (`-Dskip.npm`), with the frontend command on a separate line nothing reads, so T-13 committed a red frontend test. Fixed in pojistneudalosti #8; the stack-detector and the implementer's SETUP step now put every suite into `test command (all)`.
+
 ## Later: move global rules into the plugin
 
 So users don't need your `~/.claude/rules`: Shell (no bare `cd`), Questions (in chat, one at a time), Git state reporting (commit check, block check, PR only after `gh pr create` returned a URL). How a plugin ships rules is to be checked in the Claude Code docs first.
