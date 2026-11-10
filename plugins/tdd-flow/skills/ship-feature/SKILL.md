@@ -31,6 +31,7 @@ Any workflow can return `agent_limit` (its per-run agent cap was reached). Tell 
 
 1. **Analyze.** Run step 1.
    **GATE 1 - spec approval.** Show: goal, acceptance criteria (ID + one line each), tasks with their kind (`tdd` or `[setup]`) and, for setup tasks, the verify commands. Point out any setup task that looks like it contains testable logic.
+   - If the result has `stateKept`, show it: `state.json` still names another feature that is not done, so pass `{feature: "<slug>"}` explicitly from here on (this skill always does).
    - Open questions: print them in chat as a numbered list with their assumptions, then go through them one at a time as the `resolve-questions` skill describes (`/tdd-flow:resolve-questions <slug>`): ask one, wait for the answer, update `spec.md` and `tasks.md`, then ask the next one. Never leave a question only in the spec file or in a dialog.
    - Then ask the user to approve or change the spec, in chat as plain text. Apply their edits to `spec.md` directly. When approved, set `Status: approved` in the spec.
 2. **Implement.** Run step 2.

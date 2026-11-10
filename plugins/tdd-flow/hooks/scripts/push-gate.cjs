@@ -3,6 +3,7 @@
 // repo's type check, lint and tests, and scan the unpushed commits for secrets with gitleaks.
 // Exit 2 blocks the command and feeds stderr back to Claude. See plugins/tdd-flow/README.md "push-gate".
 const { execSync, spawn } = require('child_process');
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
@@ -110,9 +111,9 @@ function detectChecks(root, hasCmd) {
   if (stackTypeCheck && !(stackTest || '').includes(stackTypeCheck)) {
     const i = checks.findIndex((c) => c.name.startsWith('typecheck'));
     if (i >= 0) checks.splice(i, 1);
-    checks.unshift({ name: 'type check (.tdd-flow/stack.md)', cmd: stackTypeCheck });
+    checks.unshift({ name: 'type check (.tdd-flow/stack.md)', cmd: stackTypeCheck, fromProfile: true });
   }
-  if (stackTest) checks.push({ name: 'tests (.tdd-flow/stack.md)', cmd: stackTest });
+  if (stackTest) checks.push({ name: 'tests (.tdd-flow/stack.md)', cmd: stackTest, fromProfile: true });
   else if (test) checks.push({ name: 'tests', ...test });
   return checks;
 }
@@ -178,11 +179,15 @@ async function main(input, env = process.env) {
     const docsOnly = changed !== null && changed.length > 0 && changed.every((p) => DOC_RE.test(p));
     const head = git('git rev-parse HEAD', root);
     const cacheFile = path.resolve(root, git('git rev-parse --git-path tdd-flow-push-gate', root) || '.git/tdd-flow-push-gate');
+    const detected = ownGate || docsOnly || (gitPrePush && !onlyGh) ? [] : detectChecks(root, hasCmd);
+    // The cache key is HEAD plus the check commands, so a changed stack.md command reruns the checks for the same commit.
+    const cacheKey = head && detected.length ? `${head} ${crypto.createHash('sha256').update(detected.map((c) => c.cmd).join('\n')).digest('hex').slice(0, 16)}` : '';
     let cached = false;
-    try { cached = !!head && fs.readFileSync(cacheFile, 'utf8').trim() === head; } catch { /* no cache */ }
+    try { cached = !!cacheKey && fs.readFileSync(cacheFile, 'utf8').trim() === cacheKey; } catch { /* no cache */ }
 
-    const checks = ownGate || docsOnly || cached || (gitPrePush && !onlyGh) ? [] : detectChecks(root, hasCmd);
+    const checks = cached ? [] : detected;
     if (checks.length) {
+      let skipped = false;
       const dirty = git(DIRTY_CMD, root);
       if (dirty) return block(`uncommitted changes in ${root}; the checks run on the working tree, so commit or stash them first:\n${dirty}`);
       for (const c of checks) {
@@ -192,12 +197,17 @@ async function main(input, env = process.env) {
         const r = await runCheck(c.cmd, root, left, runEnv);
         if (r.timedOut) return block(`${c.name} (\`${c.cmd}\`) timed out after ${Math.round(left / 1000)} s (shared check budget; a first run may still be filling the dependency cache, retry once).`);
         if (r.code === 0 || (c.pytest && r.code === 5)) continue; // pytest 5 = no tests collected
-        if (r.code === 127 || (c.pytest && /No module named pytest/.test(r.out))) { warnings.push(`${c.name} skipped, tool not found (\`${c.cmd}\`)`); continue; }
+        // The stack profile declares its commands as the repo's checks: one that cannot run must not let the push through.
+        if (r.code === 127 && c.fromProfile) {
+          return block(`${c.name} (\`${c.cmd}\`) exited 127: a command it runs was not found. Install the dependencies (e.g. \`npm ci\`), or make the tool available on the hook's PATH (Claude Code's environment, not your login shell: nvm, pyenv, asdf and sdkman shims may be missing there), then push again:\n${r.out.trim().split('\n').slice(-20).join('\n')}`);
+        }
+        if (r.code === 127 || (c.pytest && /No module named pytest/.test(r.out))) { warnings.push(`${c.name} skipped, tool not found (\`${c.cmd}\`)`); skipped = true; continue; }
         return block(`${c.name} failed (\`${c.cmd}\`, exit ${r.code}). Fix these before pushing:\n${r.out.trim().split('\n').slice(-40).join('\n')}`);
       }
       const after = git(DIRTY_CMD, root);
       if (after) return block(`the checks modified tracked files (a lint --fix or formatter?). Review and commit them, then push again:\n${after}`);
-      if (head) { try { fs.writeFileSync(cacheFile, `${head}\n`); } catch { /* cache is optional */ } }
+      // A skipped check verified nothing, so this commit is not marked as passed.
+      if (cacheKey && !skipped) { try { fs.writeFileSync(cacheFile, `${cacheKey}\n`); } catch { /* cache is optional */ } }
     }
 
     // ---- Secret scan on commits that are on no remote yet ----

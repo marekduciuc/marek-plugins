@@ -236,14 +236,21 @@ try {
   // ---------- PR ----------
   phase('PR')
   let secretScan = pre.secretScan || 'not_github'
+  let scanFailure = ''
   if (secretScan === 'missing' && pre.workflowScope) {
     // secretScan is "missing" only from the CLI preflight (GitHub), so the CLI writes and commits the file.
     const sc = await cli('add-secret-scan', {}, COMMIT, { label: 'add secret scan', phase: 'PR' })
     secretScan = sc.ok && sc.result.committed ? 'added' : 'add_failed'
+    if (secretScan === 'add_failed') {
+      scanFailure = (sc.ok ? sc.result.reason : sc.error) || 'no reason given'
+      log(`adding the secret scan workflow failed: ${scanFailure}`)
+      warnings.push(`The repo has no secret scan in CI, and adding .github/workflows/secret-scan.yml failed: ${scanFailure}. Common causes: a pre-commit hook rejected the commit, or .github/ is git-ignored.`)
+    }
   } else if (secretScan === 'missing') secretScan = 'missing_no_workflow_scope'
   const scanNote = {
     added: ' This PR also adds .github/workflows/secret-scan.yml (gitleaks on the PR\'s commits) in a separate `ci:` commit; say so in the PR body.',
     missing_no_workflow_scope: ' The repo has no secret scan in CI and the gh token lacks the `workflow` scope; list that under risks in the PR body.',
+    add_failed: ` The repo has no secret scan in CI, and adding one failed (${scanFailure}); list that under risks in the PR body.`,
   }[secretScan] || ''
   const pr = await run(
     `Action: prepare-pr. Feature ${pre.slug}, base ${pre.base}, issue ${pre.issueId || 'none'}.${pre.existingPr ? ' A PR already exists (' + pre.existingPr + '): push and update it instead of opening a new one.' : ''}\n` +
@@ -251,7 +258,7 @@ try {
     { agentType: A('release-engineer'), schema: PR, label: 'open PR', phase: 'PR' })
   if (!pr) throw new Error('tdd-flow: opening the PR failed.')
   log(`PR: ${pr.prUrl}`)
-  if (!pre.hasCi) return { status: 'pr_open_no_ci', prUrl: pr.prUrl, next: 'This repo has no CI pipeline, so deployment cannot be automated. Merge manually or add a pipeline.' }
+  if (!pre.hasCi) return { status: 'pr_open_no_ci', prUrl: pr.prUrl, ...(warnings.length ? { warnings } : {}), next: 'This repo has no CI pipeline, so deployment cannot be automated. Merge manually or add a pipeline.' }
 
   // ---------- CI watch + fix loop ----------
   phase('CI')
