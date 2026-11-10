@@ -28,4 +28,4 @@ Show:
 
 On `ok: false`, show the error: it says what to fix (for example, run it from the main checkout).
 
-Do not remove a kept worktree by hand to "finish" the cleanup. Say what the user has to do first, for example commit or delete the uncommitted changes, or close the session with `claude stop <name>`.
+Do not remove a kept worktree by hand to "finish" the cleanup. Say what the user has to do first, for example commit or delete the uncommitted changes, or close the session with `claude stop <id>` (`claude stop` takes only the id, not the name).

@@ -1428,7 +1428,11 @@ function saveRelay(id, text) {
 const REGENERABLE = new Set(['node_modules', 'target', 'build', 'dist', 'out', '.gradle', '.next', '.nuxt', '.turbo', '.cache',
   '.parcel-cache', 'coverage', '__pycache__', '.pytest_cache', '.mypy_cache', '.ruff_cache', '.venv', 'venv', '.tox', 'bin', 'obj', '.DS_Store',
   // IDE / language-server metadata (Eclipse JDT, IntelliJ) and the test report the test runs rewrite.
-  '.classpath', '.project', '.settings', '.factorypath', '.idea', 'testreport.md']);
+  '.classpath', '.project', '.settings', '.factorypath', '.idea', 'testreport.md',
+  // Next.js type stub (next build/dev/typegen) and Playwright output.
+  'next-env.d.ts', 'playwright-report', 'test-results', 'blob-report']);
+// Ignored file suffixes with the same meaning: IntelliJ modules and the incremental tsc cache.
+const REGENERABLE_SUFFIXES = ['.iml', '.tsbuildinfo'];
 const ENDED = ['done', 'stopped'];
 
 /** Registered worktrees as [{path, branch}] from `git worktree list --porcelain` (branch '' when detached). */
@@ -1473,10 +1477,13 @@ function cleanup() {
     const inside = (s) => s.cwd && (realpath(s.cwd) === wt.path || realpath(s.cwd).startsWith(wt.path + path.sep));
     const own = sessions.filter((s) => inside(s) || (run && run.session && (s.id === run.session || s.sessionId === run.session)));
     const active = own.find((s) => !ENDED.includes(s.state));
-    if (active) { keep(`session ${attachRef(sessions, active)} is still open (${active.state || 'unknown state'}) - if its work is done, close it with \`claude stop ${attachRef(sessions, active)}\``); continue; }
-    const precious = exec('git', ['-C', wt.path, 'status', '--porcelain', '--ignored'], undefined, true).out.split('\n')
+    if (active) { keep(`session ${attachRef(sessions, active)} is still open (${active.state || 'unknown state'}) - if its work is done, close it with \`claude stop ${active.id}\``); continue; }
+    // `matching` lists each ignored path; plain --ignored folds a folder of only ignored files into one line.
+    const st = exec('git', ['-C', wt.path, 'status', '--porcelain', '--ignored=matching'], undefined, true);
+    if (st.code !== 0) { keep(`git status failed: ${(st.err || st.out).split('\n')[0]}`); continue; }
+    const precious = st.out.split('\n')
       .filter((l) => l.startsWith('!! ')).map((l) => l.slice(3).replace(/^"|"$/g, '').replace(/\/$/, ''))
-      .filter((p) => p !== STATE && !p.split('/').some((seg) => REGENERABLE.has(seg) || seg.endsWith('.iml')));
+      .filter((p) => p !== STATE && !p.split('/').some((seg) => REGENERABLE.has(seg) || REGENERABLE_SUFFIXES.some((x) => seg.endsWith(x))));
     if (precious.length) { keep(`ignored files would be deleted: ${precious.slice(0, 5).join(', ')}${precious.length > 5 ? ', ...' : ''}`); continue; }
     const du = exec('du', ['-sk', wt.path]);
     const freedMb = du.code === 0 ? Math.round(parseInt(du.out, 10) / 1024) : null;
