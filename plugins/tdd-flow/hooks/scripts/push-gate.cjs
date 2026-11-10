@@ -6,7 +6,7 @@ const { execSync, spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
-const BUDGET_MS = 280000; // all checks together; stays under the 300 s hook timeout, whose kill would let the push through
+const BUDGET_MS = 540000; // all checks together; stays under the 600 s hook timeout in hooks.json, whose kill would let the push through
 const MIN_CHECK_MS = 5000; // less time than this left: block instead of starting a check that cannot finish
 const GIT_PUSH_RE = /\bgit(?:\s+(?:-[Cc]\s+\S+|--[\w-]+(?:=\S+)?))*\s+push\b/;
 const PUSH_RE = new RegExp(`${GIT_PUSH_RE.source}|\\bgh\\s+pr\\s+create\\b`);
@@ -58,15 +58,19 @@ function pushTargets(cmd, cwd) {
   return out;
 }
 
-/** `test command (all)` from .tdd-flow/stack.md, or null when absent/unknown/none. */
-function stackTestCommand(root) {
+const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+/** A command line of .tdd-flow/stack.md (`test command (all)`, `type check command`), or null when absent/unknown/none. */
+function stackField(root, label) {
   let txt;
   try { txt = fs.readFileSync(path.join(root, '.tdd-flow', 'stack.md'), 'utf8'); } catch { return null; }
-  const m = txt.match(/^\s*test command \(all\):[ \t]*(.*)$/mi);
+  const m = txt.match(new RegExp(`^\\s*${esc(label)}:[ \\t]*(.*)$`, 'mi'));
   if (!m) return null;
-  const v = m[1].trim().replace(/^`+|`+$/g, '').trim();
-  return !v || /^(unknown|none|n\/a)\b/i.test(v) ? null : v;
+  const v = m[1].trim();
+  const bt = v.match(/`([^`]+)`/);
+  const cmd = (bt ? bt[1] : v.replace(/^`+|`+$/g, '')).trim();
+  return !cmd || /^(unknown|none|n\/a)\b/i.test(cmd) ? null : cmd;
 }
+const stackTestCommand = (root) => stackField(root, 'test command (all)');
 
 /** Checks for the repo root: [{name, cmd, needs}]. `needs` is a path that must exist first. */
 function detectChecks(root, hasCmd) {
@@ -99,7 +103,15 @@ function detectChecks(root, hasCmd) {
   } else if (fs.readdirSync(root).some((f) => /\.(sln|csproj)$/.test(f))) {
     test = { cmd: 'dotnet test --nologo -v q' };
   }
+  // A stack profile knows the repo better than the root manifests (a monorepo has none): its type check runs
+  // first, unless the test command already contains it, and its test command replaces the detected one.
   const stackTest = stackTestCommand(root);
+  const stackTypeCheck = stackField(root, 'type check command');
+  if (stackTypeCheck && !(stackTest || '').includes(stackTypeCheck)) {
+    const i = checks.findIndex((c) => c.name.startsWith('typecheck'));
+    if (i >= 0) checks.splice(i, 1);
+    checks.unshift({ name: 'type check (.tdd-flow/stack.md)', cmd: stackTypeCheck });
+  }
   if (stackTest) checks.push({ name: 'tests (.tdd-flow/stack.md)', cmd: stackTest });
   else if (test) checks.push({ name: 'tests', ...test });
   return checks;
@@ -211,4 +223,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { main, pushTargets, publishesNothing, detectChecks, stackTestCommand, runCheck };
+module.exports = { main, pushTargets, publishesNothing, detectChecks, stackField, stackTestCommand, runCheck };
