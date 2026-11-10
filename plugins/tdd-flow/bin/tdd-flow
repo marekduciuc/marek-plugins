@@ -385,16 +385,24 @@ async function plan(inp) {
   return res;
 }
 
+/**
+ * Switches to or creates feature/<slug>. Runs once at the start of every tdd-implement run (on the CLI and the
+ * planning-agent path), so it also clears a phase an earlier run left behind (a crash between RED and GREEN would
+ * keep tdd-guard blocking every production edit). Only `phase` changes, and only in an existing state.json.
+ */
 function branch(inp) {
+  const st = readJSON(STATE);
+  const reset = st && st.phase && st.phase !== 'IDLE' ? { phaseReset: String(st.phase) } : {};
+  if (reset.phaseReset) writeJSON(STATE, { ...st, phase: 'IDLE' });
   const base = baseBranch();
   const current = gitOut('branch', '--show-current');
-  if (current && current !== base) return { branch: current };
+  if (current && current !== base) return { branch: current, ...reset };
   const name = `feature/${inp.slug}`;
   const exists = git('rev-parse', '--verify', '--quiet', `refs/heads/${name}`).code === 0 ||
     git('rev-parse', '--verify', '--quiet', `refs/remotes/origin/${name}`).code === 0;
   const r = exists ? git('switch', name) : git('switch', '-c', name);
   if (r.code !== 0) throw new Error(`git switch ${name} failed: ${r.err || r.out}`);
-  return { branch: name };
+  return { branch: name, ...reset };
 }
 
 /** True when HEAD's subject is the first line of `message` (HEAD only, never older commits). */
@@ -545,16 +553,37 @@ function closeOut(inp) {
   return { uncommitted: !!gitOut('status', '--porcelain', '--', '.tdd-flow') };
 }
 
+/**
+ * Writes and commits the gitleaks workflow. A file it wrote is removed again when the commit does not go through, so
+ * the next preflight does not take an uncommitted file for a scan. A leftover of an earlier failed run (untracked,
+ * same content) is committed; any other existing file is left alone.
+ */
 async function addSecretScan() {
-  if (fs.existsSync(SECRET_SCAN_PATH)) return { committed: false, nothingToCommit: true, reason: `${SECRET_SCAN_PATH} already exists` };
+  const tracked = git('ls-files', '--error-unmatch', '--', SECRET_SCAN_PATH).code === 0;
+  const own = !tracked && read(SECRET_SCAN_PATH) === SECRET_SCAN_YML;
+  if (tracked) return { committed: false, nothingToCommit: true, reason: `${SECRET_SCAN_PATH} already exists` };
+  if (fs.existsSync(SECRET_SCAN_PATH) && !own) return { committed: false, reason: `${SECRET_SCAN_PATH} exists but is not committed: commit or delete it` };
   fs.mkdirSync(path.dirname(SECRET_SCAN_PATH), { recursive: true });
   fs.writeFileSync(SECRET_SCAN_PATH, SECRET_SCAN_YML);
-  return commit({ message: 'ci: add gitleaks secret scan', files: [SECRET_SCAN_PATH] });
+  let r = null;
+  try {
+    r = await commit({ message: 'ci: add gitleaks secret scan', files: [SECRET_SCAN_PATH] });
+    // Nothing staged although the file is new: .github/ is git-ignored.
+    if (!r.committed && !r.reason) r = { ...r, reason: `${SECRET_SCAN_PATH} was not staged (is .github/ git-ignored?)` };
+    return r;
+  } finally {
+    if (!(r && r.committed) && git('cat-file', '-e', `HEAD:${SECRET_SCAN_PATH}`).code !== 0) {
+      git('reset', '-q', '--', SECRET_SCAN_PATH);
+      fs.rmSync(SECRET_SCAN_PATH, { force: true });
+    }
+  }
 }
 
 function workflowFiles() {
   try { return fs.readdirSync('.github/workflows').filter((f) => /\.ya?ml$/i.test(f)).map((f) => path.join('.github/workflows', f)); } catch { return []; }
 }
+/** The workflow files git tracks: an uncommitted file does not run in CI. */
+const trackedWorkflowFiles = () => { const t = new Set(gitOut('ls-files', '--', '.github/workflows').split('\n')); return workflowFiles().filter((f) => t.has(f)); };
 
 /** One line on which GitHub Actions workflows run on a push to `base` (heuristic over the `on:` blocks). */
 function onMergeSummary(base) {
@@ -603,7 +632,7 @@ function preflight(inp) {
   if (issue) res.issueId = issue[1];
   if (!none(stack.testAll)) res.testAll = stack.testAll;
   if (!none(stack.testSingle)) res.testSingle = stack.testSingle;
-  if (wf.some((f) => /gitleaks|trufflehog|detect-secrets|secret-scan/i.test(read(f) || ''))) res.secretScan = 'present';
+  if (trackedWorkflowFiles().some((f) => /gitleaks|trufflehog|detect-secrets|secret-scan/i.test(read(f) || ''))) res.secretScan = 'present';
   const auth = gh('auth', 'status');
   if (auth.code === 127) { res.cliFix = 'Install the GitHub CLI (https://cli.github.com), then run: gh auth login'; return res; }
   if (auth.code !== 0) { res.cliFix = 'gh auth login'; return res; }
@@ -724,6 +753,12 @@ function kebab(s, max = 40) {
 function context(inp) {
   const input = String(inp.input || '').trim();
   const res = { stack: readStack(), kind: 'text' };
+  // The feature state.json points at, for the workflow to decide whether the new spec may take it over.
+  const st = readJSON(STATE);
+  if (st && typeof st.feature === 'string' && SLUG.test(st.feature)) {
+    const spec = read(`${featureDir(st.feature)}/spec.md`);
+    res.state = { feature: st.feature, specStatus: spec == null ? 'missing' : parseSpec(spec).status || 'none' };
+  }
   const ghIssue = input.match(/^#?(\d+)$/) || input.match(/^https?:\/\/github\.com\/[^/]+\/[^/]+\/issues\/(\d+)/i);
   if (ghIssue && (!/^#?\d+$/.test(input) || tracker() === 'github')) {
     res.kind = 'issue';
@@ -1260,8 +1295,10 @@ function taskProgress(slug, root, base) {
 /** Specs with a worktree or a run file, sorted: what `board` shows when no slugs are given. */
 function knownRuns(root) {
   const names = (dir, keep) => { try { return fs.readdirSync(dir).filter(keep); } catch { return []; } };
+  // One entry that cannot be read (a dangling symlink, a worktree removed during the scan) must not hide the others.
+  const isDir = (p) => { try { return fs.statSync(p).isDirectory(); } catch { return false; } };
   // Only spec worktrees (branch feature/<slug>): .claude/worktrees/ also holds worktrees of other work.
-  const worktrees = names(path.join(root, WORKTREES), (n) => fs.statSync(path.join(root, WORKTREES, n)).isDirectory()
+  const worktrees = names(path.join(root, WORKTREES), (n) => isDir(path.join(root, WORKTREES, n))
     && git('rev-parse', '--verify', '--quiet', `refs/heads/feature/${n}`).code === 0);
   // A done run whose worktree is gone is finished: its PR was merged and cleaned up (or the worktree removed by hand).
   const runs = names(path.dirname(runFile('x')), (n) => n.endsWith('.json')).map((n) => n.slice(0, -5))

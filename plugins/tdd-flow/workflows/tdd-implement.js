@@ -121,7 +121,7 @@ const REFAC = {
     testsRemoved: { type: 'array', items: { type: 'object', required: ['file', 'test', 'reason'], properties: { file: str, test: str, reason: str } } },
   },
 }
-const BRANCH = { type: 'object', required: ['branch'], properties: { branch: str } }
+const BRANCH = { type: 'object', required: ['branch'], properties: { branch: str, phaseReset: str } }
 const COMMIT = { type: 'object', required: ['committed'], properties: { committed: { type: 'boolean' }, nothingToCommit: { type: 'boolean' }, ticked: { type: 'boolean' }, specStatus: str, specStatusSkipped: str, sha: str, reason: str, unexpected: strs, extraStaged: strs, unstaged: strs, already: { type: 'boolean' } } }
 const SUITE = { type: 'object', required: ['ran', 'pass'], properties: { ran: { type: 'boolean' }, pass: { type: 'boolean' }, command: str, cached: { type: 'boolean' }, summary: str } }
 const BLOCK = { type: 'object', required: ['logged'], properties: { logged: { type: 'boolean' }, unticked: { type: 'boolean' }, alreadyCommitted: { type: 'boolean' } } }
@@ -211,6 +211,7 @@ if (!plan.baselinePass && hasTests && !opt.allowRedBaseline) throw new Error(`td
 const branched = await cli('branch', { slug: plan.slug }, BRANCH, { label: 'branch' })
 if (!branched.ok) throw new Error(`tdd-flow: creating the feature branch failed. ${branched.error}`)
 const br = branched.result
+if (br.phaseReset) log(`state.json said phase ${br.phaseReset} from an earlier run that stopped mid-cycle - reset to IDLE`)
 
 const dir = `.tdd-flow/features/${plan.slug}`
 const ctxFor = () => `Feature: ${plan.slug}. Spec: ${dir}/spec.md. ` +

@@ -1198,3 +1198,165 @@ test('a blocked run can carry a decision: run-report checks it, board and runs-w
   const w = run(dir, 'runs-wait', { slugs: ['12-csv'] }, env).result;
   assert.deepStrictEqual([w.finished[0].status, w.finished[0].decision], ['blocked', decision]);
 });
+
+test('branch resets a phase an earlier run left behind, also when already on the feature branch', () => {
+  const { dir, read, write } = repo();
+  write('.tdd-flow/state.json', '{"feature":"12-csv","phase":"RED","task":"T-2"}\n');
+  assert.deepStrictEqual(run(dir, 'branch', { slug: '12-csv' }).result, { branch: 'feature/12-csv', phaseReset: 'RED' });
+  assert.deepStrictEqual(JSON.parse(read('.tdd-flow/state.json')), { feature: '12-csv', phase: 'IDLE', task: 'T-2' });
+  write('.tdd-flow/state.json', '{"feature":"12-csv","phase":"GREEN","task":"T-2"}\n');
+  assert.deepStrictEqual(run(dir, 'branch', { slug: '12-csv' }).result, { branch: 'feature/12-csv', phaseReset: 'GREEN' });
+  assert.deepStrictEqual(run(dir, 'branch', { slug: '12-csv' }).result, { branch: 'feature/12-csv' });
+  // No state.json: none is created.
+  fs.rmSync(path.join(dir, '.tdd-flow/state.json'));
+  run(dir, 'branch', { slug: '12-csv' });
+  assert.ok(!fs.existsSync(path.join(dir, '.tdd-flow/state.json')));
+});
+
+test('add-secret-scan removes the file again when its commit fails, and commits its own leftover', () => {
+  const { dir, g } = trackedRepo();
+  g('switch', '-q', '-c', 'feature/12-csv');
+  const file = path.join(dir, '.github/workflows/secret-scan.yml');
+  const hook = path.join(dir, '.git/hooks/pre-commit');
+  fs.writeFileSync(hook, '#!/bin/sh\necho "hook says no" >&2\nexit 1\n', { mode: 0o755 });
+  const failed = run(dir, 'add-secret-scan', {}).result;
+  assert.strictEqual(failed.committed, false);
+  assert.match(failed.reason, /git commit failed: hook says no/);
+  assert.ok(!fs.existsSync(file));
+  assert.strictEqual(g('status', '--porcelain').toString(), '');
+  fs.rmSync(hook);
+  assert.strictEqual(run(dir, 'add-secret-scan', {}).result.committed, true);
+  assert.match(run(dir, 'add-secret-scan', {}).result.reason, /already exists/);
+  // A leftover of an earlier failed run (untracked, same content) is committed; another untracked file is left alone.
+  g('reset', '-q', 'HEAD~1');
+  assert.strictEqual(run(dir, 'add-secret-scan', {}).result.committed, true);
+  g('reset', '-q', 'HEAD~1');
+  fs.appendFileSync(file, '# my own scan\n');
+  const other = run(dir, 'add-secret-scan', {}).result;
+  assert.strictEqual(other.committed, false);
+  assert.match(other.reason, /exists but is not committed/);
+  assert.match(fs.readFileSync(file, 'utf8'), /# my own scan/);
+});
+
+/** Fake `gh` answering by its first two arguments: {'pr checks': {out, err, code}}; a key may end in `*`. */
+function scriptedGh(answers) {
+  const q = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
+  const cases = Object.entries(answers).map(([k, a]) => `  ${k.replace(/ /g, '\\ ')}) ${a.out != null ? `printf '%s\\n' ${q(a.out)};` : ''} ${a.err ? `printf '%s\\n' ${q(a.err)} >&2;` : ''} exit ${a.code || 0} ;;`);
+  return { TDD_FLOW_GH_BIN: fakeBin('gh', `case "$1 $2" in\n${cases.join('\n')}\n  *) echo "unexpected: gh $*" >&2; exit 1 ;;\nesac`) };
+}
+/** The test repo with a GitHub origin (nothing is fetched). */
+function githubRepo() {
+  const r = repo();
+  r.g('remote', 'add', 'origin', 'https://github.com/o/r.git');
+  return r;
+}
+
+test('preflight falls back off GitHub, and reports a missing or logged-out gh', () => {
+  const off = run(repo().dir, 'preflight', {});
+  assert.strictEqual(off.fallback, true);
+  assert.match(off.error, /tracker is none; the script handles GitHub only/);
+  const { dir } = githubRepo();
+  const missing = run(dir, 'preflight', {}, { TDD_FLOW_GH_BIN: path.join(os.tmpdir(), 'tdd-flow-no-gh-here') }).result;
+  assert.deepStrictEqual([missing.cliReady, missing.cliFix], [false, 'Install the GitHub CLI (https://cli.github.com), then run: gh auth login']);
+  const out = run(dir, 'preflight', {}, scriptedGh({ 'auth status': { err: 'You are not logged into any GitHub hosts.', code: 1 } })).result;
+  assert.deepStrictEqual([out.cliReady, out.cliFix], [false, 'gh auth login']);
+});
+
+test('preflight reads tasks, issue, token scope, the open PR and counts only a committed secret scan', () => {
+  const { dir, g, write } = githubRepo();
+  g('switch', '-q', '-c', 'feature/12-csv');
+  const env = scriptedGh({
+    'auth status': { err: "  - Token scopes: 'gist', 'repo', 'workflow'" },
+    'pr view': { out: JSON.stringify({ url: 'https://github.com/o/r/pull/9', state: 'OPEN', reviewDecision: '' }) },
+  });
+  const p = run(dir, 'preflight', {}, env).result;
+  assert.deepStrictEqual(
+    [p.slug, p.base, p.branch, p.openTasks, p.issueId, p.cliReady, p.workflowScope, p.existingPr, p.reviewDecision, p.secretScan, p.hasCi],
+    ['12-csv', 'main', 'feature/12-csv', ['T-1', 'T-2', 'T-20'], '12', true, true, 'https://github.com/o/r/pull/9', 'NONE', 'not_github', false]);
+  write('.github/workflows/ci.yml', 'on: push\n');
+  g('add', '.github');
+  g('commit', '-qm', 'ci');
+  const scan = () => run(dir, 'preflight', {}, env).result.secretScan;
+  assert.strictEqual(scan(), 'missing');
+  write('.github/workflows/secret-scan.yml', 'jobs:\n  gitleaks:\n');
+  assert.strictEqual(scan(), 'missing'); // not committed: it does not run in CI
+  g('add', '.github');
+  g('commit', '-qm', 'scan');
+  assert.strictEqual(scan(), 'present');
+});
+
+test('ci-watch: pending returns again and keeps its state, a failure brings the log, review status and what merging runs', () => {
+  const { dir, write } = githubRepo();
+  const stFile = path.join(dir, '.git', 'tdd-flow-ci-watch.json');
+  const checks = (bucket) => ({ out: JSON.stringify([{ name: 't', state: 'X', bucket, link: 'https://github.com/o/r/actions/runs/1/job/2', workflow: 'ci' }]), code: bucket === 'pending' ? 8 : 0 });
+  const pending = run(dir, 'ci-watch', { pr: 5, callSeconds: 1 }, scriptedGh({ 'pr checks': checks('pending') }));
+  assert.strictEqual(pending.again, true);
+  assert.deepStrictEqual(pending.result, { status: 'pending', pendingChecks: ['ci / t'] });
+  assert.strictEqual(JSON.parse(fs.readFileSync(stFile, 'utf8')).key, 'pr:5');
+  write('.github/workflows/deploy.yml', 'name: deploy\non:\n  push:\n    branches: [main]\njobs:\n  d:\n    steps:\n      - run: ./deploy.sh\n');
+  const failed = run(dir, 'ci-watch', { pr: 5, callSeconds: 1 }, scriptedGh({
+    'pr checks': checks('fail'),
+    'run view': { out: 't\tstep\t2026-01-01T10:00:00.1234567Z Error: boom' },
+    'pr view': { out: '{"reviewDecision":"CHANGES_REQUESTED"}' },
+  })).result;
+  const { onMerge, ...rest } = failed;
+  assert.deepStrictEqual(rest, { status: 'failed', runUrl: 'https://github.com/o/r/actions/runs/1', failingJob: 'ci / t', log: 'Error: boom', reviewDecision: 'CHANGES_REQUESTED' });
+  assert.match(onMerge, /^Merging into main runs: deploy \(has deploy\/release steps\)/);
+  assert.ok(!fs.existsSync(stFile));
+});
+
+test('ci-watch: no checks after the grace period, a timeout, a stale state file and a commit watch', () => {
+  const { dir, g } = githubRepo();
+  const stFile = path.join(dir, '.git', 'tdd-flow-ci-watch.json');
+  const seed = (key, agoMs) => fs.writeFileSync(stFile, JSON.stringify({ key, start: Date.now() - agoMs }));
+  seed('pr:5', 200000);
+  const none = run(dir, 'ci-watch', { pr: 5, callSeconds: 1 }, scriptedGh({ 'pr checks': { err: 'no checks reported on the feature/x branch', code: 1 } })).result;
+  assert.strictEqual(none.status, 'none');
+  assert.ok(!fs.existsSync(stFile));
+  const pending = scriptedGh({ 'pr checks': { out: JSON.stringify([{ name: 't', bucket: 'pending', link: '', workflow: '' }]), code: 8 } });
+  seed('pr:5', 31 * 60000);
+  assert.deepStrictEqual(run(dir, 'ci-watch', { pr: 5, callSeconds: 1 }, pending).result, { status: 'timeout' });
+  assert.ok(!fs.existsSync(stFile));
+  // A state file left by an aborted run (older than the watch plus 10 minutes) starts a new watch.
+  seed('pr:5', 41 * 60000);
+  assert.strictEqual(run(dir, 'ci-watch', { pr: 5, callSeconds: 1 }, pending).again, true);
+  assert.ok(JSON.parse(fs.readFileSync(stFile, 'utf8')).start > Date.now() - 60000);
+  // After the merge: the runs of the commit, skipped counts as passed, plus its deployments.
+  const sha = g('rev-parse', 'HEAD').toString().trim();
+  const c = run(dir, 'ci-watch', { commit: sha, callSeconds: 1 }, scriptedGh({
+    'run list': { out: JSON.stringify([{ databaseId: 3, name: 'd', workflowName: 'deploy', status: 'completed', conclusion: 'skipped', url: 'https://github.com/o/r/actions/runs/3' }]) },
+    'api *': { out: '[]' },
+  })).result;
+  assert.deepStrictEqual(c, { status: 'passed', runUrl: 'https://github.com/o/r/actions/runs/3', commit: sha, deployments: [] });
+});
+
+test('context fetches a GitHub issue, reads a spec file, keeps text, and reports the feature state.json names', () => {
+  const { dir, write } = githubRepo();
+  const issue = { number: 12, title: 'CSV export', body: 'Export the report.', labels: [{ name: 'feature' }],
+    comments: [{ author: { login: 'ann' }, body: 'Header too' }], url: 'https://github.com/o/r/issues/12' };
+  const r = run(dir, 'context', { input: '#12' }, scriptedGh({ 'issue view': { out: JSON.stringify(issue) } })).result;
+  assert.strictEqual(r.kind, 'issue');
+  assert.deepStrictEqual(r.req, { ok: true, title: 'CSV export', source: 'https://github.com/o/r/issues/12', issueId: '12', slug: '12-csv-export',
+    text: 'CSV export\n\nExport the report.\n\nLabels: feature\n\nComment by @ann:\nHeader too' });
+  assert.deepStrictEqual(r.state, { feature: '12-csv', specStatus: 'approved' });
+  const gone = run(dir, 'context', { input: 'https://github.com/o/r/issues/99' }, scriptedGh({ 'issue view': { err: 'GraphQL: Could not resolve to an issue', code: 1 } })).result;
+  assert.match(gone.note, /^gh issue view failed: GraphQL/);
+  write('docs/req.md', '# Bulk import\n\nUsers upload a CSV.\n');
+  const f = run(dir, 'context', { input: 'docs/req.md' }).result;
+  assert.deepStrictEqual([f.kind, f.req.title, f.req.slug, f.req.source], ['file', 'Bulk import', 'bulk-import', 'docs/req.md']);
+  const t = run(dir, 'context', { input: 'Users export the report as CSV' }).result;
+  assert.deepStrictEqual([t.kind, t.req], ['text', undefined]);
+  write('.tdd-flow/state.json', '{"feature":"99-gone","phase":"IDLE","task":"T-1"}\n');
+  assert.deepStrictEqual(run(dir, 'context', { input: 'x' }).result.state, { feature: '99-gone', specStatus: 'missing' });
+  write('.tdd-flow/state.json', '{"feature":null,"phase":"IDLE","task":null}\n');
+  assert.strictEqual(run(dir, 'context', { input: 'x' }).result.state, undefined);
+  assert.strictEqual(run(repo().dir, 'context', { input: '#12' }).result.note, 'not a GitHub issue in this repo');
+});
+
+test('board keeps the other specs when one worktree entry cannot be read', () => {
+  const { dir } = trackedRepo();
+  run(dir, 'worktree', { slug: '12-csv' });
+  run(dir, 'run-report', { slug: '12-csv', status: 'done', prUrl: 'https://github.com/o/r/pull/7' });
+  fs.symlinkSync(path.join(dir, 'no-such-dir'), path.join(dir, '.claude/worktrees/zz-dangling'));
+  assert.deepStrictEqual(run(dir, 'board', {}, fakeClaude([])).result.rows.map((r) => [r.slug, r.status]), [['12-csv', 'done']]);
+});

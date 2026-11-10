@@ -5,7 +5,7 @@ const assert = require('node:assert');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { execFileSync } = require('child_process');
+const { execFileSync, spawnSync } = require('child_process');
 
 const gate = require('../hooks/scripts/push-gate.cjs');
 
@@ -24,7 +24,11 @@ function repo(stack) {
 }
 
 const env = { ...process.env, PATH: process.env.PATH, TDD_FLOW_PUSH_GATE: '' };
-const push = (dir) => gate.main(JSON.stringify({ tool_input: { command: 'git push -u origin feature/x' }, cwd: dir }), env);
+delete env.GIT_DIR;
+delete env.GIT_WORK_TREE;
+const push = (dir, e = env) => gate.main(JSON.stringify({ tool_input: { command: 'git push -u origin feature/x' }, cwd: dir }), e);
+const cacheOf = (dir) => { try { return fs.readFileSync(path.join(dir, '.git', 'tdd-flow-push-gate'), 'utf8').trim(); } catch { return null; } };
+const headOf = (dir) => execFileSync('git', ['rev-parse', 'HEAD'], { cwd: dir, encoding: 'utf8' }).trim();
 
 test('stackField reads a command line, strips backticks, treats none/unknown as absent', () => {
   const dir = repo('test command (all): `(cd app && npm test)`\ntype check command: none\nlint/format command: unknown (none configured)\n');
@@ -53,13 +57,46 @@ test('push-gate blocks on a failing stack type check, passes and caches on succe
   assert.match(r.stderr, /type check \(\.tdd-flow\/stack\.md\) failed .*exit 1/);
   assert.match(r.stderr, /type error in a\.ts/);
 
-  fs.writeFileSync(path.join(dir, '.tdd-flow', 'stack.md'), 'type check command: node -e 0\ntest command (all): node -e 0\n');
-  const ok = await push(dir);
+  // The test command appends to a marker file outside the repo, so the test sees whether the checks ran.
+  const mark = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'tdd-flow-gate-mark-')), 'runs');
+  const stack = (extra = '') => fs.writeFileSync(path.join(dir, '.tdd-flow', 'stack.md'),
+    `type check command: node -e 0\ntest command (all): node -e "require('fs').appendFileSync(process.env.MARK, 'x')"\n${extra}`);
+  const runs = () => (fs.existsSync(mark) ? fs.readFileSync(mark, 'utf8').length : 0);
+  const e = { ...env, MARK: mark };
+  stack();
+  const ok = await push(dir, e);
   assert.strictEqual(ok.code, 0, ok.stderr);
-  const head = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: dir, encoding: 'utf8' }).trim();
-  assert.strictEqual(fs.readFileSync(path.join(dir, '.git', 'tdd-flow-push-gate'), 'utf8').trim(), head);
+  assert.strictEqual(runs(), 1);
+  assert.ok(cacheOf(dir).startsWith(`${headOf(dir)} `), cacheOf(dir));
 
-  // The cache is keyed on HEAD: a failing command in an unchanged commit is not run again.
+  // The cache is keyed on HEAD and the check commands: an unchanged commit with the same commands is not run again,
+  // also when other lines of stack.md change.
+  stack('notes: a note\n');
+  assert.strictEqual((await push(dir, e)).code, 0);
+  assert.strictEqual(runs(), 1);
+  // A changed command runs again for the same commit.
   fs.writeFileSync(path.join(dir, '.tdd-flow', 'stack.md'), 'test command (all): node -e "process.exit(1)"\n');
-  assert.strictEqual((await push(dir)).code, 0);
+  assert.strictEqual((await push(dir, e)).code, 2);
+});
+
+test('push-gate blocks when a stack profile command is not found, and caches no skipped check', async (t) => {
+  // Like `(cd apps/web && npm test)` without node_modules: the profile's command exits 127.
+  const dir = repo('test command (all): `tdd-flow-no-such-tool --run`\n');
+  const r = await push(dir);
+  assert.strictEqual(r.code, 2);
+  assert.match(r.stderr, /tests \(\.tdd-flow\/stack\.md\) .* exited 127: a command it runs was not found\. Install the dependencies/);
+  assert.match(r.stderr, /hook's PATH/);
+  assert.strictEqual(cacheOf(dir), null);
+
+  // An auto-detected check whose tool is missing still only warns, but the commit is not marked as passed.
+  const auto = repo(null);
+  fs.writeFileSync(path.join(auto, 'go.mod'), 'module x\n');
+  execFileSync('git', ['add', 'go.mod'], { cwd: auto });
+  execFileSync('git', ['commit', '-qm', 'go'], { cwd: auto });
+  const noGo = { ...env, PATH: path.dirname(process.execPath) + ':/usr/bin:/bin' };
+  if (spawnSync('sh', ['-c', 'command -v go'], { env: noGo }).status === 0) { t.skip('go is installed in /usr/bin, so the missing-tool case cannot be shown'); return; }
+  const w = await push(auto, noGo);
+  assert.strictEqual(w.code, 0, w.stderr);
+  assert.match(w.stdout, /tests skipped, tool not found \(`go test \.\/\.\.\.`\)/);
+  assert.strictEqual(cacheOf(auto), null);
 });
