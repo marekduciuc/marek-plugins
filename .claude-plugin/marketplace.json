@@ -10,7 +10,7 @@
       "name": "tdd-flow",
       "source": "./plugins/tdd-flow",
       "description": "End-to-end dev pipeline on dynamic workflows: requirements analysis, test-driven implementation, documentation and CI/CD deployment.",
-      "version": "0.20.0",
+      "version": "0.21.0",
       "author": { "name": "Marek Duciuc" },
       "license": "MIT",
       "keywords": ["tdd", "workflows", "agents", "ci-cd"]

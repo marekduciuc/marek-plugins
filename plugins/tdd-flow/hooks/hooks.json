@@ -8,7 +8,7 @@
           {
             "type": "command",
             "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/push-gate.cjs\"",
-            "timeout": 300,
+            "timeout": 600,
             "statusMessage": "tdd-flow push-gate"
           }
         ]
