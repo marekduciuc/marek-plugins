@@ -96,6 +96,10 @@ Seen: `npm ci` left the shell in `apps/web`, T-1 started from the wrong director
 - **An answer left a Verify command stale.** The AC-19 allow-list of changed tests did not get the Q-15/Q-16 files, so T-17 failed. Fix: resolve-questions and the autopilot's Decisions step update Verify commands too.
 - **The full suite was only the backend.** `test command (all)` skipped the frontend (`-Dskip.npm`), with the frontend command on a separate line nothing reads, so T-13 committed a red frontend test. Fixed in pojistneudalosti #8; the stack-detector and the implementer's SETUP step now put every suite into `test command (all)`.
 
+## Reviewing runs (0.20.0)
+
+The findings above came from reading session transcripts by hand twice. `/tdd-flow:review-run` does that: `skills/review-run/scripts/transcript.cjs` locates a transcript by session id, job name or slug (job `state.json`, `claude agents`, the run file, `~/.claude/projects/*/<uuid>.jsonl`), prints a summary of the key events and filtered views, and lists the workflow transcripts; the skill cross-checks the run file, PR, commits, spec and stack.md and reports findings as plugin / repo / one-off. Report only in chat (user decision).
+
 ## Later: move global rules into the plugin
 
 So users don't need your `~/.claude/rules`: Shell (no bare `cd`), Questions (in chat, one at a time), Git state reporting (commit check, block check, PR only after `gh pr create` returned a URL). How a plugin ships rules is to be checked in the Claude Code docs first.
