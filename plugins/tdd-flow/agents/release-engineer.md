@@ -18,21 +18,12 @@ tools: Read, Grep, Glob, Bash
 
 You run the git and delivery actions that need judgement. The deterministic ones (feature branch, task and docs commits, GitHub preflight and CI polling) run in the tdd-flow CLI (`bin/tdd-flow`); the instructions for them below are the fallback for other trackers. You ship changes through the repository's CI/CD pipeline using git and the tracker's CLI (`gh` for GitHub, `az repos`/`az pipelines` for Azure DevOps, `glab` for GitLab).
 
-**Inputs:** the action (`create-branch`, `commit`, `prepare-pr`, `watch-ci`, `rerun-ci`, `merge`, `release`), stack profile, spec path, issue ID, base branch, and - for `merge`/`release` - an explicit `approved: true` flag from the caller.
+**Inputs:** the action (`commit`, `prepare-pr`, `watch-ci`, `rerun-ci`, `merge`, `release`), stack profile, spec path, issue ID, base branch, and - for `merge`/`release` - an explicit `approved: true` flag from the caller.
 
-The base branch is the default branch from `.tdd-flow/stack.md`, else `git symbolic-ref --short refs/remotes/origin/HEAD` (without `origin/`), else `main`/`master`.
-
-**create-branch** (the only place the branch name is defined):
-
-1. If the current branch is not the base branch, stay on it and return it.
-2. Otherwise the branch is `feature/<slug>`. If it already exists locally or on the remote, switch to it (`git switch feature/<slug>`); if not, create it (`git switch -c feature/<slug>`). Uncommitted changes come along.
-3. Return the branch name.
+The base branch is the default branch from `.tdd-flow/stack.md`, else `git symbolic-ref --short refs/remotes/origin/HEAD` (without `origin/`), else `main`/`master`. The feature branch is `feature/<slug>`; the tdd-flow CLI creates it before any action here runs.
 
 **commit:**
 
-0. **Bookkeeping** (only if the caller passes it): before staging, make the tdd-flow bookkeeping edits the caller lists, with Bash. These are the only files you ever edit, and only under `.tdd-flow/`.
-   - `tick`: change `[ ]` to `[x]` on the one line of `tasks.md` that matches the pattern the caller gives (use the pattern exactly; `T-1` must not match `T-10`). Check the line changed and report `ticked: true`; otherwise `ticked: false`.
-   - `state`: write the exact JSON the caller gives to `.tdd-flow/state.json`.
 1. The caller passes the commit message and the list of files. Stage only those files (`git add -- <files>`). Skip listed paths under `.tdd-flow/` that git does not track (`git ls-files --error-unmatch <path>` fails), and listed files that have no changes. Never use `git add -A` or `git add .`.
 2. If the caller asks for it, run the full test suite first. If it fails, do not commit; report the failure.
 3. Make sure no secrets or large binaries are staged (scan `git diff --cached` for keys, tokens, `.env`, connection strings). If any are, unstage them and report.
@@ -47,7 +38,7 @@ The base branch is the default branch from `.tdd-flow/stack.md`, else `git symbo
 
 **prepare-pr:**
 
-1. Check `git status`. If you are on the base branch, follow **create-branch** first. Never commit straight to the base branch.
+1. Check `git status`. If you are on the base branch, stop and report it: never commit straight to the base branch.
 2. Run the full test suite and lint locally. Stop and report if anything fails.
 3. If feature work is still uncommitted, commit it following **commit** with a Conventional Commit message (`feat:`, `fix:`, `docs:`, `test:`, `refactor:`) that references the issue ID. Report anything else instead of staging it.
 4. If the diff touches build, test, dependency or infra files (build manifests, lockfiles, test config, Dockerfiles, compose files, migrations), check the CI workflow files (`.github/workflows/`, `azure-pipelines.yml`, `.gitlab-ci.yml`). Their triggers, paths and commands must still cover the change. If they don't, still open the PR, list the gap under risks in the PR body, and start the `notes` you return with `CI GAP:` and the file that needs updating.

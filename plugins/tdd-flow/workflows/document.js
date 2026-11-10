@@ -122,7 +122,7 @@ try {
 
   // ---------- Write -> Verify -> Fix (pipelined per target; targets are distinct files) ----------
   const results = await pipeline(targets,
-    (_, t) => run(
+    t => run(
       `${ctx}\n\nProduce ONLY the "${t.kind}" documentation target, in ${t.file}. Why: ${t.why}. Do not touch other doc targets' files.`,
       { agentType: A('doc-writer'), schema: WROTE, label: `write:${t.kind}`, phase: 'Write' }),
     (wrote, t) => wrote && run(

@@ -932,7 +932,7 @@ function autopilotCheck(dir, input, { settings, version = '2.1.200', env = {} } 
   assert.strictEqual(r.ok, true, r.error);
   return { ...r.result, check: (name) => r.result.checks.find((c) => c.name === name) };
 }
-const SESSION_ALLOW = ['Workflow', 'Bash(tdd-flow:*)', 'Bash(git *)', 'Bash(gh pr:*)', 'Edit'];
+const SESSION_ALLOW = ['Workflow', 'Bash(tdd-flow:*)', 'Bash(git *)', 'Bash(gh pr:*)', 'Bash(gh issue view *)', 'Edit', 'Write'];
 
 test('autopilot-check: tests need from the stack.md field, else inferred from its test lines only', () => {
   const { dir, write } = repo();
@@ -957,13 +957,14 @@ test('autopilot-check: gh login is required', () => {
 });
 
 test('autopilot-check: permissions from user and local settings, broader rules cover, auto mode needs no rules', () => {
-  const { dir, write } = trackedRepo();
+  const { dir, g, write } = trackedRepo();
   const perms = (opts) => autopilotCheck(dir, { runnable: 1 }, opts).check('permissions');
   const missing = perms({ settings: { permissions: { allow: ['Bash(git push *)', 'Edit(src/**)'] } } });
   assert.strictEqual(missing.status, 'warn');
-  assert.match(missing.details, /stop at a permission prompt until you attach for: Workflow, Bash\(tdd-flow \*\), Bash\(git \*\), Bash\(gh pr \*\), Edit \(mode default, Claude Code default\)/);
+  assert.match(missing.details, /stop at a permission prompt until you attach for: Workflow, Bash\(tdd-flow \*\), Bash\(git \*\), Bash\(gh pr \*\), Bash\(gh issue view \*\), Edit, Write \(mode default, Claude Code default\)/);
   assert.match(missing.fix, /settings\.local\.json or ~\/\.claude\/settings\.json/);
-  assert.strictEqual(perms({ settings: { permissions: { allow: ['Workflow', 'Bash', 'Edit'] } } }).status, 'ok');
+  assert.strictEqual(perms({ settings: { permissions: { allow: ['Workflow', 'Bash', 'Edit'] } } }).status, 'warn');
+  assert.strictEqual(perms({ settings: { permissions: { allow: ['Workflow', 'Bash', 'Edit', 'Write'] } } }).status, 'ok');
   assert.strictEqual(perms({ settings: { permissions: { allow: ['Workflow', 'Bash(*)'], defaultMode: 'acceptEdits' } } }).status, 'ok');
   assert.match(perms({ settings: { permissions: { allow: ['Workflow'], defaultMode: 'dontAsk' } } }).details, /deny without asking for: Bash/);
   assert.strictEqual(perms({ settings: { permissions: { defaultMode: 'auto' } } }).status, 'ok');
@@ -975,6 +976,13 @@ test('autopilot-check: permissions from user and local settings, broader rules c
   assert.strictEqual(perms({}).status, 'warn');
   write('.claude/settings.local.json', '{ not json');
   assert.match(perms({ settings: { permissions: { defaultMode: 'auto' } } }).details, /settings\.local\.json is not valid JSON/);
+  // implement-spec installs the dependencies of a fresh worktree: a tracked lockfile needs its frozen install command.
+  fs.rmSync(path.join(dir, '.claude/settings.local.json'));
+  write('apps/web/package-lock.json', '{}\n');
+  g('add', 'apps/web/package-lock.json');
+  g('commit', '-qm', 'lockfile');
+  assert.match(perms({ settings: { permissions: { allow: SESSION_ALLOW } } }).details, /for: Bash\(npm ci\) \(mode default/);
+  assert.strictEqual(perms({ settings: { permissions: { allow: [...SESSION_ALLOW, 'Bash(npm *)'] } } }).status, 'ok');
 });
 
 test('autopilot-check: tests that need Docker check the engine and run one spec at a time', () => {

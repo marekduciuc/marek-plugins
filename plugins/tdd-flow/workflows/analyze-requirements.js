@@ -22,7 +22,9 @@ const strs = { type: 'array', items: { type: 'string' } }
 const M = Object.assign({ worker: 'sonnet', strong: 'opus', light: 'haiku' }, (typeof args === 'object' && args && args.models) || {})
 // Agent limits. Override per run with args {maxAgents, maxParallel} (positive integers).
 const posInt = (v, d) => (Number.isInteger(v) && v > 0 ? v : d)
-const MAX_AGENTS = posInt(opt.maxAgents, 12)
+// 14: context, stack-detector, stack-fill, fetch, 3 drafts, synthesis, 3 critics and the revision are 12 on a
+// first run with a non-GitHub tracker; the two spare slots cover a relay retry without losing the revision.
+const MAX_AGENTS = posInt(opt.maxAgents, 14)
 const MAX_PARALLEL = posInt(opt.maxParallel, 2)
 const LIMIT = `tdd-flow: agent limit (${MAX_AGENTS}) reached`
 let spawned = 0, active = 0, limitHit = false
@@ -222,7 +224,7 @@ try {
     },
   ]
   const crits = (await parallel(CRITICS.map(c => () => run(
-    `You are a skeptical reviewer of ${dir}/spec.md. ${c.ask}\nOnly report real problems; do not edit files.\n\nRaw requirement:\n"""${req.text}"""`,
+    `You are a skeptical reviewer of ${dir}/spec.md. ${c.ask}\nOnly report real problems; do not edit files. This reviews the spec text, not code: do not run the test suite or lint.\n\nRaw requirement:\n"""${req.text}"""`,
     { schema: CRIT, model: M.worker, label: `critic:${c.key}`, phase: 'Critique', agentType: A('code-reviewer') },
   )))).map((c, i) => c && { ...c, key: CRITICS[i].key }).filter(Boolean)
   if (limitHit) throw new Error(LIMIT)

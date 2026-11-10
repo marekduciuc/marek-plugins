@@ -41,7 +41,7 @@ const PLAN = {
   required: ['slug', 'approved', 'testAll', 'testSingle', 'baselinePass', 'tasks'],
   properties: {
     slug: str, status: str, approved: { type: 'boolean' },
-    testAll: str, testSingle: str, lint: str, typeCheck: str, testPattern: str,
+    testAll: str, testSingle: str, lint: str, typeCheck: str,
     baselinePass: { type: 'boolean' }, baselineSummary: str, noTestSuite: { type: 'boolean' },
     taskCount: { type: 'integer' }, openIds: strs,
     tasks: { type: 'array', items: { type: 'object', required: ['id', 'title', 'done', 'behaviours'], properties: {
@@ -493,7 +493,9 @@ async function refactorStep(task) {
   if (!ch.ok) return { ok: false, step: `${task.id} CHARACTERIZE`, details: ch.result ? charProblems(ch.result).join('\n') : 'agent failed' }
   const pinned = ch.result.tests
   const newFiles = [...new Set(pinned.filter(t => t.new).map(t => t.testFile))]
-  const saved = await cli('commit', { message: `test(${plan.slug}): ${task.id} characterize ${task.title}`, files: [...newFiles, `${dir}/tdd-log.md`], runTests: true },
+  // CHARACTERIZE left the phase at RED; the CLI resets it here, so tdd-guard lets REFACTOR edit production code.
+  const saved = await cli('commit', { message: `test(${plan.slug}): ${task.id} characterize ${task.title}`, files: [...newFiles, `${dir}/tdd-log.md`], runTests: true,
+    state: { feature: plan.slug, phase: 'IDLE', task: task.id } },
     COMMIT, { label: `${task.id} characterize commit`, phase: 'Implement' })
   const sc = saved.ok ? saved.result : null
   if (!sc || (!sc.committed && !sc.nothingToCommit)) return { ok: false, step: `${task.id} CHARACTERIZE COMMIT`, details: sc ? sc.reason || 'commit failed' : saved.error }
@@ -537,6 +539,7 @@ try {
   for (const task of tasks) {
     const isSetup = task.kind === 'setup'
     const isRefactor = task.kind === 'refactor'
+    current = task // before the first agent call of the task: the agent-limit handler names it
     if (!isSetup && !hasTests) {
       return await blocked(task, 'NO TEST SUITE', `${task.id} is a ${task.kind || 'tdd'} task, but the repo has no test command yet.`, false,
         `Add a [setup] task before ${task.id} that installs the test framework and updates .tdd-flow/stack.md (or set the framework up by hand), then rerun /tdd-flow:tdd-implement.`)
@@ -550,7 +553,6 @@ try {
           ? `Agent limit (${MAX_AGENTS}) reached after ${done.length} task(s). Rerun /tdd-flow:tdd-implement to continue with ${task.id}.`
           : `Task ${task.id} needs at least ${est} agents, but only ${MAX_AGENTS - spawned - 1} are left. Rerun with a higher {maxAgents}.` }
     }
-    current = task
     log(`${task.id}: ${task.title} (${isSetup ? 'setup task' : isRefactor ? 'refactor task' : task.behaviours.length + ' behaviour(s)'})`)
     const taskFiles = new Set()
     const testFixes = []
