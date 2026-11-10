@@ -17,7 +17,7 @@ Personal Claude Code plugin: an end-to-end dev pipeline built on **dynamic workf
 
 | Command | Shape | Agents (typical) |
 |---|---|---|
-| `/tdd-flow:analyze-requirements <issue \| file \| text>` | Context (stack + fetch, parallel) → 3 analysts from different angles (behaviour / risk / minimal scope) → synthesize spec.md + tasks.md → testability & completeness critics → revise | ~8-9 |
+| `/tdd-flow:analyze-requirements <issue \| file \| text>` | Context (stack + fetch, parallel) → 3 analysts from different angles (behaviour / risk / minimal scope) → synthesize spec.md + tasks.md → testability, completeness & existing-tests critics (existing tests that assert what the spec changes) → revise | ~8-9 |
 | `/tdd-flow:tdd-implement {feature}` | Plan + baseline → per task, sequentially: RED (test-writer writes all of the task's failing tests) → GREEN (implementer makes them pass one at a time, then refactors) → CLI suite check + review with up to 2 fix rounds (behavioural findings go through RED → GREEN again) → commit (also ticks the task). `[setup]` tasks: SETUP + verify commands → review → commit. `[refactor]` tasks and `{refactors}`: CHARACTERIZE → its own commit → REFACTOR → review → commit | ~5 per task (2 more per 5 extra behaviours); ~4 per setup task; ~6 per refactor task |
 | `/tdd-flow:document {feature}` | Survey diff → pipeline per target: write → adversarial fact-check → fix → commit | ~6-14 |
 | `/tdd-flow:deploy {feature}` | Preflight → 3 review lenses (spec, security, quality) → dedupe → 2 skeptics per finding → PR → CI watch with test-first fix loop (max 2) → stops at `ready_to_merge` | ~8-12 |

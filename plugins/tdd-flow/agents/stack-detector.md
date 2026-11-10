@@ -22,7 +22,7 @@ You detect how a repository is built and tested. Be fast and factual.
 
 1. List root files and common manifests: `package.json`, `pnpm-lock.yaml`, `yarn.lock`, `*.csproj`, `*.sln`, `Directory.Build.props`, `pyproject.toml`, `setup.cfg`, `requirements*.txt`, `go.mod`, `Cargo.toml`, `pom.xml`, `build.gradle*`, `Makefile`, `CMakeLists.txt`.
 2. Find existing test files and the framework they use (imports/attributes such as `xunit`, `NUnit`, `MSTest`, `jest`, `vitest`, `mocha`, `pytest`, `unittest`, `testing`, `JUnit`).
-3. Read scripts/targets to find the real commands (e.g. `package.json` scripts, Makefile targets, CI workflow files under `.github/workflows/` or `azure-pipelines.yml`). Prefer the commands CI uses.
+3. Read scripts/targets to find the real commands (e.g. `package.json` scripts, Makefile targets, CI workflow files under `.github/workflows/` or `azure-pipelines.yml`). Prefer the commands CI uses. With several test suites (a backend and a frontend, several packages), `test command (all)` runs all of them, each in a subshell joined with `&&`: the workflows run only that line as the full suite.
 4. Determine the test-file naming convention and location (e.g. `tests/test_*.py`, `*.test.ts` next to source, separate `*.Tests` project).
 5. Detect the CI system and the issue tracker remote: run `git remote -v`; check for `.github/`, `azure-pipelines.yml`, `.gitlab-ci.yml`, `Jenkinsfile`; check which CLIs exist (`gh`, `az`, `jira`, `glab`) with `command -v`.
 6. Find what the tests need outside the repo: Testcontainers or a Docker client in the test dependencies, `docker compose` in test scripts or CI test jobs, a database URL or a service (Redis, a queue) in the test config that nothing in the tests starts.
