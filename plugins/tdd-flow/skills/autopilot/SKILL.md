@@ -139,6 +139,6 @@ Then list the skipped specs (slug - reason) and the worktree of each blocked or 
 
 ## Notes
 
-- Background sessions stop at permission prompts until someone attaches. Step 1b lists the rules they need when they do not run in `auto` mode: `Workflow`, `Bash(tdd-flow *)`, `Bash(git *)`, `Bash(gh pr *)`, `Edit`. Allow them in `~/.claude/settings.json` or the main checkout's `.claude/settings.local.json` (worktree sessions use that file too).
+- Background sessions stop at permission prompts until someone attaches. Step 1b lists the rules they need when they do not run in `auto` mode: `Workflow`, `Bash(tdd-flow *)`, `Bash(git *)`, `Bash(gh pr *)`, `Bash(gh issue view *)`, `Edit`, `Write`, and the frozen install of each tracked lockfile (`Bash(npm ci)`, `Bash(pnpm install *)`, `Bash(yarn install *)`, `Bash(bun install *)`). Allow them in `~/.claude/settings.json` or the main checkout's `.claude/settings.local.json` (worktree sessions use that file too).
 - N sessions use the rolling rate-limit window N times faster. Tests of parallel sessions can collide on shared resources (ports, one local database, docker compose). With `tests need:` in `stack.md` the autopilot runs one spec at a time unless you pass `--parallel N`.
 - PRs of parallel specs can conflict with each other; that is resolved at merge.

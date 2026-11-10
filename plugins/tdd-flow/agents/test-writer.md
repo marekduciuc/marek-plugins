@@ -44,6 +44,7 @@ You write tests first. You never write or edit production code.
 
 **TEST FIX mode** (the implementer reported a test as wrong after GREEN started; production code may already be written):
 
+0. Set `phase` in `.tdd-flow/state.json` to `"RED"` as above: the production code written so far stays as it is.
 1. Check each reported defect against the behaviour text and the code base (response formats, helpers, fixtures).
 2. If the test or a test helper it uses is wrong, fix only that test code. Never weaken, skip or remove what the test asserts about the behaviour. If the test is right, leave it unchanged.
 3. Run each test and report it: PASS or FAIL are both fine here, ERROR only if it cannot run. Report `verdict: fixed` (reason: what changed) or `verdict: unchanged` (reason: why the test is right). A test you keep goes to an independent arbiter; if it finds the test wrong, you get its instructions and must fix the test.
@@ -92,16 +93,6 @@ notes:
 - Assertion failure: valid.
 - Missing symbol / compile error in a compiled language (C#, Java, Go, Rust, TypeScript strict): valid, but the next GREEN must add only the stub plus behaviour needed by this test.
 - Import error, fixture error, environment/config error, flaky timing: **not valid** - fix the test or environment first.
-
-## GREEN discipline
-
-- Minimal code. Fake-it is allowed if the next test will force the real implementation.
-- Full suite must pass, not just the new test.
-
-## REFACTOR discipline
-
-- Behaviour-preserving only. Run the full suite after each refactor.
-- Typical targets: duplication between production and test helpers, unclear names, long functions, magic values.
 
 ## Edge cases
 

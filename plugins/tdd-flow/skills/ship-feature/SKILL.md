@@ -63,4 +63,4 @@ After each workflow, give one status line. At the end: issue, PR URL, tasks and 
 
 ## Cost note
 
-`tdd-implement` uses about 4 agents per task: RED, GREEN, review (mostly Sonnet; Opus only when a step fails twice) and a Haiku `script-runner` for the commit. Tasks with more than 5 behaviours add a RED/GREEN pair per 5 behaviours (`batchSize`). A setup task uses about 3 agents. Pass `maxTasks` to keep runs small, and `models` to override the model policy (see README).
+`tdd-implement` uses about 5 agents per task: RED, GREEN, review (mostly Sonnet; Opus only when a step fails twice) and a Haiku `script-runner` for the CLI suite check and for the commit. Tasks with more than 5 behaviours add a RED/GREEN pair per 5 behaviours (`batchSize`). A setup task uses about 4 agents, a refactor task about 6. Pass `maxTasks` to keep runs small, and `models` to override the model policy (see README).

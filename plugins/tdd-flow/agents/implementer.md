@@ -44,6 +44,7 @@ You make failing tests pass with the least code necessary, then refactor safely.
 
 **REFACTOR mode for a refactor task** (the caller passes a proposal and the tests that pin the behaviour):
 
+0. If `.tdd-flow/state.json` exists, set its `phase` to `"REFACTOR"` (keep the other fields); set it to `"IDLE"` when you finish.
 1. Apply the proposal and nothing else. Behaviour must stay the same, including edge cases and error paths.
 2. Never edit the pinned tests: they were committed before the change and are the evidence. Fix production code instead.
 3. A test that exercises nothing but code the proposal removes may be deleted or adapted; report each in `tests removed` with the reason. Everything else in the rule "never delete a test" still holds.

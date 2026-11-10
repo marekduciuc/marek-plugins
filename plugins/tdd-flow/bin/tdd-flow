@@ -993,14 +993,26 @@ const PARALLEL_DEFAULT = 3;
 const DOCKER_TIMEOUT_MS = 20000;
 const FETCH_TIMEOUT_MS = 30000;
 // What every background session runs (implement-spec and the workflows it starts). Test and build commands run
-// inside `tdd-flow test`, so they need no rule of their own.
+// inside `tdd-flow test`, so they need no rule of their own. `gh issue view` gives the PR title of a spec without a
+// heading; Write writes the PR body file.
 const SESSION_RULES = [
   { rule: 'Workflow', tool: 'Workflow' },
   { rule: 'Bash(tdd-flow *)', tool: 'Bash', cmd: 'tdd-flow' },
   { rule: 'Bash(git *)', tool: 'Bash', cmd: 'git' },
   { rule: 'Bash(gh pr *)', tool: 'Bash', cmd: 'gh pr' },
+  { rule: 'Bash(gh issue view *)', tool: 'Bash', cmd: 'gh issue view' },
   { rule: 'Edit', tool: 'Edit' },
+  { rule: 'Write', tool: 'Write' },
 ];
+// implement-spec installs the dependencies of a fresh worktree with the frozen command of each tracked lockfile.
+const LOCKFILE_RULES = [
+  { glob: '*package-lock.json', rule: 'Bash(npm ci)', cmd: 'npm ci' },
+  { glob: '*pnpm-lock.yaml', rule: 'Bash(pnpm install *)', cmd: 'pnpm install' },
+  { glob: '*yarn.lock', rule: 'Bash(yarn install *)', cmd: 'yarn install' },
+  { glob: '*bun.lock*', rule: 'Bash(bun install *)', cmd: 'bun install' },
+];
+/** The rules a background session needs in this repo: SESSION_RULES plus the install of each tracked lockfile. */
+const sessionRules = () => [...SESSION_RULES, ...LOCKFILE_RULES.filter((l) => gitOut('ls-files', '--', l.glob)).map((l) => ({ rule: l.rule, tool: 'Bash', cmd: l.cmd }))];
 const NO_PROMPT_MODES = ['auto', 'bypassPermissions'];
 const AUTO_DEFAULT_SINCE = [2, 1, 283]; // Claude Code versions from this one start sessions in auto mode by default
 
@@ -1052,7 +1064,7 @@ function permissionsCheck(root, base) {
   const note = broken.length ? ` ${broken.join('; ')}.` : '';
   if (NO_PROMPT_MODES.includes(mode)) return { name: 'permissions', status: broken.length ? 'warn' : 'ok', details: `mode ${mode} (${from}): sessions do not stop at prompts.${note}` };
   const allow = perms.flatMap((f) => (Array.isArray(f.p.allow) ? f.p.allow : []));
-  const missing = SESSION_RULES.filter((n) => !(n.tool === 'Edit' && mode === 'acceptEdits') && !allow.some((a) => ruleCovers(a, n)));
+  const missing = sessionRules().filter((n) => !(['Edit', 'Write'].includes(n.tool) && mode === 'acceptEdits') && !allow.some((a) => ruleCovers(a, n)));
   if (!missing.length) return { name: 'permissions', status: broken.length ? 'warn' : 'ok', details: `the rules background sessions need are allowed.${note}` };
   const rules = missing.map((n) => n.rule);
   const what = mode === 'dontAsk' ? 'deny without asking' : 'stop at a permission prompt until you attach';
