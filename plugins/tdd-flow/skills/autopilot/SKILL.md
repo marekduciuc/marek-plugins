@@ -43,7 +43,7 @@ Show `runnable` and `skipped` (one line each: slug - reason), and every entry of
 
 ## 1b. Pre-flight
 
-Once, in the main checkout, before any worktree exists. Run it with the Bash tool and `timeout: 600000`: it may run the test suite.
+Once, in the main checkout, before any worktree exists. Run it with the Bash tool and `timeout: 600000`: it may run the test suite. While the printed JSON has `"again": true` (the base suite still runs), run the identical command again; it waits for the same run.
 
 ```bash
 tdd-flow autopilot-check <<'TDD_FLOW_JSON'
