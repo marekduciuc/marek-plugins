@@ -1,5 +1,5 @@
 {
-  "description": "tdd-guard: blocks production-code edits while a tdd-flow cycle is in the RED phase. push-gate: runs type check, lint, tests and a gitleaks scan before Claude runs git push or gh pr create.",
+  "description": "tdd-guard: blocks production-code edits while a tdd-flow cycle is in the RED phase. push-gate: runs type check, lint, tests and a gitleaks scan before Claude runs git push or gh pr create. register.tsx: the status pane (/tdd-status).",
   "hooks": {
     "PreToolUse": [
       {
@@ -24,5 +24,6 @@
         ]
       }
     ]
-  }
+  },
+  "modules": ["./register.tsx"]
 }

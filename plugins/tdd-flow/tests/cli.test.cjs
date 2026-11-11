@@ -440,6 +440,88 @@ test('board leaves out worktrees that are not on a feature/<slug> branch', () =>
   assert.deepStrictEqual(run(dir, 'board', {}, fakeClaude([])).result.rows.map((r) => r.slug), ['12-csv']);
 });
 
+test('status returns no rows outside a repo and in a repo with no spec run, and never throws', () => {
+  const plain = fs.mkdtempSync(path.join(os.tmpdir(), 'tdd-flow-plain-'));
+  assert.deepStrictEqual(run(plain, 'status', {}, fakeClaude([])), { ok: true, shape: '', result: { rows: [], paneSeen: false } });
+  assert.deepStrictEqual(run(trackedRepo().dir, 'status', {}, fakeClaude([])).result, { rows: [], paneSeen: false });
+});
+
+test('status rows carry phase, task, issue URL, title, session and decision, from the main checkout and a worktree', () => {
+  const { dir } = trackedRepo();
+  const env = fakeClaude([{ id: 's-1', kind: 'background', name: 'csv-export-flow', state: 'working' }]);
+  run(dir, 'run-report', { slug: '12-csv', status: 'running', session: 's-1' });
+  const at = JSON.parse(fs.readFileSync(path.join(dir, '.git/tdd-flow/runs/12-csv.json'), 'utf8')).at;
+  const wt = run(dir, 'worktree', { slug: '12-csv' }).result.path;
+  fs.writeFileSync(path.join(wt, '.tdd-flow/features/12-csv/spec.md'), `# CSV export\n\n${SPEC}`);
+  const stateFile = path.join(wt, '.tdd-flow/state.json');
+  fs.writeFileSync(stateFile, '{"feature":"12-csv","phase":"GREEN","task":"T-2"}\n');
+  const row = (from = dir, e = env) => run(from, 'status', {}, e).result.rows[0];
+  assert.deepStrictEqual(row(), {
+    slug: '12-csv', status: 'running', done: 0, total: 3, current: 'T-1 Docker compose', prUrl: '', details: '',
+    attach: 'claude attach csv-export-flow', task: 'T-2', phase: 'GREEN', issueUrl: 'https://github.com/o/r/issues/12',
+    title: 'CSV export', session: 'csv-export-flow', sessionState: 'working', at,
+  });
+  assert.deepStrictEqual(row(wt), row()); // called from the worktree: the same rows
+  fs.writeFileSync(stateFile, '{"feature":"12-csv","phase":"IDLE","task":"T-2"}\n');
+  assert.strictEqual(row().phase, 'review'); // IDLE while the spec runs with open tasks
+  fs.rmSync(stateFile);
+  assert.deepStrictEqual([row().phase, row().task], ['', '']);
+  // A Source that is not a URL gives no issue link.
+  fs.writeFileSync(path.join(wt, '.tdd-flow/features/12-csv/spec.md'), SPEC.replace(/Source: .*/, 'Source: prompt text'));
+  assert.deepStrictEqual([row().issueUrl, row().title], ['', '']);
+  const decision = { id: 'Q-2', question: 'Keep the old export?', recommendation: 'Keep it', options: ['Keep it', 'Drop it'], tasks: ['T-2'] };
+  run(dir, 'run-report', { slug: '12-csv', status: 'blocked', session: 's-1', details: 'needs a decision', decision });
+  fs.writeFileSync(stateFile, '{"feature":"12-csv","phase":"IDLE","task":"T-2"}\n');
+  const idle = fakeClaude([{ id: 's-1', kind: 'background', name: 'csv-export-flow', state: 'done', status: 'idle' }]);
+  const blocked = row(dir, idle);
+  assert.deepStrictEqual(blocked.decision, decision);
+  assert.deepStrictEqual([blocked.status, blocked.phase, blocked.sessionState, blocked.details], ['blocked', '', 'done', 'needs a decision']);
+});
+
+test('status with pane writes a heartbeat; board and runs-wait say paneOpen while it is younger than 60 s', () => {
+  const { dir } = trackedRepo();
+  const env = fakeClaude([]);
+  run(dir, 'run-report', { slug: '12-csv', status: 'done', prUrl: 'https://github.com/o/r/pull/7' });
+  assert.strictEqual(run(dir, 'board', { slugs: ['12-csv'] }, env).result.paneOpen, undefined);
+  assert.strictEqual(run(dir, 'status', {}, env).result.paneSeen, false);
+  assert.strictEqual(fs.existsSync(path.join(dir, '.git/tdd-flow/pane.json')), false); // only with pane: true
+  assert.strictEqual(run(dir, 'status', { pane: true }, env).result.paneSeen, true);
+  assert.ok(Date.now() - Date.parse(JSON.parse(fs.readFileSync(path.join(dir, '.git/tdd-flow/pane.json'), 'utf8')).at) < 5000);
+  assert.strictEqual(run(dir, 'board', { slugs: ['12-csv'] }, env).result.paneOpen, true);
+  assert.strictEqual(run(dir, 'runs-wait', { slugs: ['12-csv'] }, env).result.paneOpen, true);
+  assert.strictEqual(run(dir, 'status', {}, env).result.paneSeen, true);
+  fs.writeFileSync(path.join(dir, '.git/tdd-flow/pane.json'), JSON.stringify({ at: new Date(Date.now() - 61000).toISOString() }));
+  assert.strictEqual(run(dir, 'board', { slugs: ['12-csv'] }, env).result.paneOpen, undefined);
+  assert.strictEqual(run(dir, 'runs-wait', { slugs: ['12-csv'] }, env).result.paneOpen, undefined);
+});
+
+test('runs-wait with ticks: false returns only when a run finishes, not on a ticked task', () => {
+  const { dir } = trackedRepo();
+  const env = fakeClaude([{ id: 's-1', kind: 'background', name: 'csv-export-flow', state: 'working' }]);
+  run(dir, 'run-report', { slug: '12-csv', status: 'running', session: 's-1' });
+  const wt = run(dir, 'worktree', { slug: '12-csv' }).result.path;
+  fs.writeFileSync(path.join(wt, '.tdd-flow/features/12-csv/tasks.md'), TASKS.replace('[ ] T-1', '[x] T-1'));
+  const running = [{ slug: '12-csv', attach: 'claude attach csv-export-flow' }];
+  assert.deepStrictEqual(run(dir, 'runs-wait', { slugs: ['12-csv'], progress: { '12-csv': 0 }, ticks: false, maxMinutes: 0.005 }, env).result,
+    { finished: [], running, timedOut: true, progress: { '12-csv': 1 } });
+  run(dir, 'run-report', { slug: '12-csv', status: 'done', prUrl: 'https://github.com/o/r/pull/7' });
+  assert.deepStrictEqual(run(dir, 'runs-wait', { slugs: ['12-csv'], ticks: false }, env).result.finished.map((f) => f.status), ['done']);
+});
+
+test('worktree writes state.json (IDLE, first open task) into a new worktree', () => {
+  const { dir } = trackedRepo();
+  const tasks = TASKS.replace('[ ] T-1', '[x] T-1');
+  fs.writeFileSync(path.join(dir, '.tdd-flow/features/12-csv/tasks.md'), tasks);
+  execFileSync('git', ['commit', '-qam', 'tick'], { cwd: dir });
+  const wt = run(dir, 'worktree', { slug: '12-csv' }).result.path;
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(path.join(wt, '.tdd-flow/state.json'), 'utf8')), { feature: '12-csv', phase: 'IDLE', task: 'T-2' });
+  assert.strictEqual(execFileSync('git', ['status', '--porcelain'], { cwd: wt }).toString(), ''); // excluded, never committed
+  // A reused worktree keeps the state.json its session wrote.
+  fs.writeFileSync(path.join(wt, '.tdd-flow/state.json'), '{"feature":"12-csv","phase":"RED","task":"T-2"}\n');
+  run(dir, 'worktree', { slug: '12-csv' });
+  assert.strictEqual(JSON.parse(fs.readFileSync(path.join(wt, '.tdd-flow/state.json'), 'utf8')).phase, 'RED');
+});
+
 test('specTitle takes the # heading, else the first sentence of the Goal', () => {
   assert.strictEqual(specTitle('# CSV export\n\n- Status: approved\n\n## Goal\n\nX.'), 'CSV export');
   assert.strictEqual(specTitle('- Status: approved\n\n## Goal\n\nUsers export the report as CSV. It has a header.\n\n## Context\n'), 'Users export the report as CSV.');
