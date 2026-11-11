@@ -22,7 +22,16 @@ TDD_FLOW_JSON
 
 **Report blocked and stop** means: run `run-report` with `status: "blocked"` and a short `details` (step, reason, what the user must do), print the same in your reply, and end.
 
-**Report a decision and stop** is the same, for a block that only the user can resolve because it needs a choice, not a fix. Examples: the spec contradicts itself or the code, an acceptance criterion allows two behaviours, or a review finding needs a product call. Technical failures (a red test, the environment, a merge conflict, the agent limit) stay **report blocked**. Do not guess the answer and do not go on with later tasks.
+**Reuse an earlier decision first.** Before you report a decision, check whether the repo already made it:
+1. Run `tdd-flow decisions` with `{"slug": "<slug>"}`. It lists the `## Resolved questions` of every other spec (`slug`, `title`, `id`, `question`, `answer`, `date`, `where`), from the newest copy of each.
+2. If an earlier decision covers the same subject and the same behaviour, answer the question from it instead of stopping:
+   - write it into `## Resolved questions` of `.tdd-flow/features/<slug>/spec.md` (create the section after Open questions if it is missing), numbered after the highest `Q-<n>` in Open and Resolved questions: `- Q-<n> <question> - **Answer:** <answer>, as decided in <other-slug> Q-<m> (<dd.MM.yyyy of that decision>) → <where it went>`;
+   - update the acceptance criteria, edge cases, task table, `tasks.md` and the **Verify** commands the answer changes, as the autopilot's **Decisions** step 3 does (`skills/autopilot/SKILL.md`), and keep `Status: approved`;
+   - commit only the spec folder: `git add .tdd-flow/features/<slug> && git commit -m "docs(<slug>): answer Q-<n> from <other-slug> Q-<m>"`;
+   - set the uncommitted work of the blocked task aside (`tdd-flow set-aside` with `{"slug": "<slug>", "label": "reuse-Q-<n>"}`), then run the blocked task again (step 1, or the step that stopped). Keep the question, the answer and the source (`<other-slug> Q-<m>`) for the PR body.
+3. Report a decision only when no earlier decision fits, or when two fit and disagree (name both, with slug and Q id, in the question). A reused decision that blocks the same task a second time is reported as a decision too: say in the question which earlier decision was tried.
+
+**Report a decision and stop** is the same as report blocked, for a block that only the user can resolve because it needs a choice, not a fix. Examples: the spec contradicts itself or the code, an acceptance criterion allows two behaviours, or a review finding needs a product call. Technical failures (a red test, the environment, a merge conflict, the agent limit) stay **report blocked**. Do not guess the answer and do not go on with later tasks.
 1. Add the question to `## Open questions` in `.tdd-flow/features/<slug>/spec.md`, numbered after the highest `Q-<n>` in Open and Resolved questions: `- Q-<n> <question> - *assumption if unanswered:* <your recommendation>`. Then the options and the tasks it blocks, on indented lines.
 2. Commit only that file: `git add .tdd-flow/features/<slug>/spec.md && git commit -m "docs(<slug>): open question Q-<n>"`. Then set the rest of the uncommitted work aside with `tdd-flow set-aside` and `{"slug": "<slug>", "label": "decision-Q-<n>"}`. The restart needs a clean worktree, and the answer may change the blocked task, so it is redone from the committed code. Mention the patch path in `details`.
 3. Report it:
@@ -124,6 +133,7 @@ Minor findings are not fixed; they go into the PR body.
    - **Acceptance criteria**: AC ids with one line each
    - **Tasks**: the commits from step 1 (`git log --oneline <base>..HEAD`), and refactor tasks skipped with their reason
    - **Simplification**: the changes step 2 applied (commits). Also, with their reasons: proposals refuted by the verifier (`dropped`), proposals set aside, with the patch path, and proposals that no longer applied. "Lean already" if there were none.
+   - **Decisions reused**: each question answered from an earlier decision (question, answer, source spec and Q id), if any
    - **Code review**: counts per severity; what the fix round fixed; Minor findings as a list; findings set aside, with the reason
    - **Not verified here**: the `unverified` list from step 1 (verify commands that could not run), if any
    - **Test plan**: the test command from `.tdd-flow/stack.md`, that the push-gate ran it before the push, and whether `sync-base` merged `<base>` or regenerated files
