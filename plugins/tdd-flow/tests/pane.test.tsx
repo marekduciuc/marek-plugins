@@ -12,11 +12,12 @@ const SESSION = { cwd: ROOT, surface: 'terminal', isInteractive: true } as const
 const RUNNING: StatusRow = {
   slug: '82-ux-fixes-68f-focus', status: 'running', done: 5, total: 10, current: 'T-6 Settings: inline category…', prUrl: 'https://github.com/o/r/pull/90',
   details: '', attach: 'claude attach form-error-focus', task: 'T-6', phase: 'GREEN', issueUrl: 'https://github.com/o/r/issues/82',
+  position: 6, issueNumber: 82, prNumber: 90,
   title: 'UX fixes', session: 'form-error-focus', sessionState: 'working', at: '2026-11-11T10:00:00.000Z',
 }
 const DECISION: StatusRow = {
   ...RUNNING, slug: '23-csv', status: 'blocked', done: 2, total: 4, current: 'T-3 Export', prUrl: '', attach: 'claude attach csv-export-flow',
-  phase: '', issueUrl: '', details: 'needs a decision', sessionState: 'done',
+  phase: '', issueUrl: '', issueNumber: null, prNumber: null, position: 3, details: 'needs a decision', sessionState: 'done',
   decision: { id: 'Q-2', question: 'Keep the old export?', recommendation: 'Keep it', options: ['Keep it', 'Drop it'], tasks: ['T-3', 'T-4'] },
 }
 
@@ -28,9 +29,10 @@ const PANE: Omit<RenderInput<'Pane'>, 'surface'> = {
 }
 
 /** The engine beneath the plugin: a repo with .tdd-flow/, a canned `tdd-flow status`, and a record of what was asked. */
-function world(on: On, opts: { rows?: StatusRow[]; isSkillListed?: boolean; fail?: string; isClosedStored?: boolean } = {}) {
+function world(on: On, opts: { rows?: StatusRow[]; isSkillListed?: boolean; fail?: string; isClosedStored?: boolean; restartFail?: string; restartGate?: Promise<void> } = {}) {
   const w = {
     rows: opts.rows ?? [RUNNING],
+    restarts: [] as { argv: readonly string[]; cwd?: string; stdin?: string }[],
     runs: [] as { argv: readonly string[]; cwd?: string; stdin?: string }[],
     commands: [] as string[],
     opened: [] as string[],
@@ -48,7 +50,13 @@ function world(on: On, opts: { rows?: StatusRow[]; isSkillListed?: boolean; fail
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('session.repo', () => ({ value: { root: ROOT, remote: null, internal: false, name: null } }))
   on('fs.exists', ($, e) => ({ value: e.path === `${ROOT}/.tdd-flow` }))
-  on('process.run', ($, e) => {
+  on('process.run', async ($, e) => {
+    if (e.argv[1] === 'restart') {
+      w.restarts.push({ argv: e.argv, cwd: e.init?.cwd, stdin: e.init?.stdin })
+      await opts.restartGate
+      const out = opts.restartFail ? { ok: false, shape: '', error: opts.restartFail } : { ok: true, shape: '', result: { slug: 'x', session: 'new-7', name: 'n', attach: 'claude attach n', notes: [] } }
+      return { value: { exitCode: opts.restartFail ? 1 : 0, stdout: `${JSON.stringify(out)}\n`, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } as never }
+    }
     w.runs.push({ argv: e.argv, cwd: e.init?.cwd, stdin: e.init?.stdin })
     const out = opts.fail ? { ok: false, shape: '', error: opts.fail } : { ok: true, shape: '', result: { rows: w.rows, paneSeen: false } }
     return { value: { exitCode: opts.fail ? 1 : 0, stdout: `${JSON.stringify(out)}\n`, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
@@ -137,10 +145,10 @@ test('rows render with status, tasks, phase, issue and PR links and the attach c
     // Sorted: stalled before running.
     const words = (await ui.findAll({ type: 'Text', text: /^(running|stalled)$/ })).map(t => t.text)
     expect(words).toEqual(['stalled', 'running'])
-    expect((await ui.find({ type: 'Text', text: /5\/10 · T-6 Settings/ }))?.text).toBe('  5/10 · T-6 Settings: inline category…')
-    expect((await ui.find({ type: 'Text', text: /GREEN/ }))?.text).toMatch(/^  GREEN · .*#82 · .*PR · claude attach form-error-focus$/)
+    expect((await ui.find({ type: 'Text', text: /5\/10 done/ }))?.text).toBe('  5/10 done · T-6 (task 6) Settings: inline category…')
+    expect((await ui.find({ type: 'Text', text: /GREEN/ }))?.text).toMatch(/^  GREEN · .*issue #82 · .*PR #90 · claude attach form-error-focus$/)
     const links = (await ui.findAll({ type: 'Link' })).map(l => [l.props.href, l.text])
-    expect(links.slice(0, 2)).toEqual([['https://github.com/o/r/issues/82', expect.stringMatching(/#82$/)], ['https://github.com/o/r/pull/90', expect.stringMatching(/PR$/)]])
+    expect(links.slice(0, 2)).toEqual([['https://github.com/o/r/issues/82', expect.stringMatching(/issue #82$/)], ['https://github.com/o/r/pull/90', expect.stringMatching(/PR #90$/)]])
     expect((await ui.find({ type: 'Text', text: /session is idle without a report$/ }))?.text).toBe('  session is idle without a report')
     await ui.press({ key: 'copy:82-ux-fixes-68f-focus' })
     await ui.unmount()
@@ -264,4 +272,82 @@ test('a workflow started in this session is listed until its task notification a
   ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...PANE })
   expect(await ui.find({ type: 'Text', text: /This session/ })).toBeUndefined()
   await ui.unmount()
+})
+
+test('a row is labelled by the spec title, the renumbered task position, issue and PR numbers; the slug only when it fits', async ($, on) => {
+  const long = 'A very long spec title that cannot share the line with anything else at all'
+  const w = world(on, { rows: [
+    { ...RUNNING, slug: 'zjednoduseni-r', title: 'Simplify app', done: 1, total: 16, current: 'T-11 Merge screens', position: 2, issueNumber: 25, prNumber: 24,
+      issueUrl: 'https://github.com/o/r/issues/25', prUrl: 'https://github.com/o/r/pull/24' },
+    { ...RUNNING, slug: '40-long', title: long, status: 'queued', issueNumber: null, prNumber: null, issueUrl: 'https://tracker.example.test/browse/ABC-1', prUrl: 'https://git.example.test/merge/abc' },
+    { ...RUNNING, slug: '41-no-title', title: '', status: 'queued', done: 3, total: 3, current: 'simplify / review / PR', position: null },
+  ] })
+  const clock = mock.clock(on)
+  await $.session.start(SESSION)
+  await clock.advance(1)
+  const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...PANE })
+  expect((await ui.find({ type: 'Text', text: /Simplify app/ }))?.text).toMatch(/^● Simplify app.*zjednoduseni-r$/)
+  expect((await ui.find({ type: 'Text', text: /1\/16 done/ }))?.text).toBe('  1/16 done · T-11 (task 2) Merge screens')
+  const labels = (await ui.findAll({ type: 'Link' })).map(l => l.text)
+  for (const label of ['issue #25', 'PR #24', 'issue ABC-1', 'PR abc']) expect(labels.some(l => l?.endsWith(label))).toBe(true)
+  const longRow = (await ui.find({ type: 'Text', text: /^● A very long/ }))?.text ?? ''
+  expect(longRow).toMatch(/…$/)
+  expect(longRow).not.toContain('40-long')
+  expect((await ui.find({ type: 'Text', text: /41-no-title/ }))?.text).toMatch(/^● 41-no-title/)
+  expect((await ui.find({ type: 'Text', text: /3\/3 done/ }))?.text).toBe('  3/3 done · simplify / review / PR')
+  expect(w.opened).toEqual([])
+  await ui.unmount()
+})
+
+test('the restart button exists only for blocked rows without a decision and stalled rows, and runs tdd-flow restart', async ($, on) => {
+  const w = world(on, { rows: [
+    RUNNING, DECISION,
+    { ...RUNNING, slug: '30-blocked', status: 'blocked', details: 'tests hang' },
+    { ...RUNNING, slug: '31-stalled', status: 'stalled', details: 'session is idle' },
+    { ...RUNNING, slug: '32-queued', status: 'queued' },
+    { ...RUNNING, slug: '33-done', status: 'done' },
+  ] })
+  const clock = mock.clock(on)
+  await $.session.start(SESSION)
+  await clock.advance(1)
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ plugin: PLUGIN, surface, ...PANE })
+    const keys = (await ui.findAll({ type: 'Button' })).map(b => b.props.key).filter(k => String(k).startsWith('restart:')).sort()
+    expect(keys).toEqual(['restart:30-blocked', 'restart:31-stalled'])
+    await ui.unmount()
+  }
+  const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...PANE })
+  await ui.press({ key: 'restart:31-stalled' })
+  expect(w.restarts.length).toBe(1)
+  expect(w.restarts[0]?.argv[0]?.endsWith('/bin/tdd-flow')).toBe(true)
+  expect(w.restarts[0]?.argv[1]).toBe('restart')
+  expect(w.restarts[0]?.cwd).toBe(ROOT)
+  expect(JSON.parse(w.restarts[0]?.stdin ?? '{}')).toEqual({ slug: '31-stalled' })
+  expect(w.ran).toEqual([])
+  expect(w.submitted).toEqual([])
+  await ui.unmount()
+})
+
+test('while a restart runs the row says restarting and has no button; a failure shows the CLI error line', async ($, on) => {
+  let release: () => void = () => {}
+  const gate = new Promise<void>(resolve => { release = resolve })
+  const w = world(on, { rows: [{ ...RUNNING, slug: '30-blocked', status: 'blocked', details: 'tests hang' }], restartGate: gate, restartFail: 'restart (restart): claude --bg printed nothing' })
+  const clock = mock.clock(on)
+  await $.session.start(SESSION)
+  await clock.advance(1)
+  let ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...PANE })
+  await ui.press({ key: 'restart:30-blocked' })
+  await ui.unmount()
+  ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...PANE })
+  expect((await ui.find({ type: 'Text', text: /restarting…/ }))?.text).toMatch(/restarting…/)
+  expect(await ui.find({ type: 'Button', key: 'restart:30-blocked' })).toBeUndefined()
+  await ui.unmount()
+  release()
+  await clock.advance(1)
+  ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...PANE })
+  expect((await ui.find({ type: 'Text', text: /claude --bg printed nothing/ }))?.text).toMatch(/restart \(restart\): claude --bg printed nothing/)
+  expect(await ui.find({ type: 'Text', text: /restarting…/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Button', key: 'restart:30-blocked' })).toBeDefined()
+  await ui.unmount()
+  expect(w.restarts.length).toBe(1)
 })

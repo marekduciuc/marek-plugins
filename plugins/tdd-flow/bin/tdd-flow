@@ -1499,6 +1499,16 @@ function answerDecision(inp) {
     if (c.code !== 0) throw new Error(`git commit failed: ${(c.err || c.out).split('\n').slice(-5).join(' ')}`);
   });
 
+  const { session, name } = restartSpec(slug, run, inp.name, notes, step);
+  return { slug, id, answer, session, name, attach: `claude attach ${name}`, notes };
+}
+
+/**
+ * Starts a spec's session again in its worktree (steps 4-5 of answer-decision, also used by restart): removes the
+ * old session unless it is working (problems go into `notes`), starts `claude --bg` and records the run as running.
+ * `step(n, what, fn)` wraps each step so the caller's error names it. Returns {session, name}.
+ */
+function restartSpec(slug, run, nameInput, notes, step) {
   const sessions = claudeSessions(true);
   const old = sessions && run.session ? sessions.find((s) => s.id === run.session || s.sessionId === run.session) : null;
   let removed = false;
@@ -1516,7 +1526,7 @@ function answerDecision(inp) {
   // The old session's name when it is free, else the first three words of the slug without its number (plus the
   // number when another session has those words), as the autopilot names sessions.
   const taken = (n) => (sessions || []).some((s) => s.name === n && !(removed && s === old));
-  let name = inp.name ? String(inp.name) : '';
+  let name = nameInput ? String(nameInput) : '';
   if (!name && old && SESSION_NAME.test(old.name || '') && !taken(old.name)) name = old.name;
   if (!name) {
     const num = (slug.match(/^(\d+)-/) || [])[1];
@@ -1533,7 +1543,27 @@ function answerDecision(inp) {
     runReport({ slug, status: 'running', session: m[1] });
     return m[1];
   });
-  return { slug, id, answer, session, name, attach: `claude attach ${name}`, notes };
+  return { session, name };
+}
+
+/**
+ * Starts a blocked (no decision) or stalled spec again, or one with no session: what the status pane's restart button
+ * runs. Input: {slug, name?}, from the main checkout. A run with a decision must be answered (answer-decision); a
+ * running or done run is not restarted. Nothing changes when it refuses.
+ */
+function restart(inp) {
+  const slug = checkSlug(inp.slug);
+  if (inp.name != null && !SESSION_NAME.test(String(inp.name))) throw new Error(`name must be lowercase kebab-case, not ${JSON.stringify(inp.name)}`);
+  const root = mainRoot();
+  const run = readRun(slug);
+  if (run && run.decision) throw new Error(`${slug} waits for a decision (${run.decision.id}): answer it with answer-decision, not restart`);
+  const state = runState(slug, claudeSessions(), root).status;
+  if (state === 'done') throw new Error(`${slug} is done: nothing to restart`);
+  if (state === 'running' && run && run.session) throw new Error(`${slug} is running (session ${run.session}): not restarted`);
+  const notes = [];
+  const step = (n, what, fn) => { try { return fn(); } catch (e) { throw new Error(`restart (${what}): ${e.message}`); } };
+  const { session, name } = restartSpec(slug, run || {}, inp.name, notes, step);
+  return { slug, session, name, attach: `claude attach ${name}`, notes };
 }
 
 /** State of one autopilot run: its run file (done/blocked/running), or "stalled" when the session is idle or gone. */
@@ -1556,9 +1586,11 @@ function taskProgress(slug, root, base) {
   const md = featureFile(slug, 'tasks.md', root, base);
   const tasks = md == null ? [] : parseTasks(md);
   if (!tasks.length) return null;
-  const open = tasks.find((t) => !t.done);
+  const index = tasks.findIndex((t) => !t.done);
+  const open = tasks[index];
   const title = open && open.title.length > 30 ? open.title.slice(0, 29) + '…' : open ? open.title : '';
-  return { done: tasks.filter((t) => t.done).length, total: tasks.length, open: open ? `${open.id} ${title}`.trim() : '' };
+  // position: place of the open task in tasks.md counted from 1 (a session may renumber its ids: T-11 can be the 2nd task).
+  return { done: tasks.filter((t) => t.done).length, total: tasks.length, open: open ? `${open.id} ${title}`.trim() : '', position: open ? index + 1 : null };
 }
 
 /** Specs with a worktree or a run file, sorted: what `board` shows when no slugs are given. */
@@ -1631,7 +1663,10 @@ function status(inp) {
     const spec = featureFile(row.slug, 'spec.md', root, base) || '';
     const source = spec ? parseSpec(spec).source : '';
     const s = findSession(sessions, run, wt);
-    return { ...row, task: own && state.task ? String(state.task) : '', phase, issueUrl: /^https?:\/\/\S+$/.test(source) ? source : '',
+    const issueUrl = /^https?:\/\/\S+$/.test(source) ? source : '';
+    const numberIn = (url, kind) => { const n = (url.match(new RegExp(`/${kind}/(\\d+)(?:[/?#]|$)`)) || [])[1]; return n ? Number(n) : null; };
+    return { ...row, task: own && state.task ? String(state.task) : '', phase, issueUrl,
+      position: progress ? progress.position : null, issueNumber: numberIn(issueUrl, 'issues'), prNumber: numberIn(row.prUrl, 'pull'),
       title: spec ? specTitle(spec) : '', session: s ? s.name || s.id || '' : '', sessionState: s ? s.state || s.status || '' : '', at: run.at || '' };
   });
   return { rows, paneSeen };
@@ -2025,7 +2060,7 @@ async function suite(inp) {
 }
 
 const COMMANDS = {
-  plan, suite, phase, 'answer-decision': answerDecision, branch, block, commit, 'close-out': closeOut, 'add-secret-scan': addSecretScan, preflight,
+  plan, suite, phase, 'answer-decision': answerDecision, restart, branch, block, commit, 'close-out': closeOut, 'add-secret-scan': addSecretScan, preflight,
   'ci-watch': ciWatch, 'ci-rerun': ciRerun, context, 'stack-fill': stackFill, specs, 'autopilot-check': autopilotCheck, worktree, cleanup, 'run-report': runReport, 'runs-wait': runsWait, board, status,
   areas, 'simplify-spec': simplifySpec, 'spec-branch': specBranch, 'set-aside': setAside, 'sync-base': syncBase, decisions,
 };

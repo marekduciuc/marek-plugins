@@ -459,7 +459,7 @@ test('status rows carry phase, task, issue URL, title, session and decision, fro
   assert.deepStrictEqual(row(), {
     slug: '12-csv', status: 'running', done: 0, total: 3, current: 'T-1 Docker compose', prUrl: '', details: '',
     attach: 'claude attach csv-export-flow', task: 'T-2', phase: 'GREEN', issueUrl: 'https://github.com/o/r/issues/12',
-    title: 'CSV export', session: 'csv-export-flow', sessionState: 'working', at,
+    position: 1, issueNumber: 12, prNumber: null, title: 'CSV export', session: 'csv-export-flow', sessionState: 'working', at,
   });
   assert.deepStrictEqual(row(wt), row()); // called from the worktree: the same rows
   fs.writeFileSync(stateFile, '{"feature":"12-csv","phase":"IDLE","task":"T-2"}\n');
@@ -1729,4 +1729,89 @@ test('answer-decision stops at the restart when claude --bg prints no id, and a 
   assert.strictEqual(b.wg('log', '-2', '--format=%s'), 'docs(12-csv): answer Q-2\ndocs(12-csv): open Q-2'); // no second commit
   assert.strictEqual((fs.readFileSync(b.specFile, 'utf8').match(/Q-2 /g) || []).length, 1);
   assert.strictEqual(b.runFileJson().session, 'new-7');
+});
+
+// ---------- status position and numbers, restart (0.27.0) ----------
+test('status returns the position of the open task in a renumbered list, null when all are ticked', () => {
+  const { dir, wt } = withWorktree();
+  const env = fakeClaude([{ id: 's-1', kind: 'background', name: 'csv-export-flow', state: 'working' }]);
+  run(dir, 'run-report', { slug: '12-csv', status: 'running', session: 's-1' });
+  const ids = Array.from({ length: 16 }, (_, i) => 10 + i);
+  const list = (ticked) => ids.map((n, i) => `- [${i < ticked ? 'x' : ' '}] T-${n} Task ${n} (AC-1)\n`).join('');
+  const tasksFile = path.join(wt, '.tdd-flow/features/12-csv/tasks.md');
+  fs.writeFileSync(tasksFile, list(1));
+  const row = () => run(dir, 'status', {}, env).result.rows[0];
+  assert.deepStrictEqual([row().done, row().total, row().current, row().position], [1, 16, 'T-11 Task 11', 2]);
+  fs.writeFileSync(tasksFile, list(16));
+  assert.deepStrictEqual([row().current, row().position], ['simplify / review / PR', null]);
+});
+
+test('status parses issueNumber and prNumber from the URLs, null when they do not match', () => {
+  const { dir, wt } = withWorktree();
+  const env = fakeClaude([{ id: 's-1', kind: 'background', name: 'csv-export-flow', state: 'working' }]);
+  const specFile = path.join(wt, '.tdd-flow/features/12-csv/spec.md');
+  const report = (prUrl) => run(dir, 'run-report', { slug: '12-csv', status: 'done', session: 's-1', prUrl });
+  const row = () => run(dir, 'status', {}, env).result.rows[0];
+  report('https://github.com/o/r/pull/24');
+  fs.writeFileSync(specFile, SPEC.replace(/Source: .*/, 'Source: https://github.com/o/r/issues/25'));
+  assert.deepStrictEqual([row().issueNumber, row().prNumber], [25, 24]);
+  report('https://git.example.test/merge/abc');
+  fs.writeFileSync(specFile, SPEC.replace(/Source: .*/, 'Source: https://tracker.example.test/browse/ABC-1'));
+  assert.deepStrictEqual([row().issueNumber, row().prNumber, row().prUrl !== '', row().issueUrl !== ''], [null, null, true, true]);
+  report('');
+  fs.writeFileSync(specFile, SPEC.replace(/Source: .*/, 'Source: prompt text'));
+  assert.deepStrictEqual([row().issueNumber, row().prNumber], [null, null]);
+});
+
+/** A worktree whose run is recorded as given, with a logging fake claude listing `sessions`. */
+function restartable(report, sessions) {
+  const w = withWorktree();
+  if (report) run(w.dir, 'run-report', { slug: '12-csv', ...report });
+  const claude = loggingClaude(sessions || [{ id: 'old-1', kind: 'background', name: 'csv-export-flow', state: 'done', cwd: w.wt }]);
+  const runFileJson = () => JSON.parse(fs.readFileSync(path.join(w.dir, '.git/tdd-flow/runs/12-csv.json'), 'utf8'));
+  return { ...w, claude, runFileJson, restart: (inp, env = claude.env) => run(w.dir, 'restart', { slug: '12-csv', ...inp }, env) };
+}
+
+test('restart refuses a running run, a done run and a run with a decision, and changes nothing', () => {
+  const working = [{ id: 'old-1', kind: 'background', name: 'csv-export-flow', state: 'working' }];
+  const cases = [
+    [{ status: 'running', session: 'old-1' }, working, /running/],
+    [{ status: 'done', session: 'old-1', prUrl: 'https://github.com/o/r/pull/7' }, null, /done/],
+    [{ status: 'blocked', session: 'old-1', details: 'x', decision: Q2_DECISION }, null, /answer-decision/],
+  ];
+  for (const [report, sessions, why] of cases) {
+    const b = restartable(report, sessions);
+    const before = fs.readFileSync(path.join(b.dir, '.git/tdd-flow/runs/12-csv.json'), 'utf8');
+    const r = b.restart({});
+    assert.strictEqual(r.ok, false, JSON.stringify(report));
+    assert.match(r.error, why);
+    assert.strictEqual(b.claude.log(), '');
+    assert.strictEqual(fs.readFileSync(path.join(b.dir, '.git/tdd-flow/runs/12-csv.json'), 'utf8'), before);
+  }
+});
+
+test('restart starts a blocked run without decision and a stalled one again, removing the old session unless it works', () => {
+  for (const report of [{ status: 'blocked', session: 'old-1', details: 'tests hang' }, { status: 'running', session: 'old-1' }]) {
+    const b = restartable(report); // the old session is done: a running run is stalled
+    const r = b.restart({});
+    assert.strictEqual(r.ok, true, r.error);
+    assert.deepStrictEqual(r.result, { slug: '12-csv', session: 'new-7', name: 'csv-export-flow', attach: 'claude attach csv-export-flow', notes: [] });
+    assert.match(b.claude.log(), /^rm old-1$/m);
+    assert.match(b.claude.log(), new RegExp(`^--bg -n csv-export-flow /tdd-flow:implement-spec 12-csv main in ${esc(b.wt)}$`, 'm'));
+    const now = b.runFileJson();
+    assert.deepStrictEqual([now.status, now.session], ['running', 'new-7']);
+  }
+  // A blocked run whose old session still works keeps that session and gets a name from the slug.
+  const w = restartable({ status: 'blocked', session: 'old-1', details: 'x' }, [{ id: 'old-1', kind: 'background', name: 'csv-export-flow', state: 'working' }]);
+  const r = w.restart({ name: 'csv-again' });
+  assert.strictEqual(r.ok, true, r.error);
+  assert.doesNotMatch(w.claude.log(), /^rm /m);
+  assert.strictEqual(r.result.name, 'csv-again');
+  assert.match(r.result.notes.join('\n'), /old-1.*working/);
+  // No run recorded at all: nothing to remove, the worktree is reused.
+  const none = restartable(null, []);
+  const rn = none.restart({});
+  assert.strictEqual(rn.ok, true, rn.error);
+  assert.strictEqual(rn.result.session, 'new-7');
+  assert.strictEqual(none.runFileJson().status, 'running');
 });

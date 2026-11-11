@@ -1,5 +1,6 @@
 // tdd-flow status pane: every spec of the repo beside the chat (`tdd-flow status`, every 10 s), the workflows this
-// session started, and a waiting decision answered from the pane through the answer-decision skill.
+// session started, a waiting decision answered from the pane through the answer-decision skill, and a blocked or
+// stalled spec restarted with `tdd-flow restart` (no model).
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, RenderViewport, ThemeKey } from 'claude-code'
 
@@ -17,6 +18,7 @@ const ANSWER_SKILL = 'tdd-flow:answer-decision'
 const status = atom({ plugin: 'tdd-flow', key: 'status' } as const, null, { shape: 'status-1' })
 const isClosed = atom({ plugin: 'tdd-flow', key: 'isClosed' } as const, false)
 const sent = atom({ plugin: 'tdd-flow', key: 'sent' } as const, [], { shape: 'sent-1' })
+const restarts = atom({ plugin: 'tdd-flow', key: 'restarts' } as const, [], { shape: 'restarts-1' })
 const workflows = atom({ plugin: 'tdd-flow', key: 'workflows' } as const, [], { shape: 'workflows-1' })
 
 /** Display order and colour per kind of row; a blocked row with a decision is its own kind. */
@@ -34,11 +36,15 @@ const rankOf = (row: StatusRow): number => {
   return i < 0 ? KINDS.length : i
 }
 const colorOf = (row: StatusRow): ThemeKey => KINDS.find(k => k.kind === kindOf(row))?.color ?? 'subtle'
+/** A blocked row without a decision or a stalled row can be restarted from the pane. */
+const canRestart = (row: StatusRow): boolean => row.status === 'stalled' || (row.status === 'blocked' && !row.decision)
 const isActive = (row: StatusRow): boolean => ['running', 'blocked', 'stalled'].includes(row.status)
 
 /** Cuts `text` to `width` cells with an ellipsis. */
 const fit = (text: string, width: number): string =>
   text.length <= width ? text : `${text.slice(0, Math.max(0, width - 1))}…`
+/** `#<n>` when the number was parsed, else the last path part of the URL. */
+const linkTail = (n: number | null, url: string): string => (n !== null ? `#${n}` : (url.replace(/[?#].*$/, '').split('/').filter(Boolean).pop() ?? url))
 const firstLine = (text: string): string => text.split('\n')[0] ?? ''
 const errorText = (err: unknown): string => (err instanceof Error ? err.message : String(err))
 
@@ -99,6 +105,11 @@ async function refresh($: EngineInterface): Promise<void> {
   const waiting = answered.filter(s => rows.some(r => r.slug === s.slug && r.status !== 'running'))
   if (waiting.length !== answered.length) await update($, sent, list => list.filter(s => waiting.some(w => w.slug === s.slug)))
 
+  // A restart error stays until the row can no longer be restarted (it runs again) or the button is pressed again.
+  const failed = await read($, restarts)
+  const kept = failed.filter(r => r.error === '' || rows.some(row => row.slug === r.slug && canRestart(row)))
+  if (kept.length !== failed.length) await update($, restarts, () => kept)
+
   const docks = viewport?.isFullscreen === true && viewport.columns >= DOCK_COLUMNS
   if (!pane && !closedByPerson && docks && rows.some(isActive)) await $.ui.open({ id: PANE, title: TITLE })
 
@@ -133,6 +144,23 @@ async function answer($: EngineInterface, slug: string, id: string, text: string
     await update($, sent, list => list.filter(s => s.slug !== slug))
     $.ui.log(`tdd-flow: the answer to ${slug} ${id} was not sent: ${errorText(err)}`)
   }
+}
+
+/** Runs `tdd-flow restart` for a spec (no model, no skill); the row says "restarting…" meanwhile and shows the CLI's error line when it fails. */
+async function restart($: EngineInterface, slug: string): Promise<void> {
+  const root = await specRoot($)
+  if (root === null) return
+  await update($, restarts, list => [...list.filter(r => r.slug !== slug), { slug, error: '' }])
+  let error = ''
+  try {
+    const ran = await $.process.run([`${$.plugin.root}/bin/tdd-flow`, 'restart'], { cwd: root, stdin: JSON.stringify({ slug }), timeoutMs: CLI_TIMEOUT_MS })
+    const out = JSON.parse(ran.stdout) as { ok: boolean; error?: string }
+    if (!out.ok) error = firstLine(out.error ?? `tdd-flow restart: exit ${ran.exitCode}`)
+  } catch (err) {
+    error = `tdd-flow restart failed: ${firstLine(errorText(err))}`
+  }
+  await update($, restarts, list => (error ? list.map(r => (r.slug === slug ? { slug, error } : r)) : list.filter(r => r.slug !== slug)))
+  if (!error) await refresh($).catch(err => showError($, err))
 }
 
 export const register: Register = on => {
@@ -202,6 +230,7 @@ export const register: Register = on => {
     const snapshot = await read($, status)
     const answered = await read($, sent)
     const flows = await read($, workflows)
+    const restarting = await read($, restarts)
     const now = await $.clock.now()
     const rows = [...(snapshot?.rows ?? [])].sort((a, b) => rankOf(a) - rankOf(b))
     const firstDecision = rows.find(r => r.decision)?.slug
@@ -209,8 +238,8 @@ export const register: Register = on => {
     const meta = (row: StatusRow) => {
       const parts = [
         row.phase ? <Text>{row.phase}</Text> : null,
-        row.issueUrl ? <Link href={row.issueUrl}>{`#${(row.issueUrl.match(/\/(\d+)\/?$/) ?? [])[1] ?? 'issue'}`}</Link> : null,
-        row.prUrl ? <Link href={row.prUrl}>PR</Link> : null,
+        row.issueUrl ? <Link href={row.issueUrl}>{`issue ${linkTail(row.issueNumber, row.issueUrl)}`}</Link> : null,
+        row.prUrl ? <Link href={row.prUrl}>{`PR ${linkTail(row.prNumber, row.prUrl)}`}</Link> : null,
         row.attach ? <Text>{row.attach}</Text> : null,
       ].filter(part => part !== null)
       if (parts.length === 0) return null
@@ -259,20 +288,34 @@ export const register: Register = on => {
 
     const specRow = (row: StatusRow) => {
       const word = kindOf(row)
-      const tasks = row.total === null ? '–' : `${row.done}/${row.total}${row.current ? ` · ${row.current}` : ''}`
+      const open = row.position !== null ? row.current.match(/^(T-\d+)\s*(.*)$/) : null
+      const current = open ? `${open[1]} (task ${row.position}) ${open[2]}`.trim() : row.current
+      const tasks = row.total === null ? '–' : `${row.done}/${row.total} done${current ? ` · ${current}` : ''}`
+      const label = row.title || row.slug
+      const room = cols - word.length - 3
+      const showSlug = row.title !== '' && row.title.length + 2 + row.slug.length <= room
+      const mine = restarting.find(r => r.slug === row.slug)
       const why = !row.decision && ['blocked', 'stalled'].includes(row.status) && row.details ? firstLine(row.details) : ''
       return (
         <Box flexDirection="column" marginBottom={1}>
           <Box flexDirection="row" justifyContent="space-between">
             <Text wrap="truncate-end">
               <Text color={colorOf(row)}>●</Text>
-              {` ${fit(row.slug, cols - word.length - 3)}`}
+              {` ${fit(label, room)}`}
+              {showSlug ? <Text dimColor>{`  ${row.slug}`}</Text> : null}
             </Text>
             <Text color={colorOf(row)}>{word}</Text>
           </Box>
           <Text dimColor wrap="truncate-end">{`  ${tasks}`}</Text>
           {meta(row)}
           {why ? <Text color={colorOf(row)} wrap="truncate-end">{`  ${why}`}</Text> : null}
+          {mine?.error ? <Text color="error" wrap="truncate-end">{`  ${mine.error}`}</Text> : null}
+          {mine?.error === '' ? <Text dimColor>{'  restarting…'}</Text> : null}
+          {canRestart(row) && mine?.error !== '' ? (
+            <Box paddingLeft={2}>
+              <Button key={`restart:${row.slug}`} label="restart" onPress={() => void restart($, row.slug)} />
+            </Box>
+          ) : null}
           {decisionBlock(row)}
         </Box>
       )

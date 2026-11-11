@@ -17,6 +17,11 @@ export type StatusRow = {
   task: string
   phase: string
   issueUrl: string
+  /** Place of the open task in tasks.md counted from 1 (ids may be renumbered); null when no task is open. */
+  position: number | null
+  /** From `/issues/<n>` of issueUrl and `/pull/<n>` of prUrl; null when absent or not parseable. */
+  issueNumber: number | null
+  prNumber: number | null
   title: string
   session: string
   sessionState: string
@@ -29,6 +34,9 @@ export type StatusSnapshot = { rows: StatusRow[]; error: string }
 /** A decision answered from the pane, shown as "answer sent" until the spec runs again. */
 export type SentAnswer = { slug: string; id: string }
 
+/** A restart started from the pane: `error` is empty while it runs, else the CLI's error line. */
+export type RestartState = { slug: string; error: string }
+
 /** A Workflow started in this session that has not sent its task notification yet. */
 export type SessionWorkflow = { taskId: string; name: string; feature: string; startedAt: number }
 
@@ -38,6 +46,7 @@ declare module 'claude-code' {
       status: Shaped<StatusSnapshot | null>
       isClosed: boolean
       sent: Shaped<SentAnswer[]>
+      restarts: Shaped<RestartState[]>
       workflows: Shaped<SessionWorkflow[]>
     }
   }
