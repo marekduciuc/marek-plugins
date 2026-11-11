@@ -749,8 +749,17 @@ function kebab(s, max = 40) {
   return (cut.includes('-') ? cut.slice(0, cut.lastIndexOf('-')) : cut) || 'feature';
 }
 
-/** analyze-requirements context: the stack profile (if detected before) and the requirement, where code can get it. */
+/**
+ * analyze-requirements context: the stack profile (if detected before), the requirement where code can get it, and
+ * the other specs (a digest each) with their decisions.
+ */
 function context(inp) {
+  const res = requirementContext(inp);
+  const others = allSpecs(res.req ? res.req.slug : null);
+  return { ...res, otherSpecs: others.map(specDigest), decisions: collectDecisions(others).decisions };
+}
+
+function requirementContext(inp) {
   const input = String(inp.input || '').trim();
   const res = { stack: readStack(), kind: 'text' };
   // The feature state.json points at, for the workflow to decide whether the new spec may take it over.
@@ -860,6 +869,99 @@ function specTitle(spec) {
   const goal = ((spec.match(/^##\s+Goal\s*\n+([\s\S]*?)(?:\n\s*\n|\n#|$)/m) || [])[1] || '').replace(/\s+/g, ' ').trim();
   const first = (goal.match(/^.*?[.!?](?=\s|$)/) || [goal])[0];
   return first.length > 80 ? `${first.slice(0, 79)}…` : first;
+}
+
+// ---------- earlier specs and their decisions (context, decisions) ----------
+/** The main checkout's root, also when called from a worktree (mainRoot() refuses worktrees): git lists it first. */
+const mainCheckout = () => (worktreeList()[0] || {}).path || path.dirname(commonDir());
+
+/** The lines of a spec's `## <name>` section, up to the next `#` or `##` heading. */
+function sectionLines(spec, name) {
+  const out = [];
+  let inside = false;
+  for (const line of spec.split(/\r?\n/)) {
+    if (/^#{1,2}\s/.test(line)) { inside = new RegExp(`^##\\s+${esc(name)}\\s*$`, 'i').test(line); continue; }
+    if (inside) out.push(line);
+  }
+  return out;
+}
+
+/**
+ * Every spec of the repo except `skip`, from its newest copy: the worktree's file, feature/<slug>, the base branch,
+ * else the main checkout's file (the order of taskProgress). Slugs: the spec folders of the main and the current
+ * checkout, plus feature/* branches that hold a spec. [{slug, text, path}]; path is a file, or `<ref>:<file>` for git show.
+ */
+function allSpecs(skip) {
+  const root = mainCheckout();
+  const base = baseBranch();
+  const folders = (dir) => { try { return fs.readdirSync(path.join(dir, '.tdd-flow/features'), { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name); } catch { return []; } };
+  const branches = gitOut('for-each-ref', '--format=%(refname)', 'refs/heads/feature/').split('\n').filter(Boolean)
+    .map((ref) => ref.slice('refs/heads/feature/'.length))
+    .filter((s) => SLUG.test(s) && git('cat-file', '-e', `refs/heads/feature/${s}:${featureDir(s)}/spec.md`).code === 0);
+  const slugs = [...new Set([...folders(root), ...folders(process.cwd()), ...branches])].filter((s) => SLUG.test(s) && s !== skip).sort();
+  const found = [];
+  for (const slug of slugs) {
+    const rel = `${featureDir(slug)}/spec.md`;
+    const wtFile = path.join(root, WORKTREES, slug, rel);
+    let spec = read(wtFile) != null ? { text: read(wtFile), path: wtFile } : null;
+    for (const ref of [`feature/${slug}`, base]) {
+      if (spec) break;
+      const r = showFile(`refs/heads/${ref}`, rel);
+      if (r.code === 0) spec = { text: r.out, path: `${ref}:${rel}` };
+    }
+    const mainFile = path.join(root, rel);
+    if (!spec && read(mainFile) != null) spec = { text: read(mainFile), path: mainFile };
+    if (spec) found.push({ slug, ...spec });
+  }
+  return found;
+}
+
+// `- Q-<n> <question> - **Answer:** <answer> (<dd.MM.yyyy>) → <where>` (format of skills/resolve-questions).
+const DECISION_LINE = /^[-*]\s+(Q-\d+)\s+(.+?)\s+-\s+\*\*Answer:\*\*\s+(.+)\s+\((\d{2}\.\d{2}\.\d{4})\)\s*→\s*(.+)$/;
+
+/** Entries of `## Resolved questions`; an indented line continues the entry above it. Lines that do not parse are counted. */
+function parseDecisions(spec) {
+  const entries = [];
+  let skipped = 0;
+  for (const line of sectionLines(spec, 'Resolved questions')) {
+    if (!line.trim()) continue;
+    if (/^\s/.test(line) && entries.length) entries[entries.length - 1] += ` ${line.trim()}`;
+    else if (/^[-*]\s/.test(line)) entries.push(line.trim());
+    else skipped++;
+  }
+  const decisions = [];
+  for (const entry of entries) {
+    const m = entry.match(DECISION_LINE);
+    if (!m) { skipped++; continue; }
+    decisions.push({ id: m[1], question: m[2], answer: m[3], date: m[4], where: m[5].trim() });
+  }
+  return { decisions, skipped };
+}
+
+/** The decisions of the given specs. No similarity logic: judging what an earlier decision covers is the agent's job. */
+function collectDecisions(found) {
+  const decisions = [];
+  let skippedLines = 0;
+  for (const s of found) {
+    const p = parseDecisions(s.text);
+    skippedLines += p.skipped;
+    const title = specTitle(s.text);
+    for (const d of p.decisions) decisions.push({ slug: s.slug, title, ...d });
+  }
+  return { decisions, conflicts: [], skippedLines };
+}
+
+/** Earlier decisions of every other spec. Input: {slug?} (the asking spec, left out). */
+function decisions(inp) {
+  return collectDecisions(allSpecs(inp.slug == null ? null : checkSlug(inp.slug)));
+}
+
+/** A short digest of a spec for the cross-spec critic: it opens only the specs it suspects. */
+function specDigest(s) {
+  const p = parseSpec(s.text);
+  const acs = Object.entries(p.crit).filter(([id]) => id.startsWith('AC-')).map(([id, c]) => ({ id, name: c.name }));
+  const outOfScope = sectionLines(s.text, 'Out of scope').map((l) => (l.match(/^[-*]\s+(.*\S)\s*$/) || [])[1]).filter(Boolean);
+  return { slug: s.slug, title: specTitle(s.text), status: p.status || 'none', path: s.path, acs, outOfScope };
 }
 
 function specs(inp) {
@@ -1771,7 +1873,7 @@ async function suite() {
 const COMMANDS = {
   plan, suite, branch, block, commit, 'close-out': closeOut, 'add-secret-scan': addSecretScan, preflight,
   'ci-watch': ciWatch, 'ci-rerun': ciRerun, context, 'stack-fill': stackFill, specs, 'autopilot-check': autopilotCheck, worktree, cleanup, 'run-report': runReport, 'runs-wait': runsWait, board, status,
-  areas, 'simplify-spec': simplifySpec, 'spec-branch': specBranch, 'set-aside': setAside, 'sync-base': syncBase,
+  areas, 'simplify-spec': simplifySpec, 'spec-branch': specBranch, 'set-aside': setAside, 'sync-base': syncBase, decisions,
 };
 
 async function main(argv) {
