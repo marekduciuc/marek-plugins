@@ -594,8 +594,9 @@ try {
     let review = null
     for (let round = 1; !skipReason && round <= MAX_REVIEW_ROUNDS + 1; round++) {
       // The CLI runs the full suite itself, so a wrong suitePass from the implementer cannot reach the commit.
-      // When the implementer really ran it, this and the reviewer's own run are cache hits.
-      const checked = checksSuite() ? await cli('suite', {}, SUITE, { label: `${task.id} suite ${round}`, phase: 'Review' }) : null
+      // When the implementer really ran it, this and the reviewer's own run are cache hits. It also sets the phase
+      // REVIEW in state.json (the status pane shows it); the commit sets IDLE again.
+      const checked = checksSuite() ? await cli('suite', { phase: 'REVIEW' }, SUITE, { label: `${task.id} suite ${round}`, phase: 'Review' }) : null
       if (checked && !checked.ok) log(`${task.id}: the CLI suite check did not run (${checked.error}) - relying on the reviewer`)
       const suite = checked && checked.ok && checked.result.ran ? checked.result : null
       review = await run(

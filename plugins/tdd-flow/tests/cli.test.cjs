@@ -636,11 +636,15 @@ function fakeGh(prs) {
   fs.writeFileSync(f, prs ? `#!/bin/sh\necho '${JSON.stringify(prs)}'\n` : '#!/bin/sh\necho "gh: not logged in" >&2\nexit 1\n', { mode: 0o755 });
   return { TDD_FLOW_GH_BIN: f };
 }
-/** Fake `claude` that prints sessions for `agents` and logs `rm` calls. */
-function loggingClaude(sessions) {
+/**
+ * Fake `claude` that prints sessions for `agents` and logs `rm` calls. `--bg -n <name> <prompt>` calls are logged with
+ * the directory they ran in and print `bgOut` (default: `backgrounded · new-7 · <name>`, as the real CLI does).
+ */
+function loggingClaude(sessions, { bgOut } = {}) {
   const d = fs.mkdtempSync(path.join(os.tmpdir(), 'tdd-flow-claude-'));
   const f = path.join(d, 'claude');
-  fs.writeFileSync(f, `#!/bin/sh\nif [ "$1" = rm ]; then echo "$@" >> "${d}/log"; else echo '${JSON.stringify(sessions)}'; fi\n`, { mode: 0o755 });
+  const bg = bgOut == null ? 'echo "backgrounded · new-7 · $3"' : `echo '${bgOut}'`;
+  fs.writeFileSync(f, `#!/bin/sh\nif [ "$1" = rm ]; then echo "$@" >> "${d}/log"; elif [ "$1" = --bg ]; then echo "$@ in $(pwd -P)" >> "${d}/log"; ${bg}; else echo '${JSON.stringify(sessions)}'; fi\n`, { mode: 0o755 });
   return { env: { TDD_FLOW_CLAUDE_BIN: f }, log: () => (fs.existsSync(path.join(d, 'log')) ? fs.readFileSync(path.join(d, 'log'), 'utf8') : '') };
 }
 /** Main checkout with the worktree of 12-csv; returns the worktree path and its branch tip. */
@@ -1528,4 +1532,201 @@ test('context returns the other specs and their decisions, without the spec bein
   write('docs/req.md', '# A export\n\nAgain.\n');
   const again = run(dir, 'context', { input: 'docs/req.md' }).result;
   assert.deepStrictEqual([again.otherSpecs.map((s) => s.slug), again.decisions], [['12-csv'], []]);
+});
+
+// ---------- phase, suite {phase}, answer-decision (0.25.0) ----------
+const PHASE_VALUES = ['RED', 'GREEN', 'REFACTOR', 'SETUP', 'REVIEW', 'IDLE'];
+
+test('phase writes each allowed value and keeps feature and task, through a rename', () => {
+  const { dir, read } = repo();
+  const file = path.join(dir, '.tdd-flow/state.json');
+  let previous = 'IDLE';
+  for (const phase of PHASE_VALUES) {
+    const ino = fs.statSync(file).ino;
+    const r = run(dir, 'phase', { phase });
+    assert.strictEqual(r.ok, true, r.error);
+    assert.deepStrictEqual(r.result, { phase, previous });
+    assert.deepStrictEqual(JSON.parse(read('.tdd-flow/state.json')), { feature: '12-csv', phase, task: 'T-1' });
+    assert.notStrictEqual(fs.statSync(file).ino, ino); // a new file renamed over the old one: never half written
+    previous = phase;
+  }
+  assert.deepStrictEqual(fs.readdirSync(path.join(dir, '.tdd-flow')).filter((f) => f.endsWith('.tmp')), []);
+});
+
+test('phase refuses other values and a broken state.json, and creates no state.json', () => {
+  const { dir, read, write } = repo();
+  const bad = run(dir, 'phase', { phase: 'review' });
+  assert.strictEqual(bad.ok, false);
+  assert.match(bad.error, /RED, GREEN, REFACTOR, SETUP, REVIEW, IDLE/);
+  assert.match(run(dir, 'phase', {}).error, /RED, GREEN, REFACTOR, SETUP, REVIEW, IDLE/);
+  assert.strictEqual(JSON.parse(read('.tdd-flow/state.json')).phase, 'IDLE');
+  write('.tdd-flow/state.json', '{"feature":');
+  assert.match(run(dir, 'phase', { phase: 'RED' }).error, /state\.json/);
+  fs.rmSync(path.join(dir, '.tdd-flow/state.json'));
+  assert.deepStrictEqual(run(dir, 'phase', { phase: 'RED' }).result, { skipped: 'no state.json' });
+  assert.ok(!fs.existsSync(path.join(dir, '.tdd-flow/state.json')));
+});
+
+test('suite with phase REVIEW leaves REVIEW in state.json, and status shows it as review', () => {
+  const { dir, read } = repo();
+  assert.strictEqual(run(dir, 'suite', { phase: 'REVIEW' }).result.pass, true);
+  assert.deepStrictEqual(JSON.parse(read('.tdd-flow/state.json')), { feature: '12-csv', phase: 'REVIEW', task: 'T-1' });
+  assert.match(run(dir, 'suite', { phase: 'LATER' }).error, /RED, GREEN, REFACTOR, SETUP, REVIEW, IDLE/);
+  // status: REVIEW shows as review, also for a blocked spec; IDLE keeps the older fallback.
+  const t = trackedRepo();
+  const env = fakeClaude([{ id: 's-1', kind: 'background', name: 'csv-export-flow', state: 'working' }]);
+  run(t.dir, 'run-report', { slug: '12-csv', status: 'running', session: 's-1' });
+  const wt = run(t.dir, 'worktree', { slug: '12-csv' }).result.path;
+  const stateFile = path.join(wt, '.tdd-flow/state.json');
+  fs.writeFileSync(stateFile, '{"feature":"12-csv","phase":"REVIEW","task":"T-1"}\n');
+  assert.strictEqual(run(t.dir, 'status', {}, env).result.rows[0].phase, 'review');
+  fs.writeFileSync(stateFile, '{"feature":"12-csv","phase":"IDLE","task":"T-1"}\n');
+  assert.strictEqual(run(t.dir, 'status', {}, env).result.rows[0].phase, 'review');
+  run(t.dir, 'run-report', { slug: '12-csv', status: 'blocked', details: 'x' });
+  assert.strictEqual(run(t.dir, 'status', {}, env).result.rows[0].phase, '');
+  fs.writeFileSync(stateFile, '{"feature":"12-csv","phase":"REVIEW","task":"T-1"}\n');
+  assert.strictEqual(run(t.dir, 'status', {}, env).result.rows[0].phase, 'review');
+});
+
+test('the agents set the phase through tdd-flow phase, and the workflow passes phase REVIEW to suite', () => {
+  const agents = path.join(__dirname, '..', 'agents');
+  const calls = (f) => [...fs.readFileSync(path.join(agents, f), 'utf8').matchAll(/tdd-flow phase <<'TDD_FLOW_JSON'\n\s*\{"phase": "([A-Z]+)"\}\n\s*TDD_FLOW_JSON/g)].map((m) => m[1]);
+  for (const f of fs.readdirSync(agents)) {
+    const text = fs.readFileSync(path.join(agents, f), 'utf8');
+    for (const re of [/set (its )?`phase`/i, /`phase`[^.\n]*state\.json/i, /state\.json[^.\n]*\b(set|write|change)\b[^.\n]*phase/i]) {
+      assert.doesNotMatch(text, re, `${f} still edits the phase in state.json by hand`);
+    }
+  }
+  assert.deepStrictEqual(calls('test-writer.md'), ['RED', 'RED', 'RED']);
+  assert.deepStrictEqual(calls('implementer.md'), ['GREEN', 'REFACTOR', 'REFACTOR', 'SETUP']);
+  const wf = fs.readFileSync(path.join(__dirname, '..', 'workflows', 'tdd-implement.js'), 'utf8');
+  assert.match(wf, /cli\('suite', \{ phase: 'REVIEW' \}/);
+});
+
+const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const today = () => { const d = new Date(); return `${String(d.getDate()).padStart(2, '0')}.${String(d.getMonth() + 1).padStart(2, '0')}.${d.getFullYear()}`; };
+const OPEN_QUESTIONS = '## Open questions\n\n- Q-1 Keep the header row? - *assumption if unanswered:* yes\n' +
+  '- Q-2 Should an empty report export only the header? - *assumption if unanswered:* header only\n  - Options: header only / no file, 204\n  - Blocks: T-2\n\n';
+const Q2_DECISION = { id: 'Q-2', question: 'Should an empty report export only the header?', recommendation: 'header only', options: ['header only', 'no file, 204'], tasks: ['T-2'] };
+
+/** A spec blocked on Q-2 in its worktree (spec committed on feature/12-csv), with the given fake claude. */
+function blockedSpec({ spec = SPEC.replace('## Edge cases', `${OPEN_QUESTIONS}## Edge cases`), tasks = TASKS, sessions } = {}) {
+  const w = withWorktree();
+  const wg = (...a) => execFileSync('git', ['-C', w.wt, ...a], { stdio: 'pipe' }).toString().trim();
+  const specFile = path.join(w.wt, '.tdd-flow/features/12-csv/spec.md');
+  fs.writeFileSync(specFile, spec);
+  fs.writeFileSync(path.join(w.wt, '.tdd-flow/features/12-csv/tasks.md'), tasks);
+  wg('commit', '-qam', 'docs(12-csv): open Q-2');
+  run(w.dir, 'run-report', { slug: '12-csv', status: 'blocked', session: 'old-1', details: 'T-2 needs a decision', decision: Q2_DECISION });
+  const claude = loggingClaude(sessions || [{ id: 'old-1', kind: 'background', name: 'csv-export-flow', state: 'done', cwd: w.wt }]);
+  const runFileJson = () => JSON.parse(fs.readFileSync(path.join(w.dir, '.git/tdd-flow/runs/12-csv.json'), 'utf8'));
+  return { ...w, wg, specFile, claude, runFileJson, answer: (inp, env = claude.env) => run(w.dir, 'answer-decision', { slug: '12-csv', id: 'Q-2', answer: 'header only', ...inp }, env) };
+}
+
+test('answer-decision moves the entry to a new Resolved questions section, commits, replaces the session and reports running', () => {
+  const b = blockedSpec();
+  const r = b.answer({ where: 'AC-1' });
+  assert.strictEqual(r.ok, true, r.error);
+  const spec = fs.readFileSync(b.specFile, 'utf8');
+  assert.ok(spec.includes('## Open questions\n\n- Q-1 Keep the header row? - *assumption if unanswered:* yes\n\n' +
+    `## Resolved questions\n\n- Q-2 Should an empty report export only the header? - **Answer:** header only (${today()}) → AC-1\n  - Options: header only / no file, 204\n  - Blocks: T-2\n\n## Edge cases`), spec);
+  assert.match(spec, /Status: approved/);
+  // decisions parses the moved entry.
+  const d = run(b.dir, 'decisions', {}).result.decisions.find((x) => x.slug === '12-csv');
+  assert.deepStrictEqual([d.id, d.question, d.answer, d.date], ['Q-2', 'Should an empty report export only the header?', 'header only', today()]);
+  assert.match(d.where, /^AC-1\b/);
+  // The commit holds the spec folder only.
+  assert.strictEqual(b.wg('log', '-1', '--format=%s'), 'docs(12-csv): answer Q-2');
+  assert.strictEqual(b.wg('show', '--name-only', '--format=', 'HEAD'), '.tdd-flow/features/12-csv/spec.md');
+  // The old session (done) is removed and its free name reused; the new one starts in the worktree.
+  assert.match(b.claude.log(), /^rm old-1$/m);
+  assert.match(b.claude.log(), new RegExp(`^--bg -n csv-export-flow /tdd-flow:implement-spec 12-csv main in ${esc(b.wt)}$`, 'm'));
+  assert.deepStrictEqual(r.result, { slug: '12-csv', id: 'Q-2', answer: 'header only', session: 'new-7', name: 'csv-export-flow', attach: 'claude attach csv-export-flow', notes: [] });
+  const runNow = b.runFileJson();
+  assert.deepStrictEqual([runNow.status, runNow.session, runNow.decision], ['running', 'new-7', undefined]);
+  // Answered: a second call errors and changes nothing.
+  const again = b.answer({});
+  assert.match(again.error, /already answered or another question/);
+  assert.strictEqual(fs.readFileSync(b.specFile, 'utf8'), spec);
+});
+
+test('answer-decision appends to an existing Resolved questions section, where defaults to no change', () => {
+  const resolved = '## Resolved questions\n\n- Q-1 Delimiter? - **Answer:** semicolon (03.11.2026) → AC-1\n\n';
+  const b = blockedSpec({ spec: SPEC.replace('## Edge cases', `${OPEN_QUESTIONS}${resolved}## Edge cases`).replace('- Q-1 Keep the header row? - *assumption if unanswered:* yes\n', '') });
+  const r = b.answer({ name: 'csv-header-answer' });
+  assert.strictEqual(r.ok, true, r.error);
+  const spec = fs.readFileSync(b.specFile, 'utf8');
+  assert.ok(spec.includes('## Open questions\n\n## Resolved questions\n\n- Q-1 Delimiter? - **Answer:** semicolon (03.11.2026) → AC-1\n' +
+    `- Q-2 Should an empty report export only the header? - **Answer:** header only (${today()}) → no change\n  - Options: header only / no file, 204\n  - Blocks: T-2\n\n## Edge cases`), spec);
+  assert.strictEqual((spec.match(/## Resolved questions/g) || []).length, 1);
+  assert.strictEqual(r.result.name, 'csv-header-answer');
+  assert.match(b.claude.log(), /^--bg -n csv-header-answer /m);
+});
+
+test('answer-decision for an implemented spec needs an open task first, then sets approved', () => {
+  const ticked = TASKS.replace(/\[ \]/g, '[x]');
+  const b = blockedSpec({ spec: SPEC.replace('## Edge cases', `${OPEN_QUESTIONS}## Edge cases`).replace('Status: approved', 'Status: implemented'), tasks: ticked });
+  const head = b.wg('rev-parse', 'HEAD');
+  const before = fs.readFileSync(b.specFile, 'utf8');
+  const r = b.answer({});
+  assert.strictEqual(r.ok, false);
+  assert.match(r.error, /add the task for the answer first/);
+  assert.strictEqual(fs.readFileSync(b.specFile, 'utf8'), before);
+  assert.strictEqual(b.wg('rev-parse', 'HEAD'), head);
+  assert.strictEqual(b.claude.log(), '');
+  assert.strictEqual(b.runFileJson().status, 'blocked');
+  // The model adds the task for the answer (uncommitted); then the spec goes back to approved in the same commit.
+  fs.writeFileSync(path.join(b.wt, '.tdd-flow/features/12-csv/tasks.md'), `${ticked}- [ ] T-21 Header-only export (AC-1)\n`);
+  const ok = b.answer({});
+  assert.strictEqual(ok.ok, true, ok.error);
+  assert.match(fs.readFileSync(b.specFile, 'utf8'), /Status: approved/);
+  assert.strictEqual(b.wg('show', '--name-only', '--format=', 'HEAD'), '.tdd-flow/features/12-csv/spec.md\n.tdd-flow/features/12-csv/tasks.md');
+});
+
+test('answer-decision keeps a working session and picks a name from the slug', () => {
+  const b = blockedSpec({ sessions: [{ id: 'old-1', kind: 'background', name: 'csv-export-flow', state: 'working', cwd: '/elsewhere' }] });
+  const r = b.answer({});
+  assert.strictEqual(r.ok, true, r.error);
+  assert.doesNotMatch(b.claude.log(), /^rm /m);
+  assert.strictEqual(r.result.name, 'csv');
+  assert.match(r.result.notes.join('\n'), /old-1.*working/);
+  // Unknown session list: no rm either.
+  const u = blockedSpec();
+  const broken = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'tdd-flow-claude-')), 'claude');
+  fs.writeFileSync(broken, `#!/bin/sh\nif [ "$1" = agents ]; then exit 1; fi\necho "$@" >> "${broken}.log"\necho "backgrounded · new-8 · $3"\n`, { mode: 0o755 });
+  const ru = u.answer({}, { TDD_FLOW_CLAUDE_BIN: broken });
+  assert.strictEqual(ru.ok, true, ru.error);
+  assert.doesNotMatch(fs.readFileSync(`${broken}.log`, 'utf8'), /^rm /m);
+  assert.match(ru.result.notes.join('\n'), /not removed/);
+  assert.strictEqual(ru.result.session, 'new-8');
+});
+
+test('answer-decision errors on a wrong id or a run that is not blocked, without touching files', () => {
+  const b = blockedSpec();
+  const before = fs.readFileSync(b.specFile, 'utf8');
+  for (const inp of [{ id: 'Q-9' }, { id: '2' }, { answer: ' ' }]) {
+    const r = b.answer(inp);
+    assert.strictEqual(r.ok, false, JSON.stringify(inp));
+  }
+  assert.match(b.answer({ id: 'Q-9' }).error, /already answered or another question/);
+  run(b.dir, 'run-report', { slug: '12-csv', status: 'running', session: 'old-1' });
+  assert.match(b.answer({}).error, /already answered or another question/);
+  assert.strictEqual(fs.readFileSync(b.specFile, 'utf8'), before);
+  assert.strictEqual(b.wg('log', '-1', '--format=%s'), 'docs(12-csv): open Q-2');
+  assert.strictEqual(b.claude.log(), '');
+});
+
+test('answer-decision stops at the restart when claude --bg prints no id, and a rerun finishes the job', () => {
+  const b = blockedSpec();
+  const noId = loggingClaude([{ id: 'old-1', kind: 'background', name: 'csv-export-flow', state: 'done', cwd: '/x' }], { bgOut: 'something went wrong' });
+  const r = b.answer({}, noId.env);
+  assert.strictEqual(r.ok, false);
+  assert.match(r.error, /step 5.*backgrounded/);
+  assert.strictEqual(b.wg('log', '-1', '--format=%s'), 'docs(12-csv): answer Q-2'); // earlier steps stay
+  assert.strictEqual(b.runFileJson().status, 'blocked');
+  const again = b.answer({});
+  assert.strictEqual(again.ok, true, again.error);
+  assert.strictEqual(b.wg('log', '-2', '--format=%s'), 'docs(12-csv): answer Q-2\ndocs(12-csv): open Q-2'); // no second commit
+  assert.strictEqual((fs.readFileSync(b.specFile, 'utf8').match(/Q-2 /g) || []).length, 1);
+  assert.strictEqual(b.runFileJson().session, 'new-7');
 });

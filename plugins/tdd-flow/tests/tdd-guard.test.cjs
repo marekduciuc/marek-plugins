@@ -78,7 +78,7 @@ test('tdd-guard reads the state of the repo the file is in, not of the session d
 });
 
 test('tdd-guard lets everything through outside RED, outside a repo and without a file path', () => {
-  assert.strictEqual(guard(path.join(repo('GREEN'), 'src/app.ts'), os.tmpdir()).code, 0);
+  for (const phase of ['GREEN', 'REFACTOR', 'SETUP', 'REVIEW', 'IDLE']) assert.strictEqual(guard(path.join(repo(phase), 'src/app.ts'), os.tmpdir()).code, 0, phase);
   assert.strictEqual(guard(path.join(repo(null), 'src/app.ts'), os.tmpdir()).code, 0);
   const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'tdd-flow-guard-norepo-'));
   assert.strictEqual(guard(path.join(outside, 'a.ts'), repo('RED')).code, 0);
