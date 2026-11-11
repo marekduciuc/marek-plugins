@@ -1579,16 +1579,6 @@ function saveRelay(id, text) {
 }
 
 // ---------- cleanup: remove the worktrees of merged specs ----------
-// Ignored paths that are rebuilt by an install or a build; any other ignored file (.env, a local database) keeps the
-// worktree, because `git worktree remove` would delete it silently.
-const REGENERABLE = new Set(['node_modules', 'target', 'build', 'dist', 'out', '.gradle', '.next', '.nuxt', '.turbo', '.cache',
-  '.parcel-cache', 'coverage', '__pycache__', '.pytest_cache', '.mypy_cache', '.ruff_cache', '.venv', 'venv', '.tox', 'bin', 'obj', '.DS_Store',
-  // IDE / language-server metadata (Eclipse JDT, IntelliJ) and the test report the test runs rewrite.
-  '.classpath', '.project', '.settings', '.factorypath', '.idea', 'testreport.md',
-  // Next.js type stub (next build/dev/typegen) and Playwright output.
-  'next-env.d.ts', 'playwright-report', 'test-results', 'blob-report']);
-// Ignored file suffixes with the same meaning: IntelliJ modules and the incremental tsc cache.
-const REGENERABLE_SUFFIXES = ['.iml', '.tsbuildinfo'];
 const ENDED = ['done', 'stopped'];
 
 /** Registered worktrees as [{path, branch}] from `git worktree list --porcelain` (branch '' when detached). */
@@ -1602,7 +1592,8 @@ function worktreeList() {
 
 /**
  * Removes the worktrees under .claude/worktrees/ whose spec PR is merged, nothing came after it, no session uses
- * them, and git can remove them without --force. Never deletes unmerged work: everything else is kept with a reason.
+ * them, and git can remove them without --force (ignored files go with the worktree). Never deletes unmerged work:
+ * everything else is kept with a reason.
  */
 function cleanup() {
   const root = mainRoot();
@@ -1634,13 +1625,6 @@ function cleanup() {
     const own = sessions.filter((s) => inside(s) || (run && run.session && (s.id === run.session || s.sessionId === run.session)));
     const active = own.find((s) => !ENDED.includes(s.state));
     if (active) { keep(`session ${attachRef(sessions, active)} is still open (${active.state || 'unknown state'}) - if its work is done, close it with \`claude stop ${active.id}\``); continue; }
-    // `matching` lists each ignored path; plain --ignored folds a folder of only ignored files into one line.
-    const st = exec('git', ['-C', wt.path, 'status', '--porcelain', '--ignored=matching'], undefined, true);
-    if (st.code !== 0) { keep(`git status failed: ${(st.err || st.out).split('\n')[0]}`); continue; }
-    const precious = st.out.split('\n')
-      .filter((l) => l.startsWith('!! ')).map((l) => l.slice(3).replace(/^"|"$/g, '').replace(/\/$/, ''))
-      .filter((p) => p !== STATE && !p.split('/').some((seg) => REGENERABLE.has(seg) || REGENERABLE_SUFFIXES.some((x) => seg.endsWith(x))));
-    if (precious.length) { keep(`ignored files would be deleted: ${precious.slice(0, 5).join(', ')}${precious.length > 5 ? ', ...' : ''}`); continue; }
     const du = exec('du', ['-sk', wt.path]);
     const freedMb = du.code === 0 ? Math.round(parseInt(du.out, 10) / 1024) : null;
     const rm = git('worktree', 'remove', wt.path);
@@ -1650,8 +1634,10 @@ function cleanup() {
       if (r.code !== 0) notes.push(`${slug}: claude rm ${s.id} failed: ${(r.err || r.out).split('\n')[0]}`);
     }
     try { fs.rmSync(runFile(slug), { force: true }); } catch (e) { notes.push(`${slug}: run file not deleted: ${e.message}`); }
-    const bd = git('branch', '-d', branch);
-    if (bd.code !== 0) notes.push(`${slug}: ${branch} kept (git branch -d refused; delete it yourself if you no longer need it)`);
+    // -D: `merged` proved the PR is merged at exactly this tip, so every commit is on GitHub. `-d` would refuse a
+    // squash or rebase merge, whose tip is not in the base branch.
+    const bd = git('branch', '-D', branch);
+    if (bd.code !== 0) notes.push(`${slug}: ${branch} not deleted: ${(bd.err || bd.out).split('\n')[0]}`);
     removed.push({ slug, pr: merged.url || `#${merged.number}`, freedMb, sessions: own.filter((x) => x.kind === 'background').map((x) => x.id), branchDeleted: bd.code === 0 });
   }
   git('worktree', 'prune');
@@ -1661,7 +1647,7 @@ function cleanup() {
 // ---------- simplify ----------
 const posInt = (v, d) => (Number.isInteger(v) && v > 0 ? v : d);
 // Scan targets for the simplifier: tracked source files, no tests (they are read as context), no generated, vendored
-// or migration code. A separate list from REGENERABLE, which names ignored directories such as bin/ and build/.
+// or migration code.
 const SOURCE_EXT = /\.(cs|vb|fs|ts|tsx|js|jsx|mjs|cjs|vue|svelte|py|go|rs|java|kt|rb|php|c|cc|cpp|h|hpp|swift|scala)$/i;
 const NOT_SOURCE = /(^|\/)(\.tdd-flow|\.claude|\.github|node_modules|vendor|third_party|dist|build|target|out|generated|__generated__|migrations?)\/|\.min\.[a-z]+$|\.d\.ts$|\.generated\.|\.g\.cs$|\.pb\.go$|_pb2\.py$/i;
 const TEST_FILE = /(^|\/)(tests?|__tests__|spec)\/|(^|\/)(test_[^/]*|[^/]*_test\.[^/]+|[^/]*\.(test|spec)\.[^/]+|[^/]*_spec\.[^/]+|[^/]*Tests?\.(java|kt|cs)|conftest\.py)$/;

@@ -14,11 +14,10 @@ tdd-flow cleanup <<'TDD_FLOW_JSON'
 TDD_FLOW_JSON
 ```
 
-It removes the worktree, background session, run file and branch (`git branch -d`) of every spec whose PR is merged with nothing after it, and never forces. A worktree is kept, with the reason, while any of these holds:
+It removes the worktree, background session, run file and local branch of every spec whose PR is merged with nothing after it. Ignored files (a `.env`, a local database) go with the worktree. The branch is deleted even after a squash merge, because the PR was merged at exactly its tip; the worktree is never forced. A worktree is kept, with the reason, while any of these holds:
 - a PR is open, or the branch has newer commits;
 - a session there is still open;
-- it has uncommitted or untracked changes;
-- it has ignored files other than build output, dependencies and IDE metadata (a `.env`, a local database).
+- it has uncommitted or untracked changes.
 
 Show:
 - one line per removed spec: slug, PR, MB freed;
