@@ -117,7 +117,7 @@ Minor findings are not fixed; they go into the PR body.
 1. `gh pr list --head feature/<slug> --state all --json number,state,url --limit 1`
    - `MERGED` → report blocked ("feature/<slug> was already merged; start a new branch").
    - `OPEN` → push only (it updates that PR) and use its URL.
-2. Bring the base in, with the Bash tool and `timeout: 600000` (it may run the generate command):
+2. Bring the base in, with the Bash tool and `timeout: 600000` (it may run the generate command; while the printed JSON has `"again": true`, run the identical command again: it resumes the same merge and generate run):
    ```bash
    tdd-flow sync-base <<'TDD_FLOW_JSON'
    {"base": "<base>"}

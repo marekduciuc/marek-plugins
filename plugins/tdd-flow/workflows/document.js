@@ -44,6 +44,11 @@ const SURVEY = {
     } } },
   },
 }
+// A CLI call that runs the test suite returns `"again": true` every ~8.5 minutes while the suite still runs (a slow
+// suite is watched for hangs, not cut by a wall clock); the runner repeats it. 9 calls reach the CLI's 60-minute
+// hard cap, after which the run is killed and reported. stallMs exceeds one call, as for ci-watch in deploy.js.
+const TEST_RUN = { repeat: 9, stallMs: 2400000 }
+
 // Deterministic steps run in the plugin's CLI (bin/tdd-flow) through the script-runner agent (haiku, Bash only)
 // instead of a reasoning agent. Returns {ok, result} or {ok: false, error, fallback}. Identical in every workflow
 // (scripts cannot import; tests/cli.test.cjs checks the copies match).
@@ -148,7 +153,7 @@ try {
   const files = [...new Set(ok.flatMap(r => [...r.wrote.files, ...((r.fixed && r.fixed.files) || [])]))]
   const touchedSource = targets.some(t => t.kind === 'api')
   // Doc comments in source files: the CLI runs the full suite first and does not commit if it fails.
-  const committed = await cli('commit', { message: `docs(${survey.slug}): update documentation`, files, runTests: touchedSource }, COMMIT, { label: 'commit' })
+  const committed = await cli('commit', { message: `docs(${survey.slug}): update documentation`, files, runTests: touchedSource }, COMMIT, { label: 'commit', ...(touchedSource ? TEST_RUN : {}) })
   const commit = committed.ok ? committed.result : null
   if (!commit || (!commit.committed && !commit.nothingToCommit)) {
     return { status: 'commit_failed', slug: survey.slug, reason: commit ? commit.reason : committed.error, next: 'Show the reason to the user, resolve it, then rerun /tdd-flow:document.' }
