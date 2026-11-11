@@ -1,22 +1,26 @@
 // tdd-flow status pane: every spec of the repo beside the chat (`tdd-flow status`, every 10 s), the workflows this
-// session started, and a waiting decision answered from the pane through the answer-decision skill.
+// session started, a waiting decision answered through the answer-decision skill, and `tdd-flow restart` of a
+// blocked or stalled spec.
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, RenderViewport, ThemeKey } from 'claude-code'
 
-import type { StatusRow, StatusSnapshot } from '../types'
+import type { RestartState, StatusRow, StatusSnapshot } from '../types'
 
 const PANE = 'tdd-status'
 const TITLE = 'tdd-flow'
 const POLL_MS = 10_000
 const CLI_TIMEOUT_MS = 30_000
+/** `tdd-flow restart` waits for `claude --bg` to print the new session. */
+const RESTART_TIMEOUT_MS = 60_000
 /** The fullscreen layout docks a pane beside the transcript from this width; below it an unasked pane lands inline. */
 const DOCK_COLUMNS = 110
 const ANSWER_SKILL = 'tdd-flow:answer-decision'
 
 // Change a shape tag when the value's fields change: a reload then reads what the old code stored as the initial.
-const status = atom({ plugin: 'tdd-flow', key: 'status' } as const, null, { shape: 'status-1' })
+const status = atom({ plugin: 'tdd-flow', key: 'status' } as const, null, { shape: 'status-2' })
 const isClosed = atom({ plugin: 'tdd-flow', key: 'isClosed' } as const, false)
 const sent = atom({ plugin: 'tdd-flow', key: 'sent' } as const, [], { shape: 'sent-1' })
+const restarts = atom({ plugin: 'tdd-flow', key: 'restarts' } as const, [], { shape: 'restarts-1' })
 const workflows = atom({ plugin: 'tdd-flow', key: 'workflows' } as const, [], { shape: 'workflows-1' })
 
 /** Display order and colour per kind of row; a blocked row with a decision is its own kind. */
@@ -35,12 +39,30 @@ const rankOf = (row: StatusRow): number => {
 }
 const colorOf = (row: StatusRow): ThemeKey => KINDS.find(k => k.kind === kindOf(row))?.color ?? 'subtle'
 const isActive = (row: StatusRow): boolean => ['running', 'blocked', 'stalled'].includes(row.status)
+/** A blocked row without a decision or a stalled row: what `tdd-flow restart` takes, and whose reason the row shows. */
+const isRestartable = (row: StatusRow): boolean => !row.decision && ['blocked', 'stalled'].includes(row.status)
 
 /** Cuts `text` to `width` cells with an ellipsis. */
 const fit = (text: string, width: number): string =>
   text.length <= width ? text : `${text.slice(0, Math.max(0, width - 1))}…`
 const firstLine = (text: string): string => text.split('\n')[0] ?? ''
 const errorText = (err: unknown): string => (err instanceof Error ? err.message : String(err))
+const cli = ($: EngineInterface): string => `${$.plugin.root}/bin/tdd-flow`
+
+/** `5/10 done · T-6 title`; the open task's position goes after its id when the id's number is not that position. */
+function progressLine(row: StatusRow): string {
+  if (row.total === null) return '–'
+  const open = row.current.match(/^([A-Z]+-(\d+)[a-z]*)(?: (.*))?$/)
+  const current = open && row.position !== null && Number(open[2]) !== row.position
+    ? `${open[1]} (task ${row.position})${open[3] ? ` ${open[3]}` : ''}`
+    : row.current
+  return `${row.done}/${row.total} done${current ? ` · ${current}` : ''}`
+}
+
+/** `issue #25` / `PR #24`; without a number, the word and the URL's last path part. */
+function linkLabel(word: string, url: string, num: number | null): string {
+  return num !== null ? `${word} #${num}` : `${word} ${url.replace(/[?#].*$/, '').replace(/\/+$/, '').split('/').pop() ?? ''}`
+}
 
 /** The feature a Workflow call works on: its `args` slug, or `args.feature`. */
 function featureOf(args: unknown): string {
@@ -70,7 +92,7 @@ async function specRoot($: EngineInterface): Promise<string | null> {
 async function runStatus($: EngineInterface, root: string, isPaneOpen: boolean, prev: StatusSnapshot | null): Promise<StatusSnapshot> {
   const kept = prev?.rows ?? []
   try {
-    const ran = await $.process.run([`${$.plugin.root}/bin/tdd-flow`, 'status'], {
+    const ran = await $.process.run([cli($), 'status'], {
       cwd: root,
       stdin: JSON.stringify(isPaneOpen ? { pane: true } : {}),
       timeoutMs: CLI_TIMEOUT_MS,
@@ -98,6 +120,15 @@ async function refresh($: EngineInterface): Promise<void> {
   const answered = await read($, sent)
   const waiting = answered.filter(s => rows.some(r => r.slug === s.slug && r.status !== 'running'))
   if (waiting.length !== answered.length) await update($, sent, list => list.filter(s => waiting.some(w => w.slug === s.slug)))
+
+  // "restarting…" stays until a status shows the spec no longer blocked or stalled (a status read before the restart
+  // landed still does), a refusal's error while the row can still be restarted. One whose answer never came (the pane
+  // reloaded during the call) expires after the CLI timeout.
+  const restartable = new Set(rows.filter(isRestartable).map(r => r.slug))
+  const now = await $.clock.now()
+  const isKept = (r: RestartState): boolean =>
+    r.state === 'failed' ? restartable.has(r.slug) : now - r.at <= RESTART_TIMEOUT_MS && (r.state === 'running' || restartable.has(r.slug))
+  if (!(await read($, restarts)).every(isKept)) await update($, restarts, list => list.filter(isKept))
 
   const docks = viewport?.isFullscreen === true && viewport.columns >= DOCK_COLUMNS
   if (!pane && !closedByPerson && docks && rows.some(isActive)) await $.ui.open({ id: PANE, title: TITLE })
@@ -132,6 +163,26 @@ async function answer($: EngineInterface, slug: string, id: string, text: string
   } catch (err) {
     await update($, sent, list => list.filter(s => s.slug !== slug))
     $.ui.log(`tdd-flow: the answer to ${slug} ${id} was not sent: ${errorText(err)}`)
+  }
+}
+
+/** Runs `tdd-flow restart` for a blocked or stalled spec, no model involved; the row says "restarting…" meanwhile. */
+async function restart($: EngineInterface, slug: string): Promise<void> {
+  if ((await read($, restarts)).some(r => r.slug === slug && r.state === 'running')) return
+  const set = async (state: RestartState['state'], error = ''): Promise<unknown> => {
+    const at = await $.clock.now()
+    return update($, restarts, list => [...list.filter(r => r.slug !== slug), { slug, state, error, at }])
+  }
+  await set('running')
+  try {
+    const root = await specRoot($)
+    if (root === null) throw new Error('no git repo with .tdd-flow/')
+    const ran = await $.process.run([cli($), 'restart'], { cwd: root, stdin: JSON.stringify({ slug }), timeoutMs: RESTART_TIMEOUT_MS })
+    const out = JSON.parse(ran.stdout) as { ok: boolean; error?: string }
+    if (out.ok) await set('sent')
+    else await set('failed', `tdd-flow restart: ${firstLine(out.error ?? `exit ${ran.exitCode}`)}`)
+  } catch (err) {
+    await set('failed', `tdd-flow restart failed: ${firstLine(errorText(err))}`)
   }
 }
 
@@ -201,6 +252,7 @@ export const register: Register = on => {
     const cols = Math.max(20, e.props.bodyColumns)
     const snapshot = await read($, status)
     const answered = await read($, sent)
+    const restarting = await read($, restarts)
     const flows = await read($, workflows)
     const now = await $.clock.now()
     const rows = [...(snapshot?.rows ?? [])].sort((a, b) => rankOf(a) - rankOf(b))
@@ -209,8 +261,8 @@ export const register: Register = on => {
     const meta = (row: StatusRow) => {
       const parts = [
         row.phase ? <Text>{row.phase}</Text> : null,
-        row.issueUrl ? <Link href={row.issueUrl}>{`#${(row.issueUrl.match(/\/(\d+)\/?$/) ?? [])[1] ?? 'issue'}`}</Link> : null,
-        row.prUrl ? <Link href={row.prUrl}>PR</Link> : null,
+        row.issueUrl ? <Link href={row.issueUrl} label={linkLabel('issue', row.issueUrl, row.issueNumber)} /> : null,
+        row.prUrl ? <Link href={row.prUrl} label={linkLabel('PR', row.prUrl, row.prNumber)} /> : null,
         row.attach ? <Text>{row.attach}</Text> : null,
       ].filter(part => part !== null)
       if (parts.length === 0) return null
@@ -257,22 +309,41 @@ export const register: Register = on => {
       )
     }
 
+    const restartBlock = (row: StatusRow) => {
+      if (!isRestartable(row)) return null
+      const r = restarting.find(x => x.slug === row.slug)
+      if (r && r.state !== 'failed') return <Text color="suggestion">{'  restarting…'}</Text>
+      return (
+        <Box flexDirection="column">
+          {r ? <Text color="error" wrap="truncate-end">{`  ${r.error}`}</Text> : null}
+          <Box flexDirection="row" paddingLeft={2}>
+            <Button key={`restart:${row.slug}`} label="restart" onPress={() => void restart($, row.slug)} />
+          </Box>
+        </Box>
+      )
+    }
+
     const specRow = (row: StatusRow) => {
       const word = kindOf(row)
-      const tasks = row.total === null ? '–' : `${row.done}/${row.total}${row.current ? ` · ${row.current}` : ''}`
-      const why = !row.decision && ['blocked', 'stalled'].includes(row.status) && row.details ? firstLine(row.details) : ''
+      const why = isRestartable(row) && row.details ? firstLine(row.details) : ''
+      // The title is the label; the slug follows, dim, only where both fit (and alone when there is no title).
+      const room = cols - word.length - 3
+      const label = row.title || row.slug
+      const withSlug = row.title !== '' && row.title.length + 1 + row.slug.length <= room
       return (
         <Box flexDirection="column" marginBottom={1}>
           <Box flexDirection="row" justifyContent="space-between">
             <Text wrap="truncate-end">
               <Text color={colorOf(row)}>●</Text>
-              {` ${fit(row.slug, cols - word.length - 3)}`}
+              {` ${fit(label, room)}`}
+              {withSlug ? <Text dimColor>{` ${row.slug}`}</Text> : null}
             </Text>
             <Text color={colorOf(row)}>{word}</Text>
           </Box>
-          <Text dimColor wrap="truncate-end">{`  ${tasks}`}</Text>
+          <Text dimColor wrap="truncate-end">{`  ${progressLine(row)}`}</Text>
           {meta(row)}
           {why ? <Text color={colorOf(row)} wrap="truncate-end">{`  ${why}`}</Text> : null}
+          {restartBlock(row)}
           {decisionBlock(row)}
         </Box>
       )

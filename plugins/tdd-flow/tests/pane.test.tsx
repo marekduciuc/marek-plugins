@@ -13,10 +13,11 @@ const RUNNING: StatusRow = {
   slug: '82-ux-fixes-68f-focus', status: 'running', done: 5, total: 10, current: 'T-6 Settings: inline category…', prUrl: 'https://github.com/o/r/pull/90',
   details: '', attach: 'claude attach form-error-focus', task: 'T-6', phase: 'GREEN', issueUrl: 'https://github.com/o/r/issues/82',
   title: 'UX fixes', session: 'form-error-focus', sessionState: 'working', at: '2026-11-11T10:00:00.000Z',
+  position: 6, issueNumber: 82, prNumber: 90,
 }
 const DECISION: StatusRow = {
   ...RUNNING, slug: '23-csv', status: 'blocked', done: 2, total: 4, current: 'T-3 Export', prUrl: '', attach: 'claude attach csv-export-flow',
-  phase: '', issueUrl: '', details: 'needs a decision', sessionState: 'done',
+  phase: '', issueUrl: '', details: 'needs a decision', sessionState: 'done', position: 3, issueNumber: null, prNumber: null,
   decision: { id: 'Q-2', question: 'Keep the old export?', recommendation: 'Keep it', options: ['Keep it', 'Drop it'], tasks: ['T-3', 'T-4'] },
 }
 
@@ -29,7 +30,12 @@ const PANE: Omit<RenderInput<'Pane'>, 'surface'> = {
 
 /** The engine beneath the plugin: a repo with .tdd-flow/, a canned `tdd-flow status`, and a record of what was asked. */
 function world(on: On, opts: { rows?: StatusRow[]; isSkillListed?: boolean; fail?: string; isClosedStored?: boolean } = {}) {
+  let releaseRestart = (): void => undefined
   const w = {
+    /** What `tdd-flow restart` prints; it answers only after `release()` while `isRestartHeld`. */
+    restartOut: { ok: true, shape: '', result: { slug: '', session: 'new-7', name: 'x', attach: 'claude attach x', notes: [] } } as object,
+    isRestartHeld: false,
+    release: () => releaseRestart(),
     rows: opts.rows ?? [RUNNING],
     runs: [] as { argv: readonly string[]; cwd?: string; stdin?: string }[],
     commands: [] as string[],
@@ -48,8 +54,12 @@ function world(on: On, opts: { rows?: StatusRow[]; isSkillListed?: boolean; fail
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('session.repo', () => ({ value: { root: ROOT, remote: null, internal: false, name: null } }))
   on('fs.exists', ($, e) => ({ value: e.path === `${ROOT}/.tdd-flow` }))
-  on('process.run', ($, e) => {
+  on('process.run', async ($, e) => {
     w.runs.push({ argv: e.argv, cwd: e.init?.cwd, stdin: e.init?.stdin })
+    if (e.argv[1] === 'restart') {
+      if (w.isRestartHeld) await new Promise<void>(resolve => { releaseRestart = resolve })
+      return { value: { exitCode: 0, stdout: `${JSON.stringify(w.restartOut)}\n`, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
     const out = opts.fail ? { ok: false, shape: '', error: opts.fail } : { ok: true, shape: '', result: { rows: w.rows, paneSeen: false } }
     return { value: { exitCode: opts.fail ? 1 : 0, stdout: `${JSON.stringify(out)}\n`, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
@@ -137,10 +147,10 @@ test('rows render with status, tasks, phase, issue and PR links and the attach c
     // Sorted: stalled before running.
     const words = (await ui.findAll({ type: 'Text', text: /^(running|stalled)$/ })).map(t => t.text)
     expect(words).toEqual(['stalled', 'running'])
-    expect((await ui.find({ type: 'Text', text: /5\/10 · T-6 Settings/ }))?.text).toBe('  5/10 · T-6 Settings: inline category…')
-    expect((await ui.find({ type: 'Text', text: /GREEN/ }))?.text).toMatch(/^  GREEN · .*#82 · .*PR · claude attach form-error-focus$/)
+    expect((await ui.find({ type: 'Text', text: /5\/10 done · T-6 Settings/ }))?.text).toBe('  5/10 done · T-6 Settings: inline category…')
+    expect((await ui.find({ type: 'Text', text: /GREEN/ }))?.text).toMatch(/^  GREEN · issue #82 · PR #90 · claude attach form-error-focus$/)
     const links = (await ui.findAll({ type: 'Link' })).map(l => [l.props.href, l.text])
-    expect(links.slice(0, 2)).toEqual([['https://github.com/o/r/issues/82', expect.stringMatching(/#82$/)], ['https://github.com/o/r/pull/90', expect.stringMatching(/PR$/)]])
+    expect(links.slice(0, 2)).toEqual([['https://github.com/o/r/issues/82', 'issue #82'], ['https://github.com/o/r/pull/90', 'PR #90']])
     expect((await ui.find({ type: 'Text', text: /session is idle without a report$/ }))?.text).toBe('  session is idle without a report')
     await ui.press({ key: 'copy:82-ux-fixes-68f-focus' })
     await ui.unmount()
@@ -264,4 +274,100 @@ test('a workflow started in this session is listed until its task notification a
   ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...PANE })
   expect(await ui.find({ type: 'Text', text: /This session/ })).toBeUndefined()
   await ui.unmount()
+})
+
+// ---------- row labels and the restart button (0.27.0) ----------
+const RENUMBERED: StatusRow = {
+  ...RUNNING, slug: 'zjednoduseni-aplikace-jedina-obrazovka-r', title: 'Simplify the app to one screen', done: 1, total: 16,
+  current: 'T-11 Shared header', task: 'T-11', position: 2, issueUrl: 'https://github.com/o/r/issues/25', issueNumber: 25,
+  prUrl: 'https://github.com/o/r/pull/24', prNumber: 24,
+}
+
+test('a row is labelled by the spec title, shows the open task position of a renumbered list and names its links', async ($, on) => {
+  const odd: StatusRow = { ...RUNNING, slug: '7-odd', title: '', done: 0, total: 2, current: 'T-1 First', position: 1,
+    issueUrl: 'https://dev.azure.com/o/p/_workitems/edit/31', issueNumber: null, prUrl: 'https://example.test/pr/7', prNumber: null }
+  world(on, { rows: [RENUMBERED, odd] })
+  const clock = mock.clock(on)
+  await $.session.start(SESSION)
+  await clock.advance(1)
+  const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...PANE })
+  // The title is the label; the slug follows dim only where it fits.
+  expect((await ui.find({ type: 'Text', text: /^● Simplify/ }))?.text).toBe('● Simplify the app to one screen')
+  expect(await ui.find({ type: 'Text', text: /^● zjednoduseni/ })).toBeUndefined()
+  expect((await ui.find({ type: 'Text', text: /^● 7-odd/ }))?.text).toBe('● 7-odd') // no title: the slug
+  expect((await ui.find({ type: 'Text', text: /1\/16 done/ }))?.text).toBe('  1/16 done · T-11 (task 2) Shared header')
+  expect((await ui.find({ type: 'Text', text: /0\/2 done/ }))?.text).toBe('  0/2 done · T-1 First') // numbered from 1: no position
+  const links = (await ui.findAll({ type: 'Link' })).map(l => [l.props.href, l.text])
+  expect(links).toEqual([
+    ['https://github.com/o/r/issues/25', 'issue #25'], ['https://github.com/o/r/pull/24', 'PR #24'],
+    ['https://dev.azure.com/o/p/_workitems/edit/31', 'issue 31'], ['https://example.test/pr/7', 'PR 7'],
+  ])
+  await ui.unmount()
+  const wide = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...PANE, props: { ...PANE.props, bodyColumns: 120 } })
+  expect((await wide.find({ type: 'Text', text: /^● Simplify/ }))?.text).toBe('● Simplify the app to one screen zjednoduseni-aplikace-jedina-obrazovka-r')
+  await wide.unmount()
+})
+
+test('the restart button is on blocked rows without a decision and stalled rows only, and runs tdd-flow restart', async ($, on) => {
+  const blocked: StatusRow = { ...RUNNING, slug: '41-blocked', status: 'blocked', details: 'tests fail', sessionState: 'done' }
+  const stalled: StatusRow = { ...RUNNING, slug: '42-stalled', status: 'stalled', details: 'session is idle without a report' }
+  const done: StatusRow = { ...RUNNING, slug: '43-done', status: 'done' }
+  const w = world(on, { rows: [RUNNING, DECISION, blocked, stalled, done] })
+  const clock = mock.clock(on)
+  await $.session.start(SESSION)
+  await clock.advance(1)
+  let ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...PANE })
+  const keys = (await ui.findAll({ type: 'Button' })).map(b => b.key).filter(k => k?.startsWith('restart:'))
+  expect(keys).toEqual(['restart:41-blocked', 'restart:42-stalled'])
+
+  // In flight: "restarting…" instead of the button, so it cannot be pressed twice.
+  // A press resolves once the work it started settles, so it is awaited only after the restart is released.
+  w.isRestartHeld = true
+  const pressing = ui.press({ key: 'restart:42-stalled' })
+  for (let i = 0; i < 1000 && !w.runs.some(r => r.argv[1] === 'restart'); i++) await Promise.resolve()
+  const call = w.runs.find(r => r.argv[1] === 'restart')
+  expect(call?.argv[0]?.endsWith('/bin/tdd-flow')).toBe(true)
+  expect([call?.cwd, call?.stdin]).toEqual([ROOT, '{"slug":"42-stalled"}'])
+  expect((await ui.find({ type: 'Text', text: /restarting/ }))?.text).toBe('  restarting…')
+  expect(await ui.find({ type: 'Button', key: 'restart:42-stalled' })).toBeUndefined()
+  w.release()
+  await pressing
+  expect((await ui.find({ type: 'Text', text: /restarting/ }))?.text).toBe('  restarting…')
+  // A status still showing the spec stalled (read before the restart landed) keeps "restarting…"; one showing it run clears it.
+  await clock.advance(10_000)
+  expect((await ui.find({ type: 'Text', text: /restarting/ }))?.text).toBe('  restarting…')
+  w.rows = [RUNNING, DECISION, blocked, { ...stalled, status: 'running' }, done]
+  await clock.advance(10_000)
+  expect(await ui.find({ type: 'Text', text: /restarting/ })).toBeUndefined()
+  await ui.unmount()
+
+  // A restart whose answer never comes (the pane reloaded meanwhile) gives the button back after the CLI timeout.
+  w.rows = [RUNNING, DECISION, blocked, stalled, done]
+  await clock.advance(10_000)
+  w.isRestartHeld = true
+  ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...PANE })
+  const stuck = ui.press({ key: 'restart:42-stalled' })
+  for (let i = 0; i < 1000 && w.runs.filter(r => r.argv[1] === 'restart').length < 2; i++) await Promise.resolve()
+  await clock.advance(60_000)
+  expect((await ui.find({ type: 'Text', text: /restarting/ }))?.text).toBe('  restarting…')
+  await clock.advance(10_000)
+  expect(await ui.find({ type: 'Text', text: /restarting/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Button', key: 'restart:42-stalled' })).toBeDefined()
+  w.restartOut = { ok: false, shape: '', error: '42-stalled is running: only a blocked or stalled spec is restarted' }
+  w.release()
+  await stuck
+  await ui.unmount()
+
+  // A refused restart shows the CLI's error line in the row, and the button stays.
+  w.isRestartHeld = false
+  w.restartOut = { ok: false, shape: '', error: '41-blocked has session s-9 working\nmore' }
+  ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...PANE })
+  await ui.press({ key: 'restart:41-blocked' })
+  await clock.advance(1)
+  expect((await ui.find({ type: 'Text', text: /tdd-flow restart:/ }))?.text).toBe('  tdd-flow restart: 41-blocked has session s-9 working')
+  expect(await ui.find({ type: 'Button', key: 'restart:41-blocked' })).toBeDefined()
+  await ui.unmount()
+  expect(w.runs.filter(r => r.argv[1] === 'restart').map(r => r.stdin)).toEqual(['{"slug":"42-stalled"}', '{"slug":"42-stalled"}', '{"slug":"41-blocked"}'])
+  expect(w.ran).toEqual([]) // no skill, no model
+  expect(w.submitted).toEqual([])
 })
