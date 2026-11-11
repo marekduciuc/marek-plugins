@@ -8,7 +8,7 @@ argument-hint: "<slug> Q-<n> <answer>"
 
 Input: $ARGUMENTS - `<slug> Q-<n> <answer>`: the spec, the question id of its run's `decision`, and the answer (the rest of the line, as the user wrote or picked it). If one of the three is missing, say what is missing and stop.
 
-This is the autopilot's **Decisions** procedure for one spec, run in whatever session the answer came from (the status pane's, usually). The steps are in `skills/autopilot/SKILL.md`; follow them there and do not change them here. `tdd-flow` is the plugin CLI on the Bash `PATH`. Run it from the main checkout's root; never use a bare `cd` (use `git -C` and subshells).
+This is the autopilot's **Decisions** procedure for one spec, run in whatever session the answer came from (the status pane's, usually). `tdd-flow` is the plugin CLI on the Bash `PATH`. Run it from the main checkout's root; never use a bare `cd` (use `git -C` and subshells).
 
 ## 1. Check the decision
 
@@ -20,18 +20,20 @@ TDD_FLOW_JSON
 
 Find the row of `<slug>`. Go on only if its `status` is `blocked` and its `decision.id` is `Q-<n>`. Otherwise say what the row shows instead (running again, another question, no such spec) and stop: the answer was already applied, or the question changed.
 
-## 2. Apply the answer and commit
+## 2. Edit what the answer changes
 
-Do autopilot **Decisions** step 3 with this answer, in `.claude/worktrees/<slug>`: move the question to `## Resolved questions` with the answer, update what it changes, keep or set `Status: approved` (add a task for the answer when the spec says `implemented`), and commit with `docs(<slug>): answer Q-<n>`. The answer comes from the user through the pane, so it approves the change as an answer in chat does.
+In `.claude/worktrees/<slug>/.tdd-flow/features/<slug>/`, update the criteria, edge cases, task table, `tasks.md` and the **Verify** commands the answer changes (an allow-list of test edits, protected paths), as the `resolve-questions` skill does. Keep the existing ids. If `spec.md` says `Status: implemented` (the decision came after every task was ticked), add a task for the answer to the task table and `tasks.md` (`- [ ] T-<next> <what the answer changes> (<AC ids>)`); otherwise the restart finds nothing to do. Do not move the question, change `Status` or commit: the next step does that. The answer comes from the user through the pane, so it approves the change as an answer in chat does.
 
-## 3. Remove the old session
+## 3. Record the answer and start the spec again
 
-Autopilot **Decisions** step 4: `claude rm <session>` with the run's `session` id, only when `claude agents --json --all` does not list it as `working`. A failed `rm` is noted, not an error.
+```bash
+tdd-flow answer-decision <<'TDD_FLOW_JSON'
+{"slug": "<slug>", "id": "Q-<n>", "answer": "<answer>", "where": "<the ids step 2 changed, e.g. AC-3, T-5; leave the key out for no change>"}
+TDD_FLOW_JSON
+```
 
-## 4. Start the spec again
+It checks again that the run waits on `Q-<n>`, moves the question to `## Resolved questions` with the answer and today's date, sets an `implemented` spec back to `approved` (it refuses when `tasks.md` has no open task: add the task, step 2, and run it again), commits `docs(<slug>): answer Q-<n>` in the worktree, removes the old session unless it is `working`, starts the spec again with `claude --bg` in its worktree (the old session's name when it is free) and records the run as `running`. An error names the step that failed and keeps the steps before it; after fixing the cause, run the same command again: it skips what is done.
 
-Autopilot step **2. Start sessions**, items 1-4, for this one spec: `tdd-flow worktree` (it reuses the worktree), the session name (reuse the old session's name when it is free), `claude --bg` in a subshell with `/tdd-flow:implement-spec <slug> <base>` (`<base>` from `tdd-flow specs {"slugs": ["<slug>"]}`), then `tdd-flow run-report` with `status: "running"` and the new session id. The new session resumes from the first open task.
+## 4. Report
 
-## 5. Report
-
-One line: `<slug>: Q-<n> answered (<answer, cut to 80>), running again as <name>` and `claude attach <name>`. If an autopilot is waiting in another session, it sees the spec running at its next `runs-wait` return and must not ask this decision again.
+One line from the result: `<slug>: Q-<n> answered (<answer, cut to 80>), running again as <name>`, its `attach` command, and each entry of `notes`. If an autopilot is waiting in another session, it sees the spec running at its next `runs-wait` return and must not ask this decision again.

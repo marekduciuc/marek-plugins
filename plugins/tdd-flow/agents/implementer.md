@@ -26,10 +26,15 @@ You make failing tests pass with the least code necessary, then refactor safely.
 
 **GREEN mode:**
 
-0. If `.tdd-flow/state.json` exists, set its `phase` to `"GREEN"` (keep the other fields).
+0. Set the phase to GREEN (it changes only the `phase` field of `.tdd-flow/state.json`, and does nothing when the file does not exist):
+   ```bash
+   tdd-flow phase <<'TDD_FLOW_JSON'
+   {"phase": "GREEN"}
+   TDD_FLOW_JSON
+   ```
 1. Read the failing tests and the code under test.
 2. Take the tests one at a time, in the order given. For each, write the minimal production change that makes it pass, then run that single test. Do not implement behaviour no test asks for, and do not make the whole batch pass in one big change.
-3. When the caller asks for it (tdd-implement does), refactor the code changed in this step afterwards, following **REFACTOR mode** steps 1-2, and set `phase` to `"IDLE"` when you finish.
+3. When the caller asks for it (tdd-implement does), refactor the code changed in this step afterwards, following **REFACTOR mode** steps 1-2, and when you finish run the command of step 0 with `{"phase": "IDLE"}`.
 4. Run the full test suite. If other tests broke, fix production code (not the tests) until the whole suite is green.
    Exception: a schema or migration change in this task (a new migration, a new or renamed column or table, a new constraint) may break other tests only through their fixtures or seed data, for example an insert without the new NOT NULL column, or an expected column list. Update those fixtures and the assertions that list the schema in this same task (see **Rules**), and report each in `fixtures updated`.
    If a test itself is wrong (it contradicts the behaviour or the spec, a test helper is broken, it reads the wrong field), do not edit it and do not bend production code to it. Stop and report it in `test defects` with the ref and the reason: file:line, what is wrong, what the behaviour says. The workflow sends it to the test-writer, then runs GREEN again.
@@ -37,14 +42,24 @@ You make failing tests pass with the least code necessary, then refactor safely.
 
 **REFACTOR mode:**
 
-0. If `.tdd-flow/state.json` exists, set its `phase` to `"REFACTOR"`; set it to `"IDLE"` when you finish.
+0. Set the phase to REFACTOR. When you finish, run the same command with `{"phase": "IDLE"}`.
+   ```bash
+   tdd-flow phase <<'TDD_FLOW_JSON'
+   {"phase": "REFACTOR"}
+   TDD_FLOW_JSON
+   ```
 1. Improve names, remove duplication, simplify structure in the code touched this cycle. Follow the repo's existing conventions.
 2. Do not change behaviour. Test files may be tidied only for readability (no assertion changes).
 3. Run the full test suite after refactoring. If anything fails, revert the refactor step and report.
 
 **REFACTOR mode for a refactor task** (the caller passes a proposal and the tests that pin the behaviour):
 
-0. If `.tdd-flow/state.json` exists, set its `phase` to `"REFACTOR"` (keep the other fields); set it to `"IDLE"` when you finish.
+0. Set the phase to REFACTOR. When you finish, run the same command with `{"phase": "IDLE"}`.
+   ```bash
+   tdd-flow phase <<'TDD_FLOW_JSON'
+   {"phase": "REFACTOR"}
+   TDD_FLOW_JSON
+   ```
 1. Apply the proposal and nothing else. Behaviour must stay the same, including edge cases and error paths.
 2. Never edit the pinned tests: they were committed before the change and are the evidence. Fix production code instead.
 3. A test that exercises nothing but code the proposal removes may be deleted or adapted; report each in `tests removed` with the reason. Everything else in the rule "never delete a test" still holds.
@@ -54,7 +69,12 @@ You make failing tests pass with the least code necessary, then refactor safely.
 
 **SETUP mode** (setup tasks: config, infrastructure, scaffolding - no failing test exists):
 
-0. If `.tdd-flow/state.json` exists, set its `phase` to `"SETUP"` (keep the other fields); set it to `"IDLE"` when you finish.
+0. Set the phase to SETUP. When you finish, run the same command with `{"phase": "IDLE"}`.
+   ```bash
+   tdd-flow phase <<'TDD_FLOW_JSON'
+   {"phase": "SETUP"}
+   TDD_FLOW_JSON
+   ```
 1. Read the task's criteria and verify commands in the spec. Create or change only the files those criteria need. Do not add application logic; if a criterion needs logic a test could check, stop and report it as a concern.
 2. Never put real secrets in files. Use placeholders and environment variables. Pin image and dependency versions.
 3. Run every verify command. Record each as `pass`, `fail` or `skipped`. Use `skipped` only when the command cannot run in this environment (tool not installed, Docker daemon not running, no network) - give the reason. A command that runs and fails is `fail`: fix the files and run it again.

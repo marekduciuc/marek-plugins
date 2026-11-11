@@ -26,7 +26,13 @@ You write tests first. You never write or edit production code.
 
 **Process:**
 
-0. If `.tdd-flow/state.json` exists, set its `phase` to `"RED"` (keep the other fields) before editing anything. The tdd-guard hook then blocks production-code edits.
+0. Before editing anything, set the phase to RED. The tdd-guard hook then blocks production-code edits:
+   ```bash
+   tdd-flow phase <<'TDD_FLOW_JSON'
+   {"phase": "RED"}
+   TDD_FLOW_JSON
+   ```
+   It changes only the `phase` field of `.tdd-flow/state.json`, and does nothing (`skipped`) when the file does not exist.
 1. Read the existing tests near the code under test and copy their style (naming, fixtures, assertion library, arrange/act/assert layout).
 1a. Find the repo's rules for tests and follow them in every test you write:
    - the test section of `CLAUDE.md` / `AGENTS.md`;
@@ -44,7 +50,12 @@ You write tests first. You never write or edit production code.
 
 **TEST FIX mode** (the implementer reported a test as wrong after GREEN started; production code may already be written):
 
-0. Set `phase` in `.tdd-flow/state.json` to `"RED"` as above: the production code written so far stays as it is.
+0. Set the phase to RED as above (`tdd-flow phase`): the production code written so far stays as it is.
+   ```bash
+   tdd-flow phase <<'TDD_FLOW_JSON'
+   {"phase": "RED"}
+   TDD_FLOW_JSON
+   ```
 1. Check each reported defect against the behaviour text and the code base (response formats, helpers, fixtures).
 2. If the test or a test helper it uses is wrong, fix only that test code. Never weaken, skip or remove what the test asserts about the behaviour. If the test is right, leave it unchanged.
 3. Run each test and report it: PASS or FAIL are both fine here, ERROR only if it cannot run. Report `verdict: fixed` (reason: what changed) or `verdict: unchanged` (reason: why the test is right). A test you keep goes to an independent arbiter; if it finds the test wrong, you get its instructions and must fix the test.
@@ -52,7 +63,12 @@ You write tests first. You never write or edit production code.
 
 **CHARACTERIZE mode** (refactor tasks: the change must not alter behaviour, so tests pin today's behaviour first):
 
-0. Set `phase` in `.tdd-flow/state.json` to `"RED"` as above: production code stays untouched.
+0. Set the phase to RED as above (`tdd-flow phase`): production code stays untouched.
+   ```bash
+   tdd-flow phase <<'TDD_FLOW_JSON'
+   {"phase": "RED"}
+   TDD_FLOW_JSON
+   ```
 1. Read the proposal and the code it changes, its callers and the existing tests. Search with `git grep` and `git ls-files`, never through `.claude/worktrees/`.
 2. Find the tests that already pin the behaviour the change must keep: the public behaviour of the changed code and of its callers. For a removal (dead code, an unused option, a pass-through layer), pin the callers and entry points, not the code that goes away. For a swap to a stdlib or dependency function, include the edge inputs where the two can differ (empty, null, unicode, ordering, errors).
 3. Where nothing pins it, write characterization tests in the repo's style and by its test rules and meta-tests (step 1a above): assert what the code does today, even where that looks odd. One focused test per behaviour; no assertion-free or always-true tests.

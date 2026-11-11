@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 'use strict';
 // tdd-flow CLI: the deterministic steps of the tdd-flow workflows (parsing the spec, git bookkeeping, commits,
-// preflight, CI polling), of the autopilot skill (spec selection, worktrees, run results, cleanup) and of the simplify
-// workflow and skill (scan areas, draft refactor specs, approving a spec on its branch, setting a failed step aside). Workflow scripts
-// cannot run commands, so they call this through the cheap script-runner agent instead of a reasoning agent.
+// preflight, CI polling), of the agents (the TDD phase in state.json), of the autopilot skill (spec selection,
+// worktrees, run results, cleanup, answering a decision) and of the simplify workflow and skill (scan areas, draft
+// refactor specs, approving a spec on its branch, setting a failed step aside). Workflow scripts cannot run commands,
+// so they call this through the cheap script-runner agent instead of a reasoning agent.
 // Claude Code puts the plugin's bin/ on the Bash PATH.
 //
 //   tdd-flow <command> <<'TDD_FLOW_JSON'      JSON input on stdin, prints {"ok":true,"result":{...}}
@@ -58,8 +59,8 @@ const SECRET_SCAN_YML = [
 class Fallback extends Error {}
 
 // ---------- process helpers ----------
-function exec(cmd, args, input, raw = false) {
-  const r = spawnSync(cmd, args, { encoding: 'utf8', input, maxBuffer: 64 * 1024 * 1024, env: { ...process.env, GH_PROMPT_DISABLED: '1' } });
+function exec(cmd, args, input, raw = false, cwd = undefined) {
+  const r = spawnSync(cmd, args, { cwd, encoding: 'utf8', input, maxBuffer: 64 * 1024 * 1024, env: { ...process.env, GH_PROMPT_DISABLED: '1' } });
   const out = r.stdout || '';
   return { code: r.error ? 127 : r.status, out: raw ? out : out.trim(), err: (r.stderr || '').trim() };
 }
@@ -82,6 +83,21 @@ const none = (v) => !v || /^(none|unknown|n\/a)\b/i.test(String(v).trim());
 const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const STATE = '.tdd-flow/state.json';
 const featureDir = (slug) => `.tdd-flow/features/${slug}`;
+// The TDD phase in state.json: tdd-guard blocks production edits in RED, the status pane shows it.
+const PHASES = ['RED', 'GREEN', 'REFACTOR', 'SETUP', 'REVIEW', 'IDLE'];
+
+/** Writes only `phase` of this checkout's state.json, atomically (tdd-guard and the pane read it). A missing file is not created. */
+function setPhase(value) {
+  if (!PHASES.includes(value)) throw new Error(`phase must be one of ${PHASES.join(', ')}, not ${JSON.stringify(value)}`);
+  if (!fs.existsSync(STATE)) return { skipped: 'no state.json' };
+  const st = readJSON(STATE);
+  if (!st || typeof st !== 'object') throw new Error(`${STATE} is not a JSON object; fix or delete it`);
+  writeAtomic(STATE, JSON.stringify({ ...st, phase: value }) + '\n');
+  return { phase: value, previous: st.phase == null ? '' : String(st.phase) };
+}
+
+/** Input: {phase: RED|GREEN|REFACTOR|SETUP|REVIEW|IDLE}. Used by the test-writer and implementer agents. */
+const phase = (inp) => setPhase(inp.phase);
 
 function resolveSlug(feature) {
   const slug = feature || (readJSON(STATE) || {}).feature;
@@ -1615,6 +1631,154 @@ function runReport(inp) {
   return run;
 }
 
+// ---------- answer-decision: apply the user's answer to a blocked spec and start it again ----------
+const SESSION_NAME = /^[a-z0-9][a-z0-9-]*$/;
+const ASSUMPTION = /\s+-\s+\*?assumption if unanswered:?\*?:?/i;
+const ddMMyyyy = (d = new Date()) => `${String(d.getDate()).padStart(2, '0')}.${String(d.getMonth() + 1).padStart(2, '0')}.${d.getFullYear()}`;
+
+/**
+ * Moves the `- Q-<n> ...` entry of `## Open questions` (with its indented lines) to `## Resolved questions` (created
+ * after Open questions when missing) as `- Q-<n> <question> - **Answer:** <answer> (<date>) → <where>`, the format of
+ * skills/resolve-questions that `decisions` parses. The question ends at the session's "*assumption if unanswered:*";
+ * the indented lines after it (options, blocked tasks) stay below the entry. Returns the text unchanged when the entry
+ * is already resolved (a rerun after a later step failed).
+ */
+function resolveQuestion(spec, id, answer, where, date) {
+  const lines = spec.split('\n');
+  const heading = (name) => lines.findIndex((l) => new RegExp(`^##\\s+${esc(name)}\\s*$`, 'i').test(l));
+  const sectionEnd = (h) => { let i = h + 1; while (i < lines.length && !/^#{1,2}\s/.test(lines[i])) i++; return i; };
+  const entryRe = new RegExp(`^[-*]\\s+${esc(id)}(?![0-9])\\s*(.*)$`);
+  const findEntry = (name) => {
+    const h = heading(name);
+    for (let i = h + 1, end = h < 0 ? 0 : sectionEnd(h); i < end; i++) if (entryRe.test(lines[i])) return i;
+    return -1;
+  };
+  const at = findEntry('Open questions');
+  if (at < 0) {
+    if (findEntry('Resolved questions') >= 0) return spec;
+    throw new Error(`${id} is not under ## Open questions`);
+  }
+  let end = at + 1;
+  while (end < lines.length && /^\s+\S/.test(lines[end])) end++;
+  const entry = lines.slice(at, end);
+  const k = entry.findIndex((l) => ASSUMPTION.test(l));
+  const questionLines = [entry[0].match(entryRe)[1], ...entry.slice(1, k < 0 ? entry.length : k + 1)];
+  if (k >= 0) questionLines[k] = questionLines[k].split(ASSUMPTION)[0];
+  const question = oneLine(questionLines.join(' '), 1000);
+  const resolved = [`- ${id} ${question} - **Answer:** ${answer} (${date}) → ${where}`, ...(k < 0 ? [] : entry.slice(k + 1))];
+  lines.splice(at, end - at);
+  if (at > 0 && lines[at - 1] === '' && lines[at] === '') lines.splice(at, 1);
+  const h = heading('Resolved questions');
+  if (h < 0) {
+    const pos = sectionEnd(heading('Open questions'));
+    lines.splice(pos, 0, ...(lines[pos - 1] === '' ? [] : ['']), '## Resolved questions', '', ...resolved, '');
+  } else {
+    let last = sectionEnd(h) - 1;
+    while (last > h && !lines[last].trim()) last--;
+    const block = last === h ? ['', ...resolved] : resolved;
+    lines.splice(last + 1, 0, ...block);
+    const after = last + 1 + block.length;
+    if (after < lines.length && /^#/.test(lines[after])) lines.splice(after, 0, '');
+  }
+  return lines.join('\n');
+}
+
+/**
+ * The bookkeeping of answering a blocked spec's decision, from the main checkout. Input: {slug, id: Q-<n>, answer,
+ * where?, name?}. The model has already edited what the answer changes in the worktree's spec (criteria, tasks,
+ * tasks.md, a new task for an implemented spec). Steps, each stopping with an error that names it and leaves the
+ * earlier ones in place (a rerun skips what is done): 1 check the run waits on this question, 2 move it to Resolved
+ * questions (an implemented spec needs an open task, then goes back to approved), 3 commit the spec folder, 4 remove the
+ * old session unless it is working, 5 start the spec again in its worktree and record the run as running.
+ */
+function answerDecision(inp) {
+  const slug = checkSlug(inp.slug);
+  const id = String(inp.id || '');
+  if (!/^Q-\d+$/.test(id)) throw new Error(`id must be the spec's question id (Q-<n>), not ${JSON.stringify(inp.id)}`);
+  const answer = oneLine(inp.answer, 1000);
+  if (!answer) throw new Error('answer is required');
+  const where = oneLine(inp.where) || 'no change';
+  if (inp.name != null && !SESSION_NAME.test(String(inp.name))) throw new Error(`name must be lowercase kebab-case, not ${JSON.stringify(inp.name)}`);
+  const root = mainRoot();
+  const step = (n, what, fn) => { try { return fn(); } catch (e) { throw new Error(`answer-decision step ${n} (${what}): ${e.message}`); } };
+
+  const run = readRun(slug);
+  step(1, 'check', () => {
+    if (!run || run.status !== 'blocked' || !run.decision || run.decision.id !== id) {
+      const now = !run ? 'no run recorded' : `${run.status}${run.decision ? ` on ${run.decision.id}` : ''}`;
+      throw new Error(`${slug} is not blocked on ${id} (${now}): already answered or another question`);
+    }
+  });
+
+  const wt = path.join(root, WORKTREES, slug);
+  const dir = featureDir(slug);
+  const wgit = (...args) => exec('git', ['-C', wt, ...args]);
+  step(2, 'resolve the question', () => {
+    const specFile = path.join(wt, dir, 'spec.md');
+    const spec = read(specFile);
+    if (spec == null) throw new Error(`no ${WORKTREES}/${slug}/${dir}/spec.md`);
+    let next = resolveQuestion(spec, id, answer, where, ddMMyyyy());
+    if (parseSpec(spec).status === 'implemented') {
+      const md = read(path.join(wt, dir, 'tasks.md'));
+      if (!md || !parseTasks(md).some((t) => !t.done)) throw new Error('the spec is implemented and tasks.md has no open task: add the task for the answer first');
+      next = next.replace(STATUS_LINE, '$1approved');
+    }
+    if (next !== spec) writeAtomic(specFile, next);
+  });
+
+  const notes = [];
+  step(3, 'commit', () => {
+    const branch = wgit('branch', '--show-current').out;
+    if (branch !== `feature/${slug}`) throw new Error(`the worktree is on ${branch || 'a detached HEAD'}, not feature/${slug}`);
+    const message = `docs(${slug}): answer ${id}`;
+    const add = wgit('add', '--', dir);
+    if (add.code !== 0) throw new Error(`git add failed: ${add.err}`);
+    if (wgit('diff', '--cached', '--quiet', '--', dir).code === 0) {
+      if (wgit('log', '-1', '--format=%s').out !== message) notes.push(`nothing to commit in ${dir}`);
+      return;
+    }
+    // The pathspec keeps anything else staged in the worktree out of this commit.
+    const c = wgit('commit', '-q', '-m', message, '--', dir);
+    if (c.code !== 0) throw new Error(`git commit failed: ${(c.err || c.out).split('\n').slice(-5).join(' ')}`);
+  });
+
+  const sessions = claudeSessions(true);
+  const old = sessions && run.session ? sessions.find((s) => s.id === run.session || s.sessionId === run.session) : null;
+  let removed = false;
+  step(4, 'remove the old session', () => {
+    if (!run.session) notes.push('the run names no session: none removed');
+    else if (!sessions) notes.push(`claude agents is not available: old session ${run.session} not removed`);
+    else if (isLive(old)) notes.push(`old session ${run.session} is still working: not removed`);
+    else {
+      const r = exec(claudeBin(), ['rm', run.session]);
+      if (r.code === 0) removed = true;
+      else notes.push(`claude rm ${run.session} failed: ${(r.err || r.out).split('\n')[0]}`);
+    }
+  });
+
+  // The old session's name when it is free, else the first three words of the slug without its number (plus the
+  // number when another session has those words), as the autopilot names sessions.
+  const taken = (n) => (sessions || []).some((s) => s.name === n && !(removed && s === old));
+  let name = inp.name ? String(inp.name) : '';
+  if (!name && old && SESSION_NAME.test(old.name || '') && !taken(old.name)) name = old.name;
+  if (!name) {
+    const num = (slug.match(/^(\d+)-/) || [])[1];
+    const words = slug.toLowerCase().replace(/^\d+-/, '').split(/[^a-z0-9]+/).filter(Boolean).slice(0, 3).join('-') || slug.toLowerCase();
+    name = taken(words) && num ? `${words}-${num}` : words;
+  }
+
+  const session = step(5, 'restart', () => {
+    const w = worktree({ slug });
+    const r = exec(claudeBin(), ['--bg', '-n', name, `/tdd-flow:implement-spec ${slug} ${baseBranch()}`], undefined, false, w.path);
+    const printed = `${r.out}\n${r.err}`.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '');
+    const m = printed.match(/backgrounded\s*·\s*(\S+)\s*·/);
+    if (!m) throw new Error(`claude --bg printed no "backgrounded · <id> · <name>" (exit ${r.code}): ${oneLine(printed, 300)}`);
+    runReport({ slug, status: 'running', session: m[1] });
+    return m[1];
+  });
+  return { slug, id, answer, session, name, attach: `claude attach ${name}`, notes };
+}
+
 /** State of one autopilot run: its run file (done/blocked/running), or "stalled" when the session is idle or gone. */
 function runState(slug, sessions, root) {
   const run = readRun(slug) || { slug, status: 'unknown' };
@@ -1683,7 +1847,6 @@ function boardRows(slugs, queued, root, sessions) {
   });
 }
 
-const PHASES = ['RED', 'GREEN', 'REFACTOR', 'SETUP'];
 
 /**
  * Data for the status pane: the board rows of every known spec plus the TDD phase and task (the worktree's
@@ -1705,7 +1868,8 @@ function status(inp) {
     const run = readRun(row.slug) || {};
     const state = readJSON(path.join(wt, STATE)) || {};
     const own = !state.feature || state.feature === row.slug;
-    const phase = !own ? '' : PHASES.includes(state.phase) ? state.phase
+    // REVIEW (set by `suite`) shows as the `review` older versions inferred from IDLE while the spec runs with open tasks.
+    const phase = !own ? '' : state.phase === 'REVIEW' ? 'review' : PHASES.includes(state.phase) && state.phase !== 'IDLE' ? state.phase
       : state.phase === 'IDLE' && row.status === 'running' && progress && progress.open ? 'review' : '';
     const spec = featureFile(row.slug, 'spec.md', root, base) || '';
     const source = spec ? parseSpec(spec).source : '';
@@ -2091,8 +2255,12 @@ function setAside(inp) {
   return { setAside: true, patch: f, files, ...(left ? { left: left.split('\n') } : {}) };
 }
 
-/** The full suite from stack.md, run here so a workflow need not trust an agent's report. ran = false: no test command. */
-async function suite() {
+/**
+ * The full suite from stack.md, run here so a workflow need not trust an agent's report. ran = false: no test command.
+ * Input: {phase?} - tdd-implement passes "REVIEW" (it runs this before each review round), written before the run.
+ */
+async function suite(inp) {
+  if (inp.phase !== undefined) setPhase(inp.phase);
   const stack = readStack();
   if (!stack || none(stack.testAll)) return { ran: false, pass: true, command: '', cached: false, summary: 'no test command in .tdd-flow/stack.md' };
   const t = await runTests(stack.testAll);
@@ -2101,7 +2269,7 @@ async function suite() {
 }
 
 const COMMANDS = {
-  plan, suite, branch, block, commit, 'close-out': closeOut, 'add-secret-scan': addSecretScan, preflight,
+  plan, suite, phase, 'answer-decision': answerDecision, branch, block, commit, 'close-out': closeOut, 'add-secret-scan': addSecretScan, preflight,
   'ci-watch': ciWatch, 'ci-rerun': ciRerun, context, 'stack-fill': stackFill, specs, 'autopilot-check': autopilotCheck, worktree, cleanup, 'run-report': runReport, 'runs-wait': runsWait, board, status,
   areas, 'simplify-spec': simplifySpec, 'spec-branch': specBranch, 'set-aside': setAside, 'sync-base': syncBase, decisions,
 };
