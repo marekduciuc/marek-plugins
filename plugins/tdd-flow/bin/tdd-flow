@@ -805,6 +805,12 @@ const runFile = (slug) => path.join(commonDir(), 'tdd-flow', 'runs', `${slug}.js
 /** Ticked tasks runs-wait last reported per slug (outside runs/, which holds one file per run). */
 const PROGRESS_FILE = () => path.join(commonDir(), 'tdd-flow', 'progress.json');
 const readRun = (slug) => readJSON(runFile(slug));
+/** The status pane's heartbeat: `tdd-flow status {pane: true}` writes it every 10 s while the pane is open. */
+const PANE_FILE = () => path.join(commonDir(), 'tdd-flow', 'pane.json');
+const PANE_FRESH_MS = 60000;
+const isPaneOpen = () => { const p = readJSON(PANE_FILE()); return !!p && Date.now() - Date.parse(p.at) < PANE_FRESH_MS; };
+/** `{paneOpen: true}` for board and runs-wait results while the pane is open, so the autopilot stops reprinting the table. */
+const paneOpen = () => (isPaneOpen() ? { paneOpen: true } : {});
 
 /** Atomic, because runs-wait reads the run file while sessions write it. */
 const writeRun = (slug, run) => writeAtomic(runFile(slug), JSON.stringify(run) + '\n');
@@ -1233,6 +1239,10 @@ function worktree(inp) {
   const hasBranch = git('rev-parse', '--verify', '--quiet', `refs/heads/${branch}`).code === 0;
   const r = hasBranch ? git('worktree', 'add', rel, branch) : git('worktree', 'add', '-b', branch, rel, baseBranch());
   if (r.code !== 0) throw new Error(`git worktree add ${rel} failed: ${r.err || r.out}`);
+  // The phase (status pane, tdd-guard) is readable from the first task on, not only after the first task commit.
+  const tasks = read(path.join(abs, featureDir(slug), 'tasks.md'));
+  const open = tasks == null ? undefined : parseTasks(tasks).find((t) => !t.done);
+  writeJSON(path.join(abs, STATE), { feature: slug, phase: 'IDLE', task: open ? open.id : '' });
   return { path: abs, branch, created: true };
 }
 
@@ -1277,14 +1287,7 @@ function runState(slug, sessions, root) {
  * else feature/<slug> or the base branch, else the main checkout. null when no task list is found.
  */
 function taskProgress(slug, root, base) {
-  const rel = `${featureDir(slug)}/tasks.md`;
-  let md = read(path.join(root, WORKTREES, slug, rel));
-  for (const ref of [`refs/heads/feature/${slug}`, base]) {
-    if (md != null) break;
-    const r = showFile(ref, rel);
-    if (r.code === 0) md = r.out;
-  }
-  if (md == null) md = read(path.join(root, rel));
+  const md = featureFile(slug, 'tasks.md', root, base);
   const tasks = md == null ? [] : parseTasks(md);
   if (!tasks.length) return null;
   const open = tasks.find((t) => !t.done);
@@ -1316,18 +1319,68 @@ function board(inp) {
   const slugs = (inp.slugs || []).length ? inp.slugs.map(checkSlug) : knownRuns(root);
   if (!slugs.length) throw new Error(`no specs to show: no worktree in ${WORKTREES}/ and no autopilot run recorded`);
   const queued = new Set((inp.queued || []).map(checkSlug));
+  const rows = boardRows(slugs, queued, root, claudeSessions()).map((r) => r.row);
+  const progress = Object.fromEntries(rows.filter((r) => r.status === 'running' && r.done !== null).map((r) => [r.slug, r.done]));
+  return { rows, progress, table: boardTable(rows), ...paneOpen() };
+}
+
+/** One board row per slug, with the run state and task progress it was built from (status adds fields from them). */
+function boardRows(slugs, queued, root, sessions) {
   const base = baseBranch();
-  const sessions = claudeSessions();
-  const rows = slugs.map((slug) => {
+  return slugs.map((slug) => {
     const st = queued.has(slug) ? { status: 'queued' } : runState(slug, sessions, root);
     const p = taskProgress(slug, root, base);
     // Every task ticked while the session still runs: implement-spec is in its simplify / review / PR steps.
     const current = !p ? '' : p.open || (st.status === 'running' ? 'simplify / review / PR' : '');
-    return { slug, status: st.status, done: p ? p.done : null, total: p ? p.total : null, current,
+    const row = { slug, status: st.status, done: p ? p.done : null, total: p ? p.total : null, current,
       prUrl: st.prUrl || '', details: st.details || '', attach: st.attach || '', ...(st.decision ? { decision: st.decision } : {}) };
+    return { row, progress: p, base };
   });
-  const progress = Object.fromEntries(rows.filter((r) => r.status === 'running' && r.done !== null).map((r) => [r.slug, r.done]));
-  return { rows, progress, table: boardTable(rows) };
+}
+
+const PHASES = ['RED', 'GREEN', 'REFACTOR', 'SETUP'];
+
+/**
+ * Data for the status pane: the board rows of every known spec plus the TDD phase and task (the worktree's
+ * state.json), issue URL, title, session name and state, and the time of the last report. Input: {pane?: true}
+ * (the pane is open: write its heartbeat). Works from the main checkout and from a worktree; with nothing to show
+ * it returns no rows instead of an error. Makes no gh call: the pane runs it every 10 s.
+ */
+function status(inp) {
+  const main = worktreeList()[0];
+  if (!main) return { rows: [], paneSeen: false };
+  if (inp.pane) writeAtomic(PANE_FILE(), JSON.stringify({ at: new Date().toISOString() }) + '\n');
+  const paneSeen = isPaneOpen();
+  const root = main.path;
+  const slugs = knownRuns(root);
+  if (!slugs.length) return { rows: [], paneSeen };
+  const sessions = claudeSessions();
+  const rows = boardRows(slugs, new Set(), root, sessions).map(({ row, progress, base }) => {
+    const wt = path.join(root, WORKTREES, row.slug);
+    const run = readRun(row.slug) || {};
+    const state = readJSON(path.join(wt, STATE)) || {};
+    const own = !state.feature || state.feature === row.slug;
+    const phase = !own ? '' : PHASES.includes(state.phase) ? state.phase
+      : state.phase === 'IDLE' && row.status === 'running' && progress && progress.open ? 'review' : '';
+    const spec = featureFile(row.slug, 'spec.md', root, base) || '';
+    const source = spec ? parseSpec(spec).source : '';
+    const s = findSession(sessions, run, wt);
+    return { ...row, task: own && state.task ? String(state.task) : '', phase, issueUrl: /^https?:\/\/\S+$/.test(source) ? source : '',
+      title: spec ? specTitle(spec) : '', session: s ? s.name || s.id || '' : '', sessionState: s ? s.state || s.status || '' : '', at: run.at || '' };
+  });
+  return { rows, paneSeen };
+}
+
+/** A file of a spec's folder: the worktree's copy (the session edits there), else feature/<slug>, else the base branch, else the main checkout; null when none has it. */
+function featureFile(slug, name, root, base) {
+  const rel = `${featureDir(slug)}/${name}`;
+  const local = read(path.join(root, WORKTREES, slug, rel));
+  if (local != null) return local;
+  for (const ref of [`refs/heads/feature/${slug}`, base]) {
+    const r = showFile(ref, rel);
+    if (r.code === 0) return r.out;
+  }
+  return read(path.join(root, rel));
 }
 
 function boardTable(rows) {
@@ -1347,7 +1400,8 @@ function boardTable(rows) {
  * Waits until at least one of the given runs has finished or ticked a task in its worktree's tasks.md (`progressed`).
  * A run is finished when its file says done or blocked, or "stalled" when its session is idle or gone without a
  * report (it asked a question or stopped early).
- * Input: {slugs: [...], progress?: {slug: ticked}, maxMinutes?: 240}; `progress` is the board's map.
+ * Input: {slugs: [...], progress?: {slug: ticked}, maxMinutes?: 240, ticks?: false}; `progress` is the board's map.
+ * `ticks: false` (the status pane shows the ticks): return only when a run finishes, not on a ticked task.
  * Meant for a background Bash call, so it blocks without "again".
  */
 async function runsWait(inp) {
@@ -1380,7 +1434,7 @@ async function runsWait(inp) {
         const usable = [inp.progress && inp.progress[slug], reported[slug]].filter((v) => Number.isInteger(v) && v <= p.done);
         seen[slug] = usable.length ? Math.max(...usable) : p.done;
       }
-      if (p.done > seen[slug]) progressed.push(slug);
+      if (p.done > seen[slug] && inp.ticks !== false) progressed.push(slug);
     }
     if (progressed.length) {
       // Re-read before writing: another autopilot may have written its slugs during this wait.
@@ -1388,8 +1442,8 @@ async function runsWait(inp) {
       for (const slug of progressed) latest[slug] = current[slug];
       try { writeAtomic(PROGRESS_FILE(), JSON.stringify(latest) + '\n'); } catch { /* only a guard against re-reporting */ }
     }
-    if (finished.length || progressed.length) return { finished, running, ...(progressed.length ? { progressed } : {}), progress: current };
-    if (Date.now() > end) return { finished: [], running, timedOut: true, progress: current };
+    if (finished.length || progressed.length) return { finished, running, ...(progressed.length ? { progressed } : {}), progress: current, ...paneOpen() };
+    if (Date.now() > end) return { finished: [], running, timedOut: true, progress: current, ...paneOpen() };
     await sleep(Math.min(RUN_POLL_MS, Math.max(0, end - Date.now()) + 50));
   }
 }
@@ -1716,7 +1770,7 @@ async function suite() {
 
 const COMMANDS = {
   plan, suite, branch, block, commit, 'close-out': closeOut, 'add-secret-scan': addSecretScan, preflight,
-  'ci-watch': ciWatch, 'ci-rerun': ciRerun, context, 'stack-fill': stackFill, specs, 'autopilot-check': autopilotCheck, worktree, cleanup, 'run-report': runReport, 'runs-wait': runsWait, board,
+  'ci-watch': ciWatch, 'ci-rerun': ciRerun, context, 'stack-fill': stackFill, specs, 'autopilot-check': autopilotCheck, worktree, cleanup, 'run-report': runReport, 'runs-wait': runsWait, board, status,
   areas, 'simplify-spec': simplifySpec, 'spec-branch': specBranch, 'set-aside': setAside, 'sync-base': syncBase,
 };
 

@@ -96,6 +96,8 @@ Print its `table` exactly as returned (one row per spec: status, ticked/total ta
 
 ## 3. Wait, refill, repeat
 
+**With the status pane open** (`board` returned `paneOpen: true`; the pane shows every spec beside the chat, `/tdd-status`): print the board `table` once after step 2 and once in the summary, not after every return. Add `"ticks": false` to every `runs-wait` input, so it returns only when a run finishes, not on a ticked task. After each return, write one line per finished or blocked spec (`<slug>: done <prUrl>`, `<slug>: blocked - <first line of details>`, `<slug>: decision Q-<n>`, `<slug>: stalled - <attach>`) instead of the table. Without `paneOpen`, everything below stays as written.
+
 Run with the Bash tool and `run_in_background: true` (it blocks until a run finishes, up to 4 hours):
 
 ```bash
@@ -122,6 +124,8 @@ A blocked run with `decision` added an open question (`decision.id`) to `spec.md
 5. Queue the spec again. `specs` with its slug takes a blocked spec that is named. It starts in step 2 when a slot is free and resumes from the first open task. Once it runs, stop the background `runs-wait` (TaskStop) and start a new one that includes the restarted slug.
 
 A decision the user does not answer stays open; list it in the summary.
+
+A decision answered through `/tdd-flow:answer-decision` (for example from the status pane) counts as answered: before you ask one, check the spec's row in the latest `board`. When it no longer shows that decision, do not ask it again; once the spec runs, add it back to the `runs-wait` slugs.
 
 ## 4. Summary
 
