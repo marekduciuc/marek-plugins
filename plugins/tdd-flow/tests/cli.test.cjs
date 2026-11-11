@@ -1379,3 +1379,76 @@ test('board keeps the other specs when one worktree entry cannot be read', () =>
   fs.symlinkSync(path.join(dir, 'no-such-dir'), path.join(dir, '.claude/worktrees/zz-dangling'));
   assert.deepStrictEqual(run(dir, 'board', {}, fakeClaude([])).result.rows.map((r) => [r.slug, r.status]), [['12-csv', 'done']]);
 });
+
+/** A spec with a title, one AC, out of scope items and the given `## Resolved questions` lines. */
+const decidedSpec = (title, resolved) => `# ${title}\n\n- Slug: x\n- Status: approved\n\n## Acceptance criteria\n\n### AC-1 Export works\n- **Given** a report\n- **When** exported\n- **Then** a file\n\n## Out of scope\n\n- PDF export\n- Scheduling\n\n## Open questions\n\n## Resolved questions\n\n${resolved}\n\n## Task breakdown\n\n- Q-9 not in the section - **Answer:** ignored (01.01.2026) → no change\n`;
+
+test('decisions parses resolved questions with continuation lines, skips malformed lines, leaves out the asking slug', () => {
+  const { dir, g, write } = trackedRepo();
+  write('.tdd-flow/features/a-export/spec.md', decidedSpec('CSV export', [
+    '- Q-1 Include hidden columns? - **Answer:** no, only visible ones (03.11.2026) → AC-1',
+    '- Q-2 Which delimiter',
+    '  for European locales? - **Answer:** semicolon, as decided in b-import Q-1 (04.11.2026) → EC-1, T-2',
+    '- Q-3 Malformed, no answer here',
+    '- Q-4 Sort - by name or date? - **Answer:** assumption accepted: by name (see AC-1 (old)) (05.11.2026) → no change',
+    'stray prose line',
+  ].join('\n')));
+  write('.tdd-flow/features/b-import/spec.md', decidedSpec('CSV import', '- Q-1 Delimiter? - **Answer:** semicolon (01.11.2026) → AC-1'));
+  g('add', '.tdd-flow');
+  g('commit', '-qm', 'specs with decisions');
+  const r = run(dir, 'decisions', { slug: 'b-import' });
+  assert.strictEqual(r.ok, true, r.error);
+  assert.deepStrictEqual(r.result.decisions, [
+    { slug: 'a-export', title: 'CSV export', id: 'Q-1', question: 'Include hidden columns?', answer: 'no, only visible ones', date: '03.11.2026', where: 'AC-1' },
+    { slug: 'a-export', title: 'CSV export', id: 'Q-2', question: 'Which delimiter for European locales?', answer: 'semicolon, as decided in b-import Q-1', date: '04.11.2026', where: 'EC-1, T-2' },
+    { slug: 'a-export', title: 'CSV export', id: 'Q-4', question: 'Sort - by name or date?', answer: 'assumption accepted: by name (see AC-1 (old))', date: '05.11.2026', where: 'no change' },
+  ]);
+  assert.deepStrictEqual(r.result.conflicts, []);
+  assert.strictEqual(r.result.skippedLines, 2);
+  assert.deepStrictEqual(run(dir, 'decisions', {}).result.decisions.map((d) => `${d.slug} ${d.id}`), ['a-export Q-1', 'a-export Q-2', 'a-export Q-4', 'b-import Q-1']);
+  assert.match(run(dir, 'decisions', { slug: '../x' }).error, /invalid feature slug/);
+});
+
+test('decisions prefers the worktree copy, reads feature/* branches, and works from a worktree', () => {
+  const { dir, g, wt } = withWorktree();
+  // A spec that exists only on its branch (spec-branch / an interactive run).
+  g('switch', '-qc', 'feature/c-branch');
+  fs.mkdirSync(path.join(dir, '.tdd-flow/features/c-branch'), { recursive: true });
+  fs.writeFileSync(path.join(dir, '.tdd-flow/features/c-branch/spec.md'), decidedSpec('Branch only', '- Q-1 Branch? - **Answer:** yes (02.11.2026) → no change'));
+  g('add', '.tdd-flow/features/c-branch');
+  g('commit', '-qm', 'branch spec');
+  g('switch', '-q', 'main');
+  assert.ok(!fs.existsSync(path.join(dir, '.tdd-flow/features/c-branch')));
+  // The worktree's uncommitted answer is newer than the committed spec.
+  fs.writeFileSync(path.join(wt, '.tdd-flow/features/12-csv/spec.md'), decidedSpec('CSV', '- Q-1 Header row? - **Answer:** always (05.11.2026) → AC-1'));
+  const fromMain = run(dir, 'decisions', {}).result.decisions.map((d) => `${d.slug} ${d.id} ${d.answer}`);
+  assert.deepStrictEqual(fromMain, ['12-csv Q-1 always', 'c-branch Q-1 yes']);
+  const fromWt = run(wt, 'decisions', { slug: '12-csv' });
+  assert.strictEqual(fromWt.ok, true, fromWt.error);
+  assert.deepStrictEqual(fromWt.result.decisions.map((d) => `${d.slug} ${d.id}`), ['c-branch Q-1']);
+  assert.deepStrictEqual(run(wt, 'decisions', {}).result.decisions.map((d) => d.slug), ['12-csv', 'c-branch']);
+});
+
+test('context returns the other specs and their decisions, without the spec being analysed', () => {
+  const { dir, g, write } = trackedRepo();
+  write('.tdd-flow/features/a-export/spec.md', decidedSpec('CSV export', '- Q-1 Delimiter? - **Answer:** semicolon (03.11.2026) → AC-1'));
+  write('.tdd-flow/features/a-export/tasks.md', '- [ ] T-1 Export (AC-1)\n');
+  g('add', '.tdd-flow');
+  g('commit', '-qm', 'spec');
+  write('docs/req.md', '# CSV export\n\nAgain.\n');
+  const r = run(dir, 'context', { input: 'Users import a CSV' });
+  assert.strictEqual(r.ok, true, r.error);
+  const byslug = Object.fromEntries(r.result.otherSpecs.map((s) => [s.slug, s]));
+  assert.deepStrictEqual(Object.keys(byslug), ['12-csv', 'a-export']);
+  const a = byslug['a-export'];
+  assert.deepStrictEqual([a.title, a.status, a.acs, a.outOfScope], ['CSV export', 'approved', [{ id: 'AC-1', name: 'Export works' }], ['PDF export', 'Scheduling']]);
+  assert.strictEqual(a.path, 'main:.tdd-flow/features/a-export/spec.md');
+  assert.deepStrictEqual(byslug['12-csv'].acs.map((c) => c.id), ['AC-1', 'AC-2']);
+  assert.deepStrictEqual(r.result.decisions.map((d) => `${d.slug} ${d.id} ${d.answer}`), ['a-export Q-1 semicolon']);
+  // A file input whose slug names an existing spec leaves that spec out.
+  const f = run(dir, 'context', { input: 'docs/req.md' }).result;
+  assert.strictEqual(f.req.slug, 'csv-export');
+  write('docs/req.md', '# A export\n\nAgain.\n');
+  const again = run(dir, 'context', { input: 'docs/req.md' }).result;
+  assert.deepStrictEqual([again.otherSpecs.map((s) => s.slug), again.decisions], [['12-csv'], []]);
+});

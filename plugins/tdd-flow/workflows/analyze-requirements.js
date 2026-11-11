@@ -6,7 +6,7 @@ export const meta = {
     { title: 'Context', detail: 'detect stack, fetch requirement' },
     { title: 'Draft', detail: '3 analysts from different angles' },
     { title: 'Synthesize', detail: 'merge drafts into spec.md + tasks.md' },
-    { title: 'Critique', detail: 'testability, completeness and existing-tests critics, then revise' },
+    { title: 'Critique', detail: 'testability, completeness, existing-tests and cross-spec critics, then revise' },
   ],
 }
 
@@ -22,9 +22,9 @@ const strs = { type: 'array', items: { type: 'string' } }
 const M = Object.assign({ worker: 'sonnet', strong: 'opus', light: 'haiku' }, (typeof args === 'object' && args && args.models) || {})
 // Agent limits. Override per run with args {maxAgents, maxParallel} (positive integers).
 const posInt = (v, d) => (Number.isInteger(v) && v > 0 ? v : d)
-// 14: context, stack-detector, stack-fill, fetch, 3 drafts, synthesis, 3 critics and the revision are 12 on a
+// 15: context, stack-detector, stack-fill, fetch, 3 drafts, synthesis, 4 critics and the revision are 13 on a
 // first run with a non-GitHub tracker; the two spare slots cover a relay retry without losing the revision.
-const MAX_AGENTS = posInt(opt.maxAgents, 14)
+const MAX_AGENTS = posInt(opt.maxAgents, 15)
 const MAX_PARALLEL = posInt(opt.maxParallel, 2)
 const LIMIT = `tdd-flow: agent limit (${MAX_AGENTS}) reached`
 let spawned = 0, active = 0, limitHit = false
@@ -58,10 +58,18 @@ const REQ = {
     issueId: str, slug: str, problem: str,
   },
 }
+// Earlier decisions: `## Resolved questions` entries of the other specs (tdd-flow decisions).
+const DECISIONS = { type: 'array', items: { type: 'object', required: ['slug', 'id', 'question', 'answer'],
+  properties: { slug: str, title: str, id: str, question: str, answer: str, date: str, where: str } } }
+// A digest of every other spec, for the cross-spec critic: it opens only the specs it suspects.
+const OTHER_SPECS = { type: 'array', items: { type: 'object', required: ['slug', 'path'], properties: {
+  slug: str, title: str, status: str, path: str, outOfScope: strs,
+  acs: { type: 'array', items: { type: 'object', required: ['id', 'name'], properties: { id: str, name: str } } } } } }
 const CONTEXT = {
   type: 'object', required: ['kind'],
   properties: { kind: { type: 'string', enum: ['issue', 'file', 'text'] }, note: str, stack: STACK, req: REQ,
-    state: { type: 'object', required: ['feature', 'specStatus'], properties: { feature: str, specStatus: str } } },
+    state: { type: 'object', required: ['feature', 'specStatus'], properties: { feature: str, specStatus: str } },
+    otherSpecs: OTHER_SPECS, decisions: DECISIONS },
 }
 // Deterministic steps run in the plugin's CLI (bin/tdd-flow) through the script-runner agent (haiku, Bash only)
 // instead of a reasoning agent. Returns {ok, result} or {ok: false, error, fallback}. Identical in every workflow
@@ -178,6 +186,10 @@ try {
   if (!req.ok) throw new Error('tdd-flow: could not fetch the requirement. ' + (req.problem || ''))
   const dir = `.tdd-flow/features/${req.slug}`
   log(`Feature ${req.slug} - stack: ${stack.language}, tests: ${stack.testAll}`)
+  // The CLI leaves out the spec of an issue or file; a text requirement's slug is only known here.
+  const otherSpecs = (known.otherSpecs || []).filter(s => s.slug !== req.slug)
+  const decisions = (known.decisions || []).filter(d => d.slug !== req.slug)
+  if (otherSpecs.length) log(`${otherSpecs.length} other spec(s), ${decisions.length} earlier decision(s) to check against`)
   // state.json names the feature that commands without a slug work on. A new spec takes it over only from a finished
   // or missing one; another feature still in progress keeps it, so a bare /tdd-flow:tdd-implement does not switch.
   const active = cx.ok && known.state && known.state.feature !== req.slug && !['done', 'missing'].includes(known.state.specStatus) ? known.state : null
@@ -216,6 +228,12 @@ try {
     `Write ${dir}/tasks.md as a checklist: "- [ ] T-1 <title> (AC-1, AC-2)"; end the line of a setup task with " [setup]". Every criterion of a setup task needs a "- **Verify:** \`<command>\`" line in spec.md (or "- **Verify (manual):**" only when no automatic check exists). In a repo with no test suite, put the setup task that installs the test framework before the first tdd task.\n` +
     stateStep +
     'If .tdd-flow/ is not in .gitignore, do not change .gitignore - just mention it in assumptions.\n' +
+    (decisions.length
+      ? 'Earlier decisions of other specs are below. An open question that one of them answers (same subject, same behaviour) is not listed as open: put it under ## Resolved questions as ' +
+        '"- Q-<n> <question> - **Answer:** <answer>, as decided in <slug> Q-<m> (<dd.MM.yyyy of that decision>) → <where it went>", and apply the answer to the criteria. ' +
+        'Only a decision that really covers the question counts; if two of them fit and disagree, keep the question open and name both.\n' +
+        `Earlier decisions:\n${JSON.stringify(decisions, null, 1)}\n`
+      : '') +
     (extra || '') +
     `\nRaw requirement:\n"""${req.text}"""\n\nDrafts:\n${JSON.stringify(drafts, null, 1)}`
   let spec = await run(synthPrompt(), { agentType: A('requirements-analyst'), model: M.strong, schema: SPEC, label: 'synthesize' })
@@ -232,6 +250,15 @@ try {
         'Report a hit only when the test asserts the old value on the same element, component, endpoint or function the AC changes, not every file that contains the word. ' +
         'A hit is a blocker unless the spec keeps the old value or already names that test (file:line) as one to update. Give where = the test file:line, problem = the assertion and the AC that changes it, fix = name the test in the AC and its task, or ask which wins when a criterion says existing tests stay unchanged.',
     },
+    // Contradictions with the other specs, found before approval. No other spec: no agent.
+    ...(otherSpecs.length ? [{
+      key: 'cross-spec',
+      ask: 'Check the spec against the OTHER specs of this repo (digest below: title, status, AC names, out of scope) and their earlier decisions. ' +
+        'Open only the specs you suspect: a path with ":" is `<ref>:<file>`, read it with `git show <path>`; any other path is a file. Report: the same behaviour specified differently, an AC that breaks an AC of another spec, a term used with two meanings, ' +
+        'something required here and out of scope there, a question resolved "as decided in" another spec where that decision does not fit, and earlier decisions that contradict each other. ' +
+        'Give where = this spec\'s id and the other spec\'s slug and id (e.g. "AC-2 vs 12-csv AC-1"), problem = the contradiction, fix = the earlier decision that settles it, or the question for the user when none does.\n' +
+        `Other specs:\n${JSON.stringify(otherSpecs)}\nEarlier decisions:\n${JSON.stringify(decisions)}`,
+    }] : []),
   ]
   const crits = (await parallel(CRITICS.map(c => () => run(
     `You are a skeptical reviewer of ${dir}/spec.md. ${c.ask}\nOnly report real problems; do not edit files. This reviews the spec text, not code: do not run the test suite or lint.\n\nRaw requirement:\n"""${req.text}"""`,
@@ -243,11 +270,15 @@ try {
   // Existing tests that assert what the spec changes: shown at the approval gate, since revise runs only once.
   const testHits = crits.filter(c => c.key === 'existing-tests').flatMap(c => c.issues).filter(i => i.severity !== 'minor')
   if (testHits.length) log(`Existing tests assert what the spec changes: ${testHits.map(i => i.where).join(', ')}`)
+  // Contradictions with other specs: also shown at the approval gate.
+  const crossHits = crits.filter(c => c.key === 'cross-spec').flatMap(c => c.issues).filter(i => i.severity !== 'minor')
+  if (crossHits.length) log(`Contradictions with other specs: ${crossHits.map(i => i.where).join(', ')}`)
   if (serious.length) {
     log(`Critics raised ${serious.length} blocker/major issue(s) - revising the spec`)
     const revised = await run(
       `Revise ${dir}/spec.md and ${dir}/tasks.md to fix these review issues. Where an issue needs information only the user has, add it to Open questions with your assumption instead of guessing.\n` +
       'An existing test that asserts what the spec changes: if no criterion says existing tests stay unchanged, name the test (file:line) and its new assertion in the AC and in the task that makes the change, so the test-writer updates it in RED. If a criterion says they stay unchanged, the spec contradicts itself: add an Open question (which wins), with your assumption; do not resolve it silently.\n' +
+      'A contradiction with another spec (cross-spec): if an earlier decision settles it, fix the spec from that decision and record it under ## Resolved questions ("as decided in <slug> Q-<m>"). If it needs the user, add an Open question that names both specs (slug and id) and your assumption.\n' +
       JSON.stringify(serious, null, 1),
       { agentType: A('requirements-analyst'), model: M.strong, schema: SPEC, label: 'revise', phase: 'Critique' })
     if (revised) spec = revised
@@ -268,8 +299,9 @@ try {
     assumptions: spec.assumptions || [],
     critiqueFixesApplied: serious.length,
     existingTestsChanged: testHits.map(i => `${i.where}: ${i.problem}`),
+    crossSpecFindings: crossHits.map(i => `${i.where}: ${i.problem}`),
     ...(active ? { stateKept: `.tdd-flow/state.json still names ${active.feature} (spec ${active.specStatus}), so commands without a slug work on that feature. Pass {feature: "${req.slug}"} to tdd-implement, document and deploy, or delete ${active.feature}'s spec folder if it is abandoned.` } : {}),
-    next: 'GATE: show the user the spec summary, including existingTestsChanged (existing tests the spec changes). Print the open questions in chat as a numbered list, then ask them one at a time and update spec.md after each answer (/tdd-flow:resolve-questions <slug>). After they approve, set "Status: approved" in spec.md, then run /tdd-flow:tdd-implement.',
+    next: 'GATE: show the user the spec summary, including existingTestsChanged (existing tests the spec changes) and crossSpecFindings (contradictions with other specs, fixed from an earlier decision or now an open question). Print the open questions in chat as a numbered list, then ask them one at a time and update spec.md after each answer (/tdd-flow:resolve-questions <slug>). After they approve, set "Status: approved" in spec.md, then run /tdd-flow:tdd-implement.',
   }
 } catch (e) {
   if (!limitHit) throw e

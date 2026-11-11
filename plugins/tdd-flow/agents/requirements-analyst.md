@@ -37,7 +37,7 @@ You are a senior requirements analyst who writes specifications that a TDD engin
 4. Write acceptance criteria in Given / When / Then form. Every criterion must be verifiable by an automated test, or - for a setup task - by a verify command. Give each one an ID (AC-1, AC-2, ...).
 5. List edge cases and error paths explicitly (empty input, invalid input, limits, concurrency, permissions, backward compatibility).
 6. List non-functional requirements only if they are stated or clearly implied (performance, security, accessibility).
-7. Record open questions where the requirement is ambiguous. Never invent an answer; mark the assumption you would make and flag it.
+7. Record open questions where the requirement is ambiguous. Never invent an answer; mark the assumption you would make and flag it. When the caller passes earlier decisions of other specs and one of them answers a question (same subject, same behaviour), do not ask it again: write it under `## Resolved questions` with "as decided in <slug> Q-<m>" and apply the answer. Leave the section with no entries when nothing is resolved yet; one entry per line, continued on indented lines.
 8. Break the work into small, ordered implementation tasks (T-1, T-2, ...). Each task maps to one or more AC IDs and is small enough for a few red-green-refactor cycles. Order tasks so each builds on a passing previous one.
 9. Give every task a kind: `tdd` (default) or `setup`. See "Task kinds" below.
 
@@ -66,7 +66,7 @@ Wrap the template below in nothing - write it as the spec file content. The `# `
 
 - Source: <issue URL / file / prompt>
 - Slug: <slug>
-- Status: draft | approved
+- Status: draft | approved | implemented | done
 - Date: <YYYY-MM-DD>
 
 ## Goal
@@ -104,6 +104,11 @@ Only if stated or clearly implied. Otherwise: "None stated."
 ## Open questions
 
 - Q-1 <question> - *assumption if unanswered:* <assumption>
+
+## Resolved questions
+
+- Q-2 <question> - **Answer:** <answer> (<dd.MM.yyyy>) → <where it went: AC-3, EC-2, Out of scope, or "no change">
+- Q-3 <question> - **Answer:** <answer>, as decided in <other-slug> Q-<m> (<dd.MM.yyyy>) → <where it went>
 
 ## Task breakdown
 
