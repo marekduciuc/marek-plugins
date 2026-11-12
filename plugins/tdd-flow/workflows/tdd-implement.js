@@ -125,6 +125,10 @@ const BRANCH = { type: 'object', required: ['branch'], properties: { branch: str
 const COMMIT = { type: 'object', required: ['committed'], properties: { committed: { type: 'boolean' }, nothingToCommit: { type: 'boolean' }, ticked: { type: 'boolean' }, specStatus: str, specStatusSkipped: str, sha: str, reason: str, unexpected: strs, extraStaged: strs, unstaged: strs, already: { type: 'boolean' } } }
 const SUITE = { type: 'object', required: ['ran', 'pass'], properties: { ran: { type: 'boolean' }, pass: { type: 'boolean' }, command: str, cached: { type: 'boolean' }, summary: str } }
 const BLOCK = { type: 'object', required: ['logged'], properties: { logged: { type: 'boolean' }, unticked: { type: 'boolean' }, alreadyCommitted: { type: 'boolean' } } }
+// A CLI call that runs the test suite returns `"again": true` every ~8.5 minutes while the suite still runs (a slow
+// suite is watched for hangs, not cut by a wall clock); the runner repeats it. 9 calls reach the CLI's 60-minute
+// hard cap, after which the run is killed and reported. stallMs exceeds one call, as for ci-watch in deploy.js.
+const TEST_RUN = { repeat: 9, stallMs: 2400000 }
 
 // Deterministic steps run in the plugin's CLI (bin/tdd-flow) through the script-runner agent (haiku, Bash only)
 // instead of a reasoning agent. Returns {ok, result} or {ok: false, error, fallback}. Identical in every workflow
@@ -189,7 +193,7 @@ const planProblem = (p) => {
 }
 const refactors = opt.refactors || []
 if (refactors.length && opt.findings && opt.findings.length) throw new Error('tdd-flow: pass either findings or refactors, not both.')
-const planned = await cli('plan', { feature: opt.feature || null, maxTasks: opt.maxTasks || null, fromTask: opt.fromTask || null, refactors: refactors.length || null }, PLAN, { label: 'plan', check: planProblem })
+const planned = await cli('plan', { feature: opt.feature || null, maxTasks: opt.maxTasks || null, fromTask: opt.fromTask || null, refactors: refactors.length || null }, PLAN, { label: 'plan', check: planProblem, ...TEST_RUN })
 if (!planned.ok && !planned.fallback) throw new Error(`tdd-flow: planning failed. ${planned.error}`)
 if (!planned.ok) log(`plan: ${planned.error} - using the planning agent`)
 const plan = planned.ok ? planned.result : await run(
@@ -497,7 +501,7 @@ async function refactorStep(task) {
   // CHARACTERIZE left the phase at RED; the CLI resets it here, so tdd-guard lets REFACTOR edit production code.
   const saved = await cli('commit', { message: `test(${plan.slug}): ${task.id} characterize ${task.title}`, files: [...newFiles, `${dir}/tdd-log.md`], runTests: true,
     state: { feature: plan.slug, phase: 'IDLE', task: task.id } },
-    COMMIT, { label: `${task.id} characterize commit`, phase: 'Implement' })
+    COMMIT, { label: `${task.id} characterize commit`, phase: 'Implement', ...TEST_RUN })
   const sc = saved.ok ? saved.result : null
   if (!sc || (!sc.committed && !sc.nothingToCommit)) return { ok: false, step: `${task.id} CHARACTERIZE COMMIT`, details: sc ? sc.reason || 'commit failed' : saved.error }
   const info = { proposal, pinned, newFiles, removed: [] }
@@ -596,7 +600,7 @@ try {
       // The CLI runs the full suite itself, so a wrong suitePass from the implementer cannot reach the commit.
       // When the implementer really ran it, this and the reviewer's own run are cache hits. It also sets the phase
       // REVIEW in state.json (the status pane shows it); the commit sets IDLE again.
-      const checked = checksSuite() ? await cli('suite', { phase: 'REVIEW' }, SUITE, { label: `${task.id} suite ${round}`, phase: 'Review' }) : null
+      const checked = checksSuite() ? await cli('suite', { phase: 'REVIEW' }, SUITE, { label: `${task.id} suite ${round}`, phase: 'Review', ...TEST_RUN }) : null
       if (checked && !checked.ok) log(`${task.id}: the CLI suite check did not run (${checked.error}) - relying on the reviewer`)
       const suite = checked && checked.ok && checked.result.ran ? checked.result : null
       review = await run(

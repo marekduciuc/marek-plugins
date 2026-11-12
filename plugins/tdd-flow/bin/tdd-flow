@@ -13,7 +13,9 @@
 //   tdd-flow replay <<< '{"id":"..."}'      prints the saved output of an earlier call with "_relay": "<id>" again
 //   tdd-flow test [-- <command>]              runs the tests (default: stack.md "test command (all)")
 //                                             and prints only the exit code and the failure tail;
-//                                             a PASS on unchanged files comes from the cache (see runTests)
+//                                             a PASS on unchanged files comes from the cache (see runTests);
+//                                             RUNNING (exit 3) when the run outlasts one call: the identical
+//                                             command waits for the same run (see watchJob)
 //
 // "fallback": true means the input is outside what the script handles (unexpected spec format, a tracker
 // other than GitHub); the workflow then uses its agent for that step. See plugins/tdd-flow/README.md.
@@ -23,9 +25,12 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const TEST_TIMEOUT_MS = 570000; // stays under the Bash tool's 10-minute limit
+/** A positive integer from the environment (milliseconds), otherwise the default. */
+const envMs = (name, d) => { const n = Number(process.env[name]); return Number.isInteger(n) && n > 0 ? n : d; };
 const POLL_MS = 20000;
-const CALL_MS = 510000; // one ci-watch call; the runner repeats the call while "again" is true
+// One call that waits (ci-watch, a test run, the generate command); the runner repeats the call while "again" is
+// true. Stays under the Bash tool's 10-minute limit. TDD_FLOW_CALL_MS is for the tests only.
+const CALL_MS = envMs('TDD_FLOW_CALL_MS', 510000);
 const NO_CHECKS_GRACE_MS = 180000; // CI may take a while to register checks for a new push
 const SECRET_SCAN_PATH = '.github/workflows/secret-scan.yml';
 // Added by deploy to GitHub repos with no secret scan in CI. Scans only the PR's commits, so old,
@@ -63,24 +68,6 @@ const git = (...args) => exec('git', args);
 const gitOut = (...args) => { const r = git(...args); return r.code === 0 ? r.out : ''; };
 const gh = (...args) => exec(process.env.TDD_FLOW_GH_BIN || 'gh', args);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-/** Shell command in its own process group; on timeout the whole group is killed. Resolves {code, out, timedOut}. */
-function runShell(cmd, timeoutMs) {
-  return new Promise((resolve) => {
-    let out = '';
-    let done = false;
-    const finish = (r) => { if (!done) { done = true; clearTimeout(timer); resolve({ out, ...r }); } };
-    const child = spawn('/bin/sh', ['-c', cmd], { env: { ...process.env, CI: 'true' }, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
-    const add = (d) => { out = (out + d).slice(-400000); };
-    child.stdout.on('data', add);
-    child.stderr.on('data', add);
-    const kill = () => { try { process.kill(-child.pid, 'SIGKILL'); } catch { /* already gone */ } };
-    const timer = setTimeout(() => { kill(); finish({ code: null, timedOut: true }); }, timeoutMs);
-    child.on('error', (e) => finish({ code: 127, out: String(e), timedOut: false }));
-    child.on('close', (code) => finish({ code, timedOut: false }));
-    child.on('exit', (code) => setTimeout(() => { kill(); finish({ code, timedOut: false }); }, 2000).unref());
-  });
-}
 
 // ---------- file helpers ----------
 const read = (p) => { try { return fs.readFileSync(p, 'utf8'); } catch { return null; } };
@@ -209,18 +196,15 @@ function worktreeHash(top) {
   }
 }
 
-/** {file, key(), entries} for this command in this directory, or null when the cache does not apply. */
+/** {file, keyOf(tree), entries} for this command in this directory, or null when the cache does not apply. */
 function testCache(cmd) {
   if (testCacheOff()) return null;
   const top = gitOut('rev-parse', '--show-toplevel');
   if (!top || fs.existsSync(path.join(top, '.gitmodules'))) return null;
   const file = path.resolve(gitOut('rev-parse', '--git-path', 'tdd-flow-test-cache'));
   const prefix = gitOut('rev-parse', '--show-prefix');
-  const key = () => {
-    const tree = worktreeHash(top);
-    return tree ? crypto.createHash('sha256').update([cmd, prefix, tree].join('\0')).digest('hex') : '';
-  };
-  return { file, key, entries: (readJSON(file) || {}).entries || [] };
+  const keyOf = (tree) => crypto.createHash('sha256').update([cmd, prefix, tree].join('\0')).digest('hex');
+  return { file, keyOf, entries: (readJSON(file) || {}).entries || [] };
 }
 
 function saveTestPass(cache, key, summary) {
@@ -228,18 +212,245 @@ function saveTestPass(cache, key, summary) {
   try { writeAtomic(cache.file, JSON.stringify({ entries }) + '\n'); } catch { /* the cache is optional */ }
 }
 
+// ---------- watched jobs: test runs and the generate command ----------
+// A command runs as a detached job that outlives the CLI call. A watcher process (`tdd-flow __watch <job file>`)
+// starts it in its own process group, sends its output to a log file and writes the result into the job file. It
+// kills the group when the run hangs: no new output and no growth of the group's CPU time for the idle limit, or
+// longer than the hard cap. A CLI call waits at most CALL_MS and then reports the job as running; the identical
+// call attaches to the same job. Files: <git dir>/tdd-flow/test-jobs/<key>.json, .log, .seen (tree at the last
+// `again`).
+const testIdleMs = () => envMs('TDD_FLOW_TEST_IDLE_MS', 600000);
+const testHardCapMs = () => envMs('TDD_FLOW_TEST_HARD_CAP_MS', 3600000);
+const OUT_TAIL_BYTES = 400000; // what compact() gets, as before
+const RESULT_KEEP_MS = 600000; // a result nobody collected within 10 minutes is dropped, and the command runs again
+const JOB_FILES_KEEP_MS = 86400000;
+const JOB_FILE = /^[0-9a-f]{32}\.json$/;
+const sampleEvery = (idleMs, capMs) => Math.min(15000, Math.max(100, Math.floor(Math.min(idleMs, capMs) / 5)));
+const duration = (ms) => (ms % 60000 === 0 ? `${ms / 60000} min` : `${ms / 1000} s`);
+const jobPaths = (file) => { const b = file.replace(/\.json$/, ''); return { log: `${b}.log`, seen: `${b}.seen` }; };
+const removeJob = (file) => { for (const f of [file, ...Object.values(jobPaths(file))]) fs.rmSync(f, { force: true }); };
+const isAlive = (pid) => {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
+};
+const killGroup = (pgid) => { if (Number.isInteger(pgid) && pgid > 0) { try { process.kill(-pgid, 'SIGKILL'); } catch { /* already gone */ } } };
+
+function jobsDir() {
+  const r = git('rev-parse', '--absolute-git-dir');
+  return r.code === 0 && r.out ? path.join(r.out, 'tdd-flow', 'test-jobs') : path.join(os.tmpdir(), 'tdd-flow-test-jobs');
+}
+const jobFiles = (dir) => { try { return fs.readdirSync(dir).filter((f) => JOB_FILE.test(f)).map((f) => path.join(dir, f)); } catch { return []; } };
+
+/** Seconds from a ps cputime field: macOS prints M:SS.ss, Linux [DD-]HH:MM:SS. null when it does not parse. */
+function cpuSeconds(t) {
+  const m = /^(?:(\d+)-)?(\d+(?::\d+)*(?:\.\d+)?)$/.exec(t || '');
+  if (!m) return null;
+  return Number(m[1] || 0) * 86400 + m[2].split(':').reduce((acc, part) => acc * 60 + Number(part), 0);
+}
+
+/** CPU seconds of the live processes in process group `pgid`, or null when ps cannot be read. */
+function groupCpuS(pgid) {
+  const r = exec('ps', ['-A', '-o', 'pgid=,cputime=']);
+  if (r.code !== 0 || !r.out) return null;
+  let total = 0;
+  for (const line of r.out.split('\n')) {
+    const [g, t] = line.trim().split(/\s+/);
+    if (Number(g) !== pgid) continue;
+    const s = cpuSeconds(t);
+    if (s == null) return null;
+    total += s;
+  }
+  return Math.round(total * 100) / 100;
+}
+
+/** `tdd-flow __watch <job file>`: runs the job's command, records its result, kills it when it hangs. */
+function runWatcher(file) {
+  const job = readJSON(file);
+  if (!job) return Promise.resolve(1);
+  const { log } = jobPaths(file);
+  const every = sampleEvery(job.idleMs, job.capMs);
+  const save = (fields) => {
+    Object.assign(job, fields, { at: Date.now() });
+    try { writeAtomic(file, JSON.stringify(job) + '\n'); } catch { /* a caller then sees a stale heartbeat */ }
+  };
+  return new Promise((resolve) => {
+    const fd = fs.openSync(log, 'a');
+    const child = spawn('/bin/sh', ['-c', job.cmd], { cwd: job.cwd, env: { ...process.env, CI: 'true' }, detached: true, stdio: ['ignore', fd, fd] });
+    fs.closeSync(fd);
+    let done = false;
+    let logBytes = 0, cpuS = null, outputAt = job.startedAt, cpuAt = job.startedAt, sampledAt = job.startedAt, pausedMs = 0;
+    // Ends the job once; the group is killed in every case, so nothing the command left in the background survives.
+    const end = (fields) => {
+      if (done) return;
+      done = true;
+      clearInterval(timer);
+      killGroup(child.pid);
+      save({ ...fields, endedAt: Date.now() });
+      resolve(0);
+    };
+    child.on('error', (e) => { fs.appendFileSync(log, `${e.message}\n`); end({ status: 'failed', code: 127 }); });
+    child.on('exit', (code, signal) => {
+      const c = code != null ? code : 128 + (os.constants.signals[signal] || 0);
+      end({ status: c === 0 ? 'passed' : 'failed', code: c });
+    });
+    const sample = () => {
+      const now = Date.now();
+      // A gap far longer than the interval is a suspended machine (a closed laptop): the run was paused, not idle.
+      if (now - sampledAt > 3 * every + 5000) { pausedMs += now - sampledAt - every; outputAt = cpuAt = now; }
+      sampledAt = now;
+      const size = sizeOf(log);
+      if (size !== logBytes) { logBytes = size; outputAt = now; }
+      // Any change of the group's CPU time counts as work; when ps cannot be read, only the output counts.
+      const c = groupCpuS(child.pid);
+      if (c != null && c !== cpuS) { cpuS = c; cpuAt = now; }
+      const activeAt = c != null ? Math.max(outputAt, cpuAt) : outputAt;
+      if (now - job.startedAt - pausedMs >= job.capMs) return end({ status: 'hung', why: `exceeded the ${duration(job.capMs)} cap` });
+      if (now - activeAt >= job.idleMs) {
+        return end({ status: 'hung', why: c != null ? `no output and no CPU for ${duration(job.idleMs)}` : `no output for ${duration(job.idleMs)} (CPU time not readable)` });
+      }
+      save({ logBytes, outputAt, activeAt, cpu: c == null ? null : { cpuS: c, at: now } });
+    };
+    const timer = setInterval(sample, every);
+    if (child.pid) save({ status: 'running', pid: child.pid, watcher: process.pid, sampleMs: every });
+  });
+}
+
+/** True when a running job will never report: its watcher is gone (or never started), or the machine rebooted since. */
+function isInterrupted(job) {
+  if (job.status !== 'running') return false;
+  const now = Date.now();
+  if (!job.watcher) return now - job.startedAt > 30000;
+  // After a reboot another process may have the watcher's pid: a job older than the boot is gone either way.
+  return !isAlive(job.watcher) || job.startedAt < now - os.uptime() * 1000;
+}
+
+/** The last OUT_TAIL_BYTES of a file, '' when it cannot be read. */
+function readTail(file) {
+  try {
+    const size = fs.statSync(file).size;
+    const len = Math.min(size, OUT_TAIL_BYTES);
+    const buf = Buffer.alloc(len);
+    const fd = fs.openSync(file, 'r');
+    try { fs.readSync(fd, buf, 0, len, size - len); } finally { fs.closeSync(fd); }
+    return buf.toString('utf8');
+  } catch { return ''; }
+}
+
+/** Creates the job file (the `wx` flag makes it the start lock) and starts its watcher; false when it already existed. */
+function startJob(file, cmd, tree) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const { log } = jobPaths(file);
+  const job = { cmd, cwd: process.cwd(), tree, startedAt: Date.now(), logFile: log, status: 'running', idleMs: testIdleMs(), capMs: testHardCapMs() };
+  let fd;
+  try { fd = fs.openSync(file, 'wx'); } catch (e) { if (e.code === 'EEXIST') return false; throw e; }
+  try { fs.writeSync(fd, JSON.stringify(job) + '\n'); } finally { fs.closeSync(fd); }
+  fs.writeFileSync(log, '');
+  spawn(process.execPath, [__filename, '__watch', file], { detached: true, stdio: 'ignore' }).unref();
+  return true;
+}
+
+const changedPaths = (a, b) => (a && b ? gitOut('diff-tree', '-r', '--name-only', a, b).split('\n').filter(Boolean) : []);
+
+/**
+ * A running job of this command and directory that the current tree still belongs to: the tree as the job left it
+ * at its last `again`, or that tree plus more changes to files the run itself has been changing (a report it
+ * rewrites). Any other change is an edit, and the job tests an old tree.
+ */
+function attachableJob(dir, cmd, cwd, tree) {
+  for (const f of jobFiles(dir)) {
+    const job = readJSON(f);
+    if (!job || job.cmd !== cmd || job.cwd !== cwd || job.status !== 'running' || isInterrupted(job)) continue;
+    const seen = read(jobPaths(f).seen);
+    if (!seen) continue;
+    if (seen === tree) return f;
+    const since = changedPaths(seen, tree), during = changedPaths(job.tree, seen);
+    if (since.length && since.every((p) => during.includes(p))) return f;
+  }
+  return null;
+}
+
+/** Removes old finished job files, and stops the running jobs of this command and directory (they test an old tree). */
+function tidyJobs(dir, cmd, cwd) {
+  for (const f of jobFiles(dir)) {
+    const job = readJSON(f);
+    if (!job) continue;
+    if (job.cmd === cmd && job.cwd === cwd && job.status === 'running') {
+      if (!isInterrupted(job)) { try { process.kill(job.watcher, 'SIGKILL'); } catch { /* gone */ } killGroup(job.pid); }
+      removeJob(f);
+    } else if (job.status !== 'running' || isInterrupted(job)) {
+      if (Date.now() - (job.at || job.startedAt) > JOB_FILES_KEEP_MS) removeJob(f);
+    }
+  }
+}
+
+/**
+ * Runs `cmd` in this directory as a watched job for `tree` (the inputs it runs on), or attaches to the job that
+ * already runs for them. `treeNow()` (test runs only) gives the current tree, recorded when the call returns while
+ * the job runs. Waits at most CALL_MS. Resolves {running, elapsedS, idleS}, or the finished run
+ * {code (null when killed or interrupted), out, timedOut (killed as hung), why?, interrupted?, tree}. A finished
+ * job's result is returned once and its files are removed.
+ */
+async function watchJob(cmd, tree, treeNow) {
+  const dir = jobsDir();
+  const cwd = process.cwd();
+  let file = path.join(dir, `${crypto.createHash('sha256').update([cmd, cwd, tree].join('\0')).digest('hex').slice(0, 32)}.json`);
+  let job = readJSON(file);
+  if (job && job.status !== 'running' && Date.now() - (job.endedAt || 0) > RESULT_KEEP_MS) { removeJob(file); job = null; }
+  if (!job && !fs.existsSync(file)) {
+    const other = treeNow ? attachableJob(dir, cmd, cwd, tree) : null;
+    if (other) file = other;
+    else { tidyJobs(dir, cmd, cwd); startJob(file, cmd, tree); }
+  }
+  const deadline = Date.now() + CALL_MS;
+  for (let wait = 25; ; wait = Math.min(wait * 2, 1000)) {
+    job = readJSON(file) || job;
+    const out = () => readTail(jobPaths(file).log);
+    if (!job && !fs.existsSync(file)) return { code: null, out: '', timedOut: false, interrupted: true, tree };
+    if (job && job.status !== 'running') {
+      const r = { code: job.status === 'hung' ? null : job.code, out: out(), timedOut: job.status === 'hung', why: job.why, tree: job.tree };
+      removeJob(file);
+      return r;
+    }
+    if (job && isInterrupted(job)) {
+      // The group is ours while it has members (a pgid is not reused before that), so the kill hits only leftovers.
+      killGroup(job.pid);
+      const r = { code: null, out: out(), timedOut: false, interrupted: true, tree: job.tree };
+      removeJob(file);
+      return r;
+    }
+    if (Date.now() + wait > deadline) break;
+    await sleep(wait);
+  }
+  if (treeNow) { try { fs.writeFileSync(jobPaths(file).seen, treeNow()); } catch { /* attaching then needs the same tree */ } }
+  const now = Date.now();
+  const startedAt = (job && job.startedAt) || now;
+  return { running: true, elapsedS: Math.round((now - startedAt) / 1000), idleS: Math.round((now - ((job && job.activeAt) || startedAt)) / 1000) };
+}
+
+/**
+ * Runs a test command as a watched job (see above) and returns {command, pass, exitCode, timedOut (killed as hung),
+ * cached, summary}, or, while it still runs after one call, {running: true, elapsedS, idleS, pass: false, ...}.
+ */
 async function runTests(cmd) {
-  const cache = testCache(cmd);
-  const keyBefore = cache ? cache.key() : '';
-  const hit = keyBefore && cache.entries.find((e) => e.key === keyBefore);
+  const top = gitOut('rev-parse', '--show-toplevel');
+  const treeNow = () => worktreeHash(top);
+  const tree = top ? treeNow() : '';
+  const cache = tree ? testCache(cmd) : null;
+  const hit = cache && cache.entries.find((e) => e.key === cache.keyOf(tree));
   if (hit) return { command: cmd, pass: true, exitCode: 0, timedOut: false, cached: true, summary: hit.summary };
-  const r = await runShell(cmd, TEST_TIMEOUT_MS);
+  const r = await watchJob(cmd, tree, top ? treeNow : null);
+  if (r.running) {
+    return { command: cmd, pass: false, exitCode: null, timedOut: false, cached: false, running: true, elapsedS: r.elapsedS, idleS: r.idleS,
+      summary: `still running after ${r.elapsedS} s (no output for ${r.idleS} s)` };
+  }
   const pytestEmpty = /pytest/.test(cmd) && r.code === 5; // pytest 5 = no tests collected
-  const pass = !r.timedOut && (r.code === 0 || pytestEmpty);
-  const summary = r.timedOut ? `timed out after ${TEST_TIMEOUT_MS / 1000} s\n${compact(r.out, false)}` : compact(r.out, pass) || (pass ? 'passed, no output' : 'failed, no output');
+  const pass = r.code === 0 || pytestEmpty;
+  const summary = r.timedOut ? `killed as hung: ${r.why}\n${compact(r.out, false)}`
+    : r.interrupted ? `the test run was interrupted (it ended without an exit code)\n${compact(r.out, false)}`
+    : compact(r.out, pass) || (pass ? 'passed, no output' : 'failed, no output');
   // A run that changed files (lint --fix, snapshots, generated code) passed on a tree that no longer exists: not cached.
-  if (pass && keyBefore && cache.key() === keyBefore) saveTestPass(cache, keyBefore, summary);
-  return { command: cmd, pass, exitCode: r.code, timedOut: !!r.timedOut, cached: false, summary };
+  if (pass && cache && r.tree === tree && treeNow() === tree) saveTestPass(cache, cache.keyOf(tree), summary);
+  return { command: cmd, pass, exitCode: r.code, timedOut: r.timedOut, cached: false, summary };
 }
 
 // ---------- spec and task parsing (formats from agents/requirements-analyst.md) ----------
@@ -397,6 +608,8 @@ async function plan(inp) {
     const t = await runTests(stack.testAll);
     res.baselinePass = t.pass;
     res.baselineSummary = t.summary;
+    // Still running after one call: the identical call continues the same baseline run.
+    if (t.running) Object.assign(res, { again: true, running: true, elapsedS: t.elapsedS, idleS: t.idleS });
   }
   return res;
 }
@@ -508,6 +721,8 @@ async function commit(inp) {
     const stack = readStack();
     if (stack && !none(stack.testAll)) {
       const t = await runTests(stack.testAll);
+      // The steps above are idempotent, so the identical call that continues the run repeats them harmlessly.
+      if (t.running) return { committed: false, ticked, again: true, running: true, elapsedS: t.elapsedS, idleS: t.idleS, reason: `the full test suite (\`${t.command}\`) is still running` };
       if (!t.pass) return { committed: false, ticked, reason: `full test suite failed (\`${t.command}\`):\n${t.summary}` };
     }
   }
@@ -1073,17 +1288,21 @@ function generatedMatcher(list) {
 const pathList = (out) => out.split('\n').map((l) => l.trim()).filter(Boolean);
 
 /**
- * Runs the generate command and lists what it changed against the index: {ok, files (generated files to stage),
- * other (files outside `generated files` it changed), summary}. Tracked files it changed outside them are restored.
+ * Runs the generate command as a watched job and lists what it changed against the index: {ok, files (generated
+ * files to stage), other (files outside `generated files` it changed), summary}, or {running, elapsedS, idleS} while
+ * it still runs after one call. Tracked files it changed outside them are restored.
  */
 async function regenerate(cmd, isGenerated) {
-  const r = await runShell(cmd, TEST_TIMEOUT_MS);
+  // Keyed by HEAD and MERGE_HEAD, not by the working tree: the command changes the tree by design.
+  const r = await watchJob(cmd, `${gitOut('rev-parse', 'HEAD')}:${gitOut('rev-parse', '-q', '--verify', 'MERGE_HEAD')}`);
+  if (r.running) return { running: true, elapsedS: r.elapsedS, idleS: r.idleS };
   const changed = [...new Set([...pathList(gitOut('diff', '--name-only')), ...pathList(gitOut('ls-files', '--others', '--exclude-standard'))])];
   const other = changed.filter((f) => !isGenerated(f));
   const tracked = other.filter((f) => git('ls-files', '--error-unmatch', '--', f).code === 0);
   if (tracked.length) git('checkout', '--', ...tracked);
-  const failed = r.timedOut || r.code !== 0;
-  const summary = failed ? `\`${cmd}\` ${r.timedOut ? `timed out after ${TEST_TIMEOUT_MS / 1000} s` : `failed (exit ${r.code})`}:\n${compact(r.out, false)}` : '';
+  const failed = r.code !== 0;
+  const why = r.timedOut ? `was killed: ${r.why}` : r.interrupted ? 'was interrupted (it ended without an exit code)' : `failed (exit ${r.code})`;
+  const summary = failed ? `\`${cmd}\` ${why}:\n${compact(r.out, false)}` : '';
   return { ok: !failed && !other.length, files: changed.filter(isGenerated), other, summary };
 }
 
@@ -1093,26 +1312,41 @@ async function regenerate(cmd, isGenerated) {
  * are resolved by taking the base's version and running `generate command`, in the same merge commit. Any other
  * conflict, or a failing generate, aborts the merge. With nothing to merge, the generate command still runs and its
  * output is committed. The push-gate reruns the suite on the result. Input: {base?}.
- * Output: {base, merged, upToDate, regenerated, conflict?, files?, generateFailed?, reason?}.
+ * Output: {base, merged, upToDate, regenerated, conflict?, files?, generateFailed?, reason?}, plus `again` (and
+ * `running`) while the generate command still runs: the identical call resumes where this one stopped, with the
+ * merge still in progress, without a new fetch.
  */
 async function syncBase(inp) {
   const base = inp.base || baseBranch();
   const branch = gitOut('branch', '--show-current');
   if (!branch || branch === base) throw new Error(`sync-base runs on a feature branch, not on ${branch || 'a detached HEAD'}`);
-  const dirty = gitOut('status', '--porcelain', '--untracked-files=no');
-  if (dirty) throw new Error(`uncommitted changes - commit them first:\n${dirty}`);
-  const f = git('fetch', '--quiet', 'origin', base);
-  if (f.code !== 0) throw new Error(`git fetch origin ${base} failed: ${f.err || f.out}`);
+  const stateFile = path.join(gitDir(), 'tdd-flow', 'sync-base.json');
+  const mergeHead = () => gitOut('rev-parse', '-q', '--verify', 'MERGE_HEAD');
+  const head = gitOut('rev-parse', 'HEAD');
+  const saved = readJSON(stateFile);
+  fs.rmSync(stateFile, { force: true });
+  const resume = saved && saved.branch === branch && saved.base === base && saved.head === head && saved.mergeHead === mergeHead() ? saved : null;
+  if (!resume) {
+    const dirty = gitOut('status', '--porcelain', '--untracked-files=no');
+    if (dirty) throw new Error(`uncommitted changes - commit them first:\n${dirty}`);
+    const f = git('fetch', '--quiet', 'origin', base);
+    if (f.code !== 0) throw new Error(`git fetch origin ${base} failed: ${f.err || f.out}`);
+  }
   const stack = readStack() || {};
   const generate = none(stack.generate) ? '' : stack.generate;
   const isGenerated = generatedMatcher(stack.generatedFiles);
   const res = { base, merged: false, upToDate: false, regenerated: [] };
   const ref = `origin/${base}`;
+  const later = (g, conflicts) => {
+    writeJSON(stateFile, { branch, base, head, mergeHead: mergeHead(), conflicts });
+    return { ...res, again: true, running: true, elapsedS: g.elapsedS, idleS: g.idleS };
+  };
 
-  if (git('merge-base', '--is-ancestor', ref, 'HEAD').code === 0) {
+  if (resume ? !resume.mergeHead : git('merge-base', '--is-ancestor', ref, 'HEAD').code === 0) {
     res.upToDate = true;
     if (!generate) return res;
     const g = await regenerate(generate, isGenerated);
+    if (g.running) return later(g, []);
     if (!g.ok) return { ...res, generateFailed: true, reason: g.summary || `the generate command changed files outside generated files: ${g.other.join(', ')}` };
     if (!g.files.length) return res;
     const slug = branch.replace(/^feature\//, '');
@@ -1122,21 +1356,25 @@ async function syncBase(inp) {
     return { ...res, regenerated: g.files };
   }
 
-  const m = git('merge', '--no-commit', '--no-ff', ref);
-  const conflicts = pathList(gitOut('diff', '--name-only', '--diff-filter=U'));
   const abort = (extra) => { git('merge', '--abort'); return { ...res, ...extra }; };
-  if (m.code !== 0 && !conflicts.length) { abort({}); throw new Error(`git merge ${ref} failed: ${m.err || m.out}`); }
-  const other = conflicts.filter((p) => !isGenerated(p));
-  if (other.length) return abort({ conflict: true, files: conflicts, reason: `${ref} conflicts with this branch in ${other.join(', ')}` });
-  if (conflicts.length && !generate) return abort({ conflict: true, files: conflicts, reason: 'only generated files conflict, but stack.md has no generate command' });
-  if (conflicts.length) {
-    // The generator rebuilds these files from the merged sources, so either side will do as a starting point.
-    const co = git('checkout', '--theirs', '--', ...conflicts);
-    if (co.code !== 0) return abort({ conflict: true, files: conflicts, reason: `cannot take ${base}'s version: ${co.err || co.out}` });
+  let conflicts = resume ? resume.conflicts || [] : [];
+  if (!resume) {
+    const m = git('merge', '--no-commit', '--no-ff', ref);
+    conflicts = pathList(gitOut('diff', '--name-only', '--diff-filter=U'));
+    if (m.code !== 0 && !conflicts.length) { abort({}); throw new Error(`git merge ${ref} failed: ${m.err || m.out}`); }
+    const other = conflicts.filter((p) => !isGenerated(p));
+    if (other.length) return abort({ conflict: true, files: conflicts, reason: `${ref} conflicts with this branch in ${other.join(', ')}` });
+    if (conflicts.length && !generate) return abort({ conflict: true, files: conflicts, reason: 'only generated files conflict, but stack.md has no generate command' });
+    if (conflicts.length) {
+      // The generator rebuilds these files from the merged sources, so either side will do as a starting point.
+      const co = git('checkout', '--theirs', '--', ...conflicts);
+      if (co.code !== 0) return abort({ conflict: true, files: conflicts, reason: `cannot take ${base}'s version: ${co.err || co.out}` });
+    }
   }
   let regenerated = [];
   if (generate) {
     const g = await regenerate(generate, isGenerated);
+    if (g.running) return later(g, conflicts);
     if (!g.ok) return abort({ generateFailed: true, reason: g.summary || `the generate command changed files outside generated files: ${g.other.join(', ')}` });
     regenerated = g.files;
   }
@@ -1286,6 +1524,7 @@ async function baseSuiteCheck(base, runnable, stack, isBaseStale) {
     return skip('the main checkout has local changes, so it is not what the worktrees get');
   }
   const t = await runTests(stack.testAll);
+  if (t.running) return { name: 'base suite', status: 'running', details: `\`${t.command}\` ${t.summary}`, elapsedS: t.elapsedS, idleS: t.idleS };
   if (!t.pass) {
     return { name: 'base suite', status: 'fail', details: `\`${t.command}\` fails on ${base}, so every session would stop at its baseline:\n${t.summary}`, fix: `fix the suite on ${base} first` };
   }
@@ -1295,7 +1534,8 @@ async function baseSuiteCheck(base, runnable, stack, isBaseStale) {
 
 /**
  * Checks before the autopilot creates worktrees. Input: {runnable: number of specs to start, parallel?: the user's
- * --parallel}. Output: {ok (no check failed), parallel, testsNeed, checks: [{name, status ok|warn|fail|skipped, details, fix?}]}.
+ * --parallel}. Output: {ok (no check failed), parallel, testsNeed, checks: [{name, status ok|warn|fail|skipped|running, details, fix?}]},
+ * plus `again` while the base suite still runs.
  */
 async function autopilotCheck(inp) {
   const root = mainRoot();
@@ -1329,14 +1569,17 @@ async function autopilotCheck(inp) {
   checks.push(permissionsCheck(root, base));
   const fresh = baseFreshnessCheck(base);
   checks.push(fresh);
-  checks.push(await baseSuiteCheck(base, runnable, stack, fresh.status === 'fail'));
+  const suiteCheck = await baseSuiteCheck(base, runnable, stack, fresh.status === 'fail');
+  checks.push(suiteCheck);
 
   const parallel = inp.parallel || (outside ? 1 : PARALLEL_DEFAULT);
   if (outside && !inp.parallel) checks.push({ name: 'parallel', status: 'ok', details: `1 at a time, because the tests need ${need}; pass --parallel N to run more` });
   else if (outside && parallel > 1) checks.push({ name: 'parallel', status: 'warn', details: `${parallel} at a time although the tests need ${need}: their tests may collide` });
   else checks.push({ name: 'parallel', status: 'ok', details: `${parallel} at a time` });
 
-  return { ok: !checks.some((c) => c.status === 'fail'), parallel, testsNeed: need, checks };
+  // While the base suite still runs, the identical call continues it; until then the checks are not ok.
+  const running = suiteCheck.status === 'running' ? { again: true, running: true, elapsedS: suiteCheck.elapsedS, idleS: suiteCheck.idleS } : {};
+  return { ok: !checks.some((c) => c.status === 'fail' || c.status === 'running'), parallel, testsNeed: need, checks, ...running };
 }
 
 /** Creates (or reuses) .claude/worktrees/<slug> on branch feature/<slug>. Input: {slug}. */
@@ -2067,7 +2310,8 @@ async function suite(inp) {
   const stack = readStack();
   if (!stack || none(stack.testAll)) return { ran: false, pass: true, command: '', cached: false, summary: 'no test command in .tdd-flow/stack.md' };
   const t = await runTests(stack.testAll);
-  return { ran: true, pass: t.pass, command: t.command, cached: t.cached, summary: t.summary };
+  const running = t.running ? { again: true, running: true, elapsedS: t.elapsedS, idleS: t.idleS } : {};
+  return { ran: true, pass: t.pass, command: t.command, cached: t.cached, summary: t.summary, ...running };
 }
 
 const COMMANDS = {
@@ -2078,6 +2322,7 @@ const COMMANDS = {
 
 async function main(argv) {
   const [cmd, ...rest] = argv;
+  if (cmd === '__watch') return runWatcher(rest[0]);
   // Every path (.tdd-flow/, the files of a commit, the stack.md commands) is relative to the repo root, wherever the
   // caller's shell is: an agent's `cd apps/web` must not move them.
   const callerDir = process.cwd();
@@ -2093,7 +2338,11 @@ async function main(argv) {
     // A command the agent gives runs where the agent is; the stack.md command runs at the root.
     if (given.length) process.chdir(callerDir);
     const t = await runTests(command);
-    const how = t.cached ? 'cached: no file changed since this command last passed' : `exit ${t.timedOut ? 'timeout' : t.exitCode}`;
+    if (t.running) {
+      process.stdout.write(`RUNNING (${t.elapsedS} s, no output for ${t.idleS} s) \`${command}\`\nThe tests still run in the background. Run the identical command again to keep waiting for this run; it does not start a second one.\n`);
+      return 3;
+    }
+    const how = t.cached ? 'cached: no file changed since this command last passed' : `exit ${t.timedOut ? 'timeout' : t.exitCode == null ? 'interrupted' : t.exitCode}`;
     process.stdout.write(`${t.pass ? 'PASS' : 'FAIL'} (${how}) \`${command}\`\n${t.summary}\n`);
     return t.pass ? 0 : 1;
   }
