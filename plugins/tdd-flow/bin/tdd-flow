@@ -1742,24 +1742,34 @@ function answerDecision(inp) {
     if (c.code !== 0) throw new Error(`git commit failed: ${(c.err || c.out).split('\n').slice(-5).join(' ')}`);
   });
 
-  const sessions = claudeSessions(true);
-  const old = sessions && run.session ? sessions.find((s) => s.id === run.session || s.sessionId === run.session) : null;
+  const { session, name } = restartSpec({ slug, oldSession: run.session, sessions: claudeSessions(true), name: inp.name, notes, step });
+  return { slug, id, answer, session, name, attach: `claude attach ${name}`, notes };
+}
+
+/**
+ * Starts a spec's session again, the end of answer-decision and all of restart: step 4 removes the old session
+ * (`oldSession`, an id) unless it is working, step 5 starts `/tdd-flow:implement-spec <slug> <base>` in the spec's
+ * worktree (created or reused) and records the run as running with the new id. The name is `name`, else the old
+ * session's when free, else the first three words of the slug without its number (plus the number when another
+ * session has those words), as the autopilot names sessions. `sessions` is null when `claude agents` failed; what
+ * was not done goes into `notes`; `step(n, what, fn)` names the step in an error. Returns {session, name}.
+ */
+function restartSpec({ slug, oldSession, sessions, name: wanted, notes, step }) {
+  const old = sessions && oldSession ? sessions.find((s) => s.id === oldSession || s.sessionId === oldSession) : null;
   let removed = false;
   step(4, 'remove the old session', () => {
-    if (!run.session) notes.push('the run names no session: none removed');
-    else if (!sessions) notes.push(`claude agents is not available: old session ${run.session} not removed`);
-    else if (isLive(old)) notes.push(`old session ${run.session} is still working: not removed`);
+    if (!oldSession) notes.push('the run names no session: none removed');
+    else if (!sessions) notes.push(`claude agents is not available: old session ${oldSession} not removed`);
+    else if (isLive(old)) notes.push(`old session ${oldSession} is still working: not removed`);
     else {
-      const r = exec(claudeBin(), ['rm', run.session]);
+      const r = exec(claudeBin(), ['rm', oldSession]);
       if (r.code === 0) removed = true;
-      else notes.push(`claude rm ${run.session} failed: ${(r.err || r.out).split('\n')[0]}`);
+      else notes.push(`claude rm ${oldSession} failed: ${(r.err || r.out).split('\n')[0]}`);
     }
   });
 
-  // The old session's name when it is free, else the first three words of the slug without its number (plus the
-  // number when another session has those words), as the autopilot names sessions.
   const taken = (n) => (sessions || []).some((s) => s.name === n && !(removed && s === old));
-  let name = inp.name ? String(inp.name) : '';
+  let name = wanted ? String(wanted) : '';
   if (!name && old && SESSION_NAME.test(old.name || '') && !taken(old.name)) name = old.name;
   if (!name) {
     const num = (slug.match(/^(\d+)-/) || [])[1];
@@ -1776,7 +1786,33 @@ function answerDecision(inp) {
     runReport({ slug, status: 'running', session: m[1] });
     return m[1];
   });
-  return { slug, id, answer, session, name, attach: `claude attach ${name}`, notes };
+  return { session, name };
+}
+
+/**
+ * Starts a blocked (without a decision) or stalled spec again, from the main checkout, as answer-decision does after
+ * the answer: the status pane's restart button. Input: {slug, name?}. Refuses, changing nothing, a running or done run,
+ * a run waiting on a decision (answer it with answer-decision), a slug with no spec, and an unknown session list (a
+ * session that still works would get a second one). The old session is the run's, else the one found in the worktree.
+ * Returns {slug, session, name, attach, notes}.
+ */
+function restart(inp) {
+  const slug = checkSlug(inp.slug);
+  if (inp.name != null && !SESSION_NAME.test(String(inp.name))) throw new Error(`name must be lowercase kebab-case, not ${JSON.stringify(inp.name)}`);
+  const root = mainRoot();
+  if (featureFile(slug, 'spec.md', root, baseBranch()) == null) throw new Error(`no spec ${featureDir(slug)}/spec.md in the worktree, on feature/${slug}, the base branch or the main checkout`);
+  const sessions = claudeSessions(true);
+  if (!sessions) throw new Error('claude agents is not available: cannot tell whether the session still works, nothing restarted');
+  const state = runState(slug, sessions, root);
+  if (state.decision) throw new Error(`${slug} waits for decision ${state.decision.id}: answer it (tdd-flow answer-decision), not restarted`);
+  if (!['blocked', 'stalled'].includes(state.status)) throw new Error(`${slug} is ${state.status}: only a blocked or stalled spec is restarted`);
+  const run = readRun(slug);
+  const found = findSession(sessions, run, path.join(root, WORKTREES, slug));
+  const notes = [];
+  const step = (n, what, fn) => { try { return fn(); } catch (e) { throw new Error(`restart step ${n} (${what}): ${e.message}`); } };
+  const oldSession = (run && run.session) || (found && found.id) || '';
+  const { session, name } = restartSpec({ slug, oldSession, sessions, name: inp.name, notes, step });
+  return { slug, session, name, attach: `claude attach ${name}`, notes };
 }
 
 /** State of one autopilot run: its run file (done/blocked/running), or "stalled" when the session is idle or gone. */
@@ -1792,16 +1828,18 @@ function runState(slug, sessions, root) {
 }
 
 /**
- * Ticked and total tasks of a spec, and its first open task: from the worktree's tasks.md (the session ticks there),
- * else feature/<slug> or the base branch, else the main checkout. null when no task list is found.
+ * Ticked and total tasks of a spec, its first open task and that task's position in tasks.md (from 1; null when every
+ * task is ticked): from the worktree's tasks.md (the session ticks there), else feature/<slug> or the base branch, else
+ * the main checkout. null when no task list is found.
  */
 function taskProgress(slug, root, base) {
   const md = featureFile(slug, 'tasks.md', root, base);
   const tasks = md == null ? [] : parseTasks(md);
   if (!tasks.length) return null;
-  const open = tasks.find((t) => !t.done);
+  const at = tasks.findIndex((t) => !t.done);
+  const open = tasks[at];
   const title = open && open.title.length > 30 ? open.title.slice(0, 29) + '…' : open ? open.title : '';
-  return { done: tasks.filter((t) => t.done).length, total: tasks.length, open: open ? `${open.id} ${title}`.trim() : '' };
+  return { done: tasks.filter((t) => t.done).length, total: tasks.length, open: open ? `${open.id} ${title}`.trim() : '', position: open ? at + 1 : null };
 }
 
 /** Specs with a worktree or a run file, sorted: what `board` shows when no slugs are given. */
@@ -1874,10 +1912,18 @@ function status(inp) {
     const spec = featureFile(row.slug, 'spec.md', root, base) || '';
     const source = spec ? parseSpec(spec).source : '';
     const s = findSession(sessions, run, wt);
-    return { ...row, task: own && state.task ? String(state.task) : '', phase, issueUrl: /^https?:\/\/\S+$/.test(source) ? source : '',
-      title: spec ? specTitle(spec) : '', session: s ? s.name || s.id || '' : '', sessionState: s ? s.state || s.status || '' : '', at: run.at || '' };
+    const issueUrl = /^https?:\/\/\S+$/.test(source) ? source : '';
+    return { ...row, task: own && state.task ? String(state.task) : '', phase, issueUrl,
+      title: spec ? specTitle(spec) : '', session: s ? s.name || s.id || '' : '', sessionState: s ? s.state || s.status || '' : '', at: run.at || '',
+      position: progress ? progress.position : null, issueNumber: urlNumber(issueUrl, 'issues'), prNumber: urlNumber(row.prUrl, 'pull') };
   });
   return { rows, paneSeen };
+}
+
+/** The number after `/<part>/` of a GitHub URL (`/issues/25`, `/pull/24`); null when the URL has none. */
+function urlNumber(url, part) {
+  const m = String(url || '').match(new RegExp(`/${part}/(\\d+)(?:[/?#]|$)`));
+  return m ? Number(m[1]) : null;
 }
 
 /** A file of a spec's folder: the worktree's copy (the session edits there), else feature/<slug>, else the base branch, else the main checkout; null when none has it. */
@@ -2269,7 +2315,7 @@ async function suite(inp) {
 }
 
 const COMMANDS = {
-  plan, suite, phase, 'answer-decision': answerDecision, branch, block, commit, 'close-out': closeOut, 'add-secret-scan': addSecretScan, preflight,
+  plan, suite, phase, 'answer-decision': answerDecision, restart, branch, block, commit, 'close-out': closeOut, 'add-secret-scan': addSecretScan, preflight,
   'ci-watch': ciWatch, 'ci-rerun': ciRerun, context, 'stack-fill': stackFill, specs, 'autopilot-check': autopilotCheck, worktree, cleanup, 'run-report': runReport, 'runs-wait': runsWait, board, status,
   areas, 'simplify-spec': simplifySpec, 'spec-branch': specBranch, 'set-aside': setAside, 'sync-base': syncBase, decisions,
 };
