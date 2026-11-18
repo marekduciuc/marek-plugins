@@ -478,6 +478,21 @@ test('status rows carry phase, task, issue URL, title, session and decision, fro
   assert.deepStrictEqual([blocked.status, blocked.phase, blocked.sessionState, blocked.details], ['blocked', '', 'done', 'needs a decision']);
 });
 
+test('a blocked run whose session works again is running, not blocked (restarted by hand or resumed)', () => {
+  const { dir } = trackedRepo();
+  run(dir, 'run-report', { slug: '12-csv', status: 'blocked', session: 's-1', details: 'T-5 GREEN full suite red' });
+  const working = fakeClaude([{ id: 's-1', kind: 'background', name: 'csv-export-flow', state: 'working' }]);
+  const stateOf = () => run(dir, 'status', { slugs: ['12-csv'] }, working).result.rows[0].status;
+  // Just reported: the session is still finishing its turn, so it stays blocked.
+  assert.strictEqual(stateOf(), 'blocked');
+  // Reported long ago and the session works again: running.
+  const rf = execFileSync('git', ['-C', dir, 'rev-parse', '--git-common-dir']).toString().trim();
+  const f = path.join(path.resolve(dir, rf), 'tdd-flow', 'runs', '12-csv.json');
+  const r = JSON.parse(fs.readFileSync(f, 'utf8'));
+  fs.writeFileSync(f, JSON.stringify({ ...r, at: new Date(Date.now() - 5 * 60000).toISOString() }) + '\n');
+  assert.strictEqual(stateOf(), 'running');
+});
+
 test('status with pane writes a heartbeat; board and runs-wait say paneOpen while it is younger than 60 s', () => {
   const { dir } = trackedRepo();
   const env = fakeClaude([]);

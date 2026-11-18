@@ -1822,7 +1822,10 @@ function runState(slug, sessions, root) {
   const attach = s && s.id ? { attach: `claude attach ${attachRef(sessions, s)}` } : {};
   // A session that has just been started may not be listed as working yet.
   const starting = run.status === 'running' && Date.now() - Date.parse(run.at) < START_GRACE_MS && !(s && s.state === 'done');
-  if (RUN_FINAL.includes(run.status)) return { ...run, ...attach };
+  // A blocked run whose session works again (resumed or restarted by hand, not through restart/answer-decision, which
+  // rewrite the run file) is running. A session that has just reported is still finishing its turn: grace applies.
+  const resumed = run.status === 'blocked' && isLive(s) && Date.now() - Date.parse(run.at) >= START_GRACE_MS;
+  if (RUN_FINAL.includes(run.status) && !resumed) return { ...run, ...attach };
   if (!isLive(s) && !starting) return { slug, status: 'stalled', details: s ? `session is ${s.state || s.status} without a report` : 'no session found', ...attach };
   return { slug, status: 'running', ...attach };
 }
