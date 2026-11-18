@@ -80,6 +80,19 @@ function fakeClaude(sessions) {
   return { TDD_FLOW_CLAUDE_BIN: f };
 }
 
+/** Fake `claude` CLI whose every call fails (`claude agents` unavailable). */
+function failingClaude() {
+  const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'tdd-flow-claude-')), 'claude');
+  fs.writeFileSync(f, '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+  return { TDD_FLOW_CLAUDE_BIN: f };
+}
+
+/** Path of a slug's run file in the repo's shared git dir. */
+const runFilePath = (dir, slug) => path.join(path.resolve(dir, execFileSync('git', ['-C', dir, 'rev-parse', '--git-common-dir']).toString().trim()), 'tdd-flow', 'runs', `${slug}.json`);
+const runFile = (dir, slug) => JSON.parse(fs.readFileSync(runFilePath(dir, slug), 'utf8'));
+/** Moves a run's report time `minutes` into the past. */
+const age = (dir, slug, minutes) => fs.writeFileSync(runFilePath(dir, slug), JSON.stringify({ ...runFile(dir, slug), at: new Date(Date.now() - minutes * 60000).toISOString() }) + '\n');
+
 test('parseSpec reads status, criteria text, verify lines and edge cases', () => {
   const s = parseSpec(SPEC);
   assert.strictEqual(s.status, 'approved');
@@ -491,6 +504,53 @@ test('a blocked run whose session works again is running, not blocked (restarted
   const r = JSON.parse(fs.readFileSync(f, 'utf8'));
   fs.writeFileSync(f, JSON.stringify({ ...r, at: new Date(Date.now() - 5 * 60000).toISOString() }) + '\n');
   assert.strictEqual(stateOf(), 'running');
+});
+
+test('a spec whose worktree exists but whose session has not reported yet is starting, then stalled after the grace', () => {
+  const { dir } = trackedRepo();
+  const none = fakeClaude([]);
+  run(dir, 'worktree', { slug: '12-csv' }, none);
+  assert.strictEqual(runFile(dir, '12-csv').status, 'starting');
+  assert.strictEqual(run(dir, 'status', { slugs: ['12-csv'] }, none).result.rows[0].status, 'starting');
+  assert.match(run(dir, 'board', { slugs: ['12-csv'] }, none).result.table, /\| 12-csv \| starting \|/);
+  age(dir, '12-csv', 5);
+  const r = run(dir, 'board', { slugs: ['12-csv'] }, none).result.rows[0];
+  assert.deepStrictEqual([r.status, r.details], ['stalled', 'session did not start within 90 s']);
+});
+
+test('a starting run is running once its session works, and starting while only the previous idle session is found', () => {
+  const { dir } = trackedRepo();
+  const wt = run(dir, 'worktree', { slug: '12-csv' }, fakeClaude([])).result.path;
+  const at = (state) => fakeClaude([{ id: 's-1', kind: 'background', name: 'csv-export-flow', state, cwd: wt }]);
+  assert.strictEqual(run(dir, 'status', { slugs: ['12-csv'] }, at('working')).result.rows[0].status, 'running');
+  assert.strictEqual(run(dir, 'status', { slugs: ['12-csv'] }, at('done')).result.rows[0].status, 'starting');
+});
+
+test('a running run inside the grace whose session is not listed yet is starting; with a done session it is stalled', () => {
+  const { dir } = trackedRepo();
+  run(dir, 'run-report', { slug: '12-csv', status: 'running', session: 's-1' });
+  assert.strictEqual(run(dir, 'board', { slugs: ['12-csv'] }, fakeClaude([])).result.rows[0].status, 'starting');
+  const done = fakeClaude([{ id: 's-1', kind: 'background', name: 'csv-export-flow', state: 'done' }]);
+  assert.strictEqual(run(dir, 'board', { slugs: ['12-csv'] }, done).result.rows[0].status, 'stalled');
+});
+
+test('worktree replaces only a missing, blocked or starting run with starting', () => {
+  const { dir } = trackedRepo();
+  const none = fakeClaude([]);
+  const keeps = (report, env) => {
+    run(dir, 'run-report', { slug: '12-csv', ...report });
+    const before = runFile(dir, '12-csv');
+    run(dir, 'worktree', { slug: '12-csv' }, env);
+    assert.deepStrictEqual(runFile(dir, '12-csv'), before, JSON.stringify(report));
+  };
+  keeps({ status: 'done', prUrl: 'https://github.com/o/r/pull/7' }, none);
+  keeps({ status: 'running', session: 's-1' }, none);
+  keeps({ status: 'running', session: 's-1' }, failingClaude());
+  keeps({ status: 'blocked', session: 's-1', details: 'tests fail' }, fakeClaude([{ id: 's-1', kind: 'background', name: 'x', state: 'working' }]));
+  keeps({ status: 'blocked', session: 's-1', details: 'tests fail' }, failingClaude());
+  run(dir, 'run-report', { slug: '12-csv', status: 'blocked', session: 's-1', details: 'tests fail' });
+  run(dir, 'worktree', { slug: '12-csv' }, none);
+  assert.strictEqual(runFile(dir, '12-csv').status, 'starting');
 });
 
 test('status with pane writes a heartbeat; board and runs-wait say paneOpen while it is younger than 60 s', () => {
@@ -1812,7 +1872,7 @@ test('restart starts a blocked run without decision again: old session removed, 
   assert.match(r.claude.log(), new RegExp(`^--bg -n csv-export-flow /tdd-flow:implement-spec 12-csv main in ${esc(r.wt)}$`, 'm'));
   assert.deepStrictEqual([r.runFileJson().status, r.runFileJson().session], ['running', 'new-7']);
   // A second restart is refused: the new session is starting.
-  assert.match(r.restart().error, /running/);
+  assert.match(r.restart().error, /is starting/);
 });
 
 test('restart keeps a working old session, takes a given name, and restarts a stalled run or one without any session', () => {
@@ -1837,6 +1897,7 @@ test('restart keeps a working old session, takes a given name, and restarts a st
 
   // No run file and no session at all: the worktree's spec starts, with a name from the slug.
   const none = restartable(null, []);
+  fs.rmSync(runFilePath(none.dir, '12-csv')); // made by the worktree command, as for a worktree from before 0.28.0
   const n = none.restart();
   assert.strictEqual(n.ok, true, n.error);
   assert.strictEqual(n.result.name, 'csv');

@@ -1607,6 +1607,25 @@ function worktree(inp) {
   return { path: abs, branch, created: true };
 }
 
+/**
+ * The `worktree` command, which the autopilot runs before it starts a spec's session: the worktree, and the run
+ * recorded as `starting` until the session reports, so the status pane does not show the spec as stalled meanwhile.
+ * Only a missing, blocked or starting run is replaced: a done run keeps its PR, a running one its session, and a
+ * blocked one whose session works again (or when `claude agents` fails and that cannot be told) stays as it is.
+ */
+function startWorktree(inp) {
+  const w = worktree(inp);
+  const slug = inp.slug;
+  const run = readRun(slug);
+  if (run && !['blocked', 'starting'].includes(run.status)) return w;
+  if (run) {
+    const sessions = claudeSessions(true);
+    if (!sessions || isLive(findSession(sessions, run, w.path))) return w;
+  }
+  writeRun(slug, { slug, status: 'starting', at: new Date().toISOString() });
+  return w;
+}
+
 /** A blocked run's question for the user, checked: {id: Q-<n>, question, recommendation, options?: [...], tasks?: [...]}. */
 function checkDecision(d) {
   if (!d || typeof d !== 'object') throw new Error('decision must be an object {id, question, recommendation, options, tasks}');
@@ -1815,19 +1834,26 @@ function restart(inp) {
   return { slug, session, name, attach: `claude attach ${name}`, notes };
 }
 
-/** State of one autopilot run: its run file (done/blocked/running), or "stalled" when the session is idle or gone. */
+/**
+ * State of one autopilot run: its run file (done/blocked), "running" while its session works, "starting" while a
+ * just started session does not work yet, or "stalled" when the session is idle or gone.
+ */
 function runState(slug, sessions, root) {
   const run = readRun(slug) || { slug, status: 'unknown' };
   const s = findSession(sessions, run, path.join(root, WORKTREES, slug));
   const attach = s && s.id ? { attach: `claude attach ${attachRef(sessions, s)}` } : {};
-  // A session that has just been started may not be listed as working yet.
-  const starting = run.status === 'running' && Date.now() - Date.parse(run.at) < START_GRACE_MS && !(s && s.state === 'done');
+  const young = Date.now() - Date.parse(run.at) < START_GRACE_MS;
   // A blocked run whose session works again (resumed or restarted by hand, not through restart/answer-decision, which
   // rewrite the run file) is running. A session that has just reported is still finishing its turn: grace applies.
-  const resumed = run.status === 'blocked' && isLive(s) && Date.now() - Date.parse(run.at) >= START_GRACE_MS;
+  const resumed = run.status === 'blocked' && isLive(s) && !young;
   if (RUN_FINAL.includes(run.status) && !resumed) return { ...run, ...attach };
-  if (!isLive(s) && !starting) return { slug, status: 'stalled', details: s ? `session is ${s.state || s.status} without a report` : 'no session found', ...attach };
-  return { slug, status: 'running', ...attach };
+  if (isLive(s)) return { slug, status: 'running', ...attach };
+  // A session that has just been started may not be listed as working yet. A starting run has no session id: the
+  // session found by its worktree may be the previous run's idle one, which does not end the grace.
+  if (young && (run.status === 'starting' || (run.status === 'running' && !(s && s.state === 'done')))) return { slug, status: 'starting', ...attach };
+  const details = run.status === 'starting' ? `session did not start within ${START_GRACE_MS / 1000} s`
+    : s ? `session is ${s.state || s.status} without a report` : 'no session found';
+  return { slug, status: 'stalled', details, ...attach };
 }
 
 /**
@@ -2319,7 +2345,7 @@ async function suite(inp) {
 
 const COMMANDS = {
   plan, suite, phase, 'answer-decision': answerDecision, restart, branch, block, commit, 'close-out': closeOut, 'add-secret-scan': addSecretScan, preflight,
-  'ci-watch': ciWatch, 'ci-rerun': ciRerun, context, 'stack-fill': stackFill, specs, 'autopilot-check': autopilotCheck, worktree, cleanup, 'run-report': runReport, 'runs-wait': runsWait, board, status,
+  'ci-watch': ciWatch, 'ci-rerun': ciRerun, context, 'stack-fill': stackFill, specs, 'autopilot-check': autopilotCheck, worktree: startWorktree, cleanup, 'run-report': runReport, 'runs-wait': runsWait, board, status,
   areas, 'simplify-spec': simplifySpec, 'spec-branch': specBranch, 'set-aside': setAside, 'sync-base': syncBase, decisions,
 };
 
