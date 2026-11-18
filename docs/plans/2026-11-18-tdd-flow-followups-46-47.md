@@ -6,6 +6,7 @@ Status: implemented in tdd-flow 0.30.0. Changes against the design below, decide
 
 - The record file has a third field, `excluded`: the declared paths whose exclude line tdd-flow added itself. Only those lines are deleted when a path is removed; a line that was already there stays. Links are cleaned for every removed path, because each one is checked against the main checkout.
 - The `specs` result names the reason in its existing field `why`.
+- From the branch review: the links of a removed path are deleted in every worktree under `.claude/worktrees/` at once, not only in the one being prepared, because the exclude line goes for all of them at once.
 
 ## Goal
 

@@ -223,11 +223,13 @@ function syncSharedExcludes(declared, wanted) {
 
 /**
  * Deletes the worktree's links of paths that are no longer shared: only a link that points at the main checkout's
- * path, never another link, a file, a directory or anything behind a linked parent. Returns a note per deleted link.
+ * path, never another link, a file, a directory or anything behind a linked parent. Returns a note per deleted link
+ * (`where` names the worktree when it is not the one being prepared).
  */
-function forgetSharedLinks(root, wtPath, removed) {
+function forgetSharedLinks(root, wtPath, removed, where = '') {
   const notes = [];
-  const isLink = (p) => !!fs.lstatSync(p, { throwIfNoEntry: false })?.isSymbolicLink();
+  // A parent that is a file (ENOTDIR) is not a link either.
+  const isLink = (p) => { try { return fs.lstatSync(p).isSymbolicLink(); } catch { return false; } };
   for (const p of removed) {
     const at = path.join(wtPath, p);
     let behindLink = false;
@@ -236,7 +238,7 @@ function forgetSharedLinks(root, wtPath, removed) {
     const target = path.join(root, p);
     if (realpath(at) !== realpath(target) && path.resolve(path.dirname(at), fs.readlinkSync(at)) !== target) continue;
     fs.unlinkSync(at);
-    notes.push(`removed the link ${p} (no longer a shared path)`);
+    notes.push(`removed the link ${p}${where} (no longer a shared path)`);
   }
   return notes;
 }
@@ -1817,10 +1819,14 @@ function worktree(inp) {
   const abs = path.join(root, rel);
   const branch = `feature/${slug}`;
   const listed = gitOut('worktree', 'list', '--porcelain').split('\n').some((l) => l.startsWith('worktree ') && realpath(l.slice(9)) === abs);
+  // The exclude line of a removed path is gone for every worktree at once, so every worktree loses the link now: git
+  // would show it as a new file there (a session could commit it, and cleanup could not remove the worktree).
+  const others = removed.length ? worktreeList().filter((w) => path.dirname(w.path) === realpath(path.join(root, WORKTREES)) && w.path !== realpath(abs)) : [];
+  const forgotElsewhere = others.flatMap((w) => forgetSharedLinks(root, w.path, removed, ` in ${WORKTREES}/${path.basename(w.path)}`));
   if (listed) {
     const forgot = forgetSharedLinks(root, abs, removed);
     const linked = linkShared(root, abs, stack.sharedPaths);
-    return { path: abs, branch, created: false, shared: linked.shared, notes: [...forgot, ...linked.notes] };
+    return { path: abs, branch, created: false, shared: linked.shared, notes: [...forgot, ...forgotElsewhere, ...linked.notes] };
   }
   if (fs.existsSync(abs)) throw new Error(`${rel} exists but is not a git worktree`);
   const hasBranch = git('rev-parse', '--verify', '--quiet', `refs/heads/${branch}`).code === 0;
@@ -1830,7 +1836,8 @@ function worktree(inp) {
   const tasks = read(path.join(abs, featureDir(slug), 'tasks.md'));
   const open = tasks == null ? undefined : parseTasks(tasks).find((t) => !t.done);
   writeJSON(path.join(abs, STATE), { feature: slug, phase: 'IDLE', task: open ? open.id : '' });
-  return { path: abs, branch, created: true, ...linkShared(root, abs, stack.sharedPaths) };
+  const linked = linkShared(root, abs, stack.sharedPaths);
+  return { path: abs, branch, created: true, shared: linked.shared, notes: [...forgotElsewhere, ...linked.notes] };
 }
 
 /**
@@ -1935,8 +1942,9 @@ function resolveQuestion(spec, id, answer, where, date) {
  * where?, name?}. The model has already edited what the answer changes in the worktree's spec (criteria, tasks,
  * tasks.md, a new task for an implemented spec). Steps, each stopping with an error that names it and leaves the
  * earlier ones in place (a rerun skips what is done): 1 check the run waits on this question, 2 move it to Resolved
- * questions (an implemented spec needs an open task, then goes back to approved), 3 commit the spec folder, 4 remove the
- * old session unless it is working, 5 start the spec again in its worktree and record the run as running.
+ * questions (an implemented spec needs an open task, then goes back to approved), 3 commit the spec folder, 4 prepare the
+ * worktree, 5 remove the old session unless it is working, 6 start the spec again in the worktree and record the run
+ * as running.
  */
 function answerDecision(inp) {
   const slug = checkSlug(inp.slug);

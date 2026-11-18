@@ -663,7 +663,7 @@ function declare(dir, g, paths) {
 const excludeLines = (dir) => fs.readFileSync(path.join(dir, '.git/info/exclude'), 'utf8').split('\n');
 const isLink = (p) => { try { return fs.lstatSync(p).isSymbolicLink(); } catch { return false; } };
 
-test('a path removed from shared paths loses its exclude line and its links, in every worktree prepared afterwards', () => {
+test('a path removed from shared paths loses its exclude line and its links in every worktree', () => {
   const { dir, write, g } = sharedRepo('storage, storage-old, storage/x'); // storage/x is dropped as nested
   write('storage/PG_VERSION', '18\n');
   fs.appendFileSync(path.join(dir, '.git/info/exclude'), '/mine\n/storage/keep\n');
@@ -675,15 +675,15 @@ test('a path removed from shared paths loses its exclude line and its links, in 
   assert.deepStrictEqual(JSON.parse(fs.readFileSync(path.join(dir, '.git/tdd-flow/shared-paths.json'), 'utf8')), { declared: ['storage', 'storage-old'], removed: [], excluded: ['storage', 'storage-old'] });
 
   declare(dir, g, 'storage-old');
-  assert.deepStrictEqual(wt('12-csv').notes, ['removed the link storage (no longer a shared path)']);
+  // Every worktree loses the link at once: without the exclude line git would show it as a new file there.
+  assert.deepStrictEqual(wt('12-csv').notes, ['removed the link storage (no longer a shared path)', 'removed the link storage in .claude/worktrees/13-other (no longer a shared path)']);
   assert.ok(!fs.existsSync(path.join(a, 'storage')));
+  assert.strictEqual(execFileSync('git', ['-C', b, 'status', '--porcelain']).toString(), '');
   assert.strictEqual(isLink(path.join(a, 'storage-old')), true);
   assert.strictEqual(fs.readFileSync(path.join(dir, 'storage/PG_VERSION'), 'utf8'), '18\n');
   assert.ok(!excludeLines(dir).includes('/storage'));
   for (const kept of ['/storage-old', '/storage/keep', '/mine']) assert.ok(excludeLines(dir).includes(kept), kept);
-  // The other worktree is cleaned when it is prepared next; then nothing is left to do.
-  assert.strictEqual(isLink(path.join(b, 'storage')), true);
-  assert.deepStrictEqual(wt('13-other').notes, ['removed the link storage (no longer a shared path)']);
+  assert.deepStrictEqual([isLink(path.join(b, 'storage')), isLink(path.join(b, 'storage-old'))], [false, true]);
   assert.deepStrictEqual(wt('13-other').notes, []);
   // Declared again: linked and excluded again.
   declare(dir, g, 'storage, storage-old');
@@ -720,6 +720,18 @@ test('cleanup leaves what it did not make: a missing path, a directory, a link e
   declare(dir, g, 'storage-new');
   assert.strictEqual(wt().ok, true);
   assert.deepStrictEqual(JSON.parse(fs.readFileSync(record, 'utf8')), { declared: ['storage-new'], removed: [], excluded: ['storage-new'] });
+});
+
+test('cleanup of a removed nested path works when its parent in the worktree is a file', () => {
+  const { dir, g } = sharedRepo('data/db');
+  const env = fakeClaude([]);
+  const a = run(dir, 'worktree', { slug: '12-csv' }, env).result.path;
+  declare(dir, g, '');
+  fs.rmSync(path.join(a, 'data'), { recursive: true });
+  fs.writeFileSync(path.join(a, 'data'), 'a file now\n');
+  const out = run(dir, 'worktree', { slug: '12-csv' }, env);
+  assert.strictEqual(out.ok, true, out.error);
+  assert.deepStrictEqual(out.result.notes, []);
 });
 
 test('removing a worktree leaves the shared data in the main checkout', () => {
