@@ -627,6 +627,32 @@ test('shared paths that are absolute, leave the repo, sit in tool dirs or are tr
   }
 });
 
+test('worktree names every rejected shared path', () => {
+  const { dir } = sharedRepo('/srv/x, ../y');
+  assert.match(run(dir, 'worktree', { slug: '12-csv' }, fakeClaude([])).error, /shared path \/srv\/x: absolute; shared path \.\.\/y: contains \.\./);
+});
+
+test('a tracked shared path is reported by worktree and autopilot-check only: status and board do not ask git about it', () => {
+  const { dir, write, g } = sharedRepo('src/tracked.js');
+  write('src/tracked.js', 'x\n');
+  g('add', 'src/tracked.js');
+  g('commit', '-qm', 'tracked');
+  run(dir, 'run-report', { slug: '12-csv', status: 'blocked', details: 'x' });
+  // A `git` first on PATH that logs its arguments and runs the real one.
+  const real = execFileSync('which', ['git']).toString().trim();
+  const log = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'tdd-flow-gitlog-')), 'log');
+  const wrapper = fakeBin('git', `echo "$@" >> "${log}"\nexec "${real}" "$@"`);
+  const env = { ...fakeClaude([]), PATH: `${path.dirname(wrapper)}:${process.env.PATH}` };
+  assert.strictEqual(run(dir, 'status', {}, env).ok, true);
+  assert.strictEqual(run(dir, 'board', { slugs: ['12-csv'] }, env).ok, true);
+  assert.doesNotMatch(fs.readFileSync(log, 'utf8'), /ls-files.*src\/tracked\.js/);
+  assert.match(run(dir, 'worktree', { slug: '12-csv' }, env).error, /shared path src\/tracked\.js: tracked by git/);
+  assert.match(fs.readFileSync(log, 'utf8'), /ls-files.*src\/tracked\.js/);
+  const check = autopilotCheck(dir, { runnable: 1 }, { settings: { permissions: { defaultMode: 'auto' } }, env: { TDD_FLOW_DOCKER_BIN: fakeBin('docker', 'exit 0') } });
+  assert.deepStrictEqual([check.ok, check.check('shared paths').status], [false, 'fail']);
+  assert.match(check.check('shared paths').details, /src\/tracked\.js: tracked by git/);
+});
+
 test('removing a worktree leaves the shared data in the main checkout', () => {
   const { dir, write } = sharedRepo('storage/postgres');
   write('storage/postgres/PG_VERSION', '18\n');
@@ -2013,7 +2039,7 @@ test('answer-decision stops at the restart when claude --bg prints no id, and a 
   const noId = loggingClaude([{ id: 'old-1', kind: 'background', name: 'csv-export-flow', state: 'done', cwd: '/x' }], { bgOut: 'something went wrong' });
   const r = b.answer({}, noId.env);
   assert.strictEqual(r.ok, false);
-  assert.match(r.error, /step 5.*backgrounded/);
+  assert.match(r.error, /step 6.*backgrounded/);
   assert.strictEqual(b.wg('log', '-1', '--format=%s'), 'docs(12-csv): answer Q-2'); // earlier steps stay
   assert.strictEqual(b.runFileJson().status, 'blocked');
   const again = b.answer({});
@@ -2090,6 +2116,17 @@ test('restart starts a blocked run without decision again: old session removed, 
   assert.deepStrictEqual([r.runFileJson().status, r.runFileJson().session], ['running', 'new-7']);
   // A second restart is refused: the new session is starting.
   assert.match(r.restart().error, /is starting/);
+});
+
+test('restart with a rejected shared path stops before the old session is removed', () => {
+  const r = restartable({ status: 'blocked', session: 'old-1', details: 'tests fail' });
+  fs.appendFileSync(path.join(r.dir, '.tdd-flow/stack.md'), 'shared paths: /srv/x\n');
+  const before = r.runFileJson();
+  const out = r.restart();
+  assert.strictEqual(out.ok, false);
+  assert.match(out.error, /restart step 4 \(prepare the worktree\): shared path \/srv\/x: absolute/);
+  assert.doesNotMatch(r.claude.log(), /^(rm|--bg) /m);
+  assert.deepStrictEqual(r.runFileJson(), before);
 });
 
 test('restart refuses a young starting run file and restarts one older than the grace', () => {

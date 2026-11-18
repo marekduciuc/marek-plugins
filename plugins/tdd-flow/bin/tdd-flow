@@ -124,15 +124,17 @@ function testsNeed(txt, field) {
 /** A repo path as one spelling: `./a//b/` → `a/b`. */
 const normalizeRepoPath = (p) => path.posix.normalize(String(p).trim()).replace(/^(\.\/)+/, '').replace(/\/+$/, '');
 
-/** Why a declared shared path cannot be shared ('' when it can): it must stay inside the repo, outside git's and tdd-flow's directories, untracked. */
+/** Why a declared shared path cannot be shared ('' when it can): it must stay inside the repo, outside git's and tdd-flow's directories. No git call: every CLI command reads stack.md. */
 function sharedPathError(p) {
   if (path.posix.isAbsolute(p)) return 'absolute';
   if (p === '..' || p.startsWith('../') || p.split('/').includes('..')) return 'contains ..';
   for (const dir of ['.git', '.tdd-flow', WORKTREES]) if (p === dir || p.startsWith(`${dir}/`)) return `inside ${dir}`;
   if (p === '.' || !p) return 'is the repo root';
-  if (gitOut('ls-files', '--', p)) return 'tracked by git';
   return '';
 }
+
+/** The declared shared paths git tracks, as `shared path <p>: tracked by git`: a link there would be a change in every worktree. For the commands that act on the paths. */
+const trackedSharedPaths = (paths) => paths.filter((p) => gitOut('ls-files', '--', `:/${p}`)).map((p) => `shared path ${p}: tracked by git`);
 
 /** Paths without duplicates and without any that lie inside another one (the outer link covers them). */
 const outermost = (paths) => [...new Set(paths)].filter((p, _, all) => !all.some((q) => q !== p && p.startsWith(`${q}/`)));
@@ -1730,7 +1732,7 @@ async function autopilotCheck(inp) {
   checks.push(suiteCheck);
 
   const shared = stack ? stack.sharedPaths : [];
-  const sharedCheck = sharedPathsCheck(root, shared, stack ? stack.sharedPathErrors : []);
+  const sharedCheck = sharedPathsCheck(root, shared, stack ? [...stack.sharedPathErrors, ...trackedSharedPaths(shared)] : []);
   if (sharedCheck) checks.push(sharedCheck);
 
   // Outside state the sessions share: what the tests need, and the shared paths' data.
@@ -1752,7 +1754,8 @@ function worktree(inp) {
   // Kept out of `git status` in the main checkout and out of every commit, without touching .gitignore.
   // Shared paths too (a link is not matched by a .gitignore pattern with a trailing slash).
   const stack = readStack() || { sharedPaths: [], sharedPathErrors: [] };
-  if (stack.sharedPathErrors.length) throw new Error(stack.sharedPathErrors[0]);
+  const rejected = [...stack.sharedPathErrors, ...trackedSharedPaths(stack.sharedPaths)];
+  if (rejected.length) throw new Error(rejected.join('; '));
   const exclude = path.join(commonDir(), 'info', 'exclude');
   const ex = read(exclude) || '';
   const add = [`/${WORKTREES}/`, `/${STATE}`, ...stack.sharedPaths.map((p) => `/${p}`)].filter((l) => !ex.split('\n').includes(l));
@@ -1934,17 +1937,19 @@ function answerDecision(inp) {
 }
 
 /**
- * Starts a spec's session again, the end of answer-decision and all of restart: step 4 removes the old session
- * (`oldSession`, an id) unless it is working, step 5 starts `/tdd-flow:implement-spec <slug> <base>` in the spec's
- * worktree (created or reused) and records the run as running with the new id. The name is `name`, else the old
+ * Starts a spec's session again, the end of answer-decision and all of restart: step 4 prepares the spec's worktree
+ * (created or reused; an error there, such as a rejected shared path, leaves the old session and the run as they
+ * are), step 5 removes the old session (`oldSession`, an id) unless it is working, step 6 starts
+ * `/tdd-flow:implement-spec <slug> <base>` in the worktree and records the run as running with the new id. The name is `name`, else the old
  * session's when free, else the first three words of the slug without its number (plus the number when another
  * session has those words), as the autopilot names sessions. `sessions` is null when `claude agents` failed; what
  * was not done goes into `notes`; `step(n, what, fn)` names the step in an error. Returns {session, name}.
  */
 function restartSpec({ slug, oldSession, sessions, name: wanted, notes, step }) {
   const old = sessions && oldSession ? sessions.find((s) => s.id === oldSession || s.sessionId === oldSession) : null;
+  const w = step(4, 'prepare the worktree', () => worktree({ slug }));
   let removed = false;
-  step(4, 'remove the old session', () => {
+  step(5, 'remove the old session', () => {
     if (!oldSession) notes.push('the run names no session: none removed');
     else if (!sessions) notes.push(`claude agents is not available: old session ${oldSession} not removed`);
     else if (isLive(old)) notes.push(`old session ${oldSession} is still working: not removed`);
@@ -1964,8 +1969,7 @@ function restartSpec({ slug, oldSession, sessions, name: wanted, notes, step }) 
     name = taken(words) && num ? `${words}-${num}` : words;
   }
 
-  const session = step(5, 'restart', () => {
-    const w = worktree({ slug });
+  const session = step(6, 'restart', () => {
     const r = exec(claudeBin(), ['--bg', '-n', name, `/tdd-flow:implement-spec ${slug} ${baseBranch()}`], undefined, false, w.path);
     const printed = `${r.out}\n${r.err}`.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '');
     const m = printed.match(/backgrounded\s*·\s*(\S+)\s*·/);
