@@ -1141,6 +1141,14 @@ function findSession(sessions, run, wtPath) {
   return sessions.find((s) => s.kind === 'background' && s.cwd && realpath(s.cwd) === wtPath);
 }
 const isLive = (s) => !!s && s.state === 'working';
+/**
+ * The session a run's row shows. A starting run has no session id, so the one found by its worktree is the previous
+ * run's unless it works: not shown, so the row offers no `claude attach` to a session that is over.
+ */
+function runSession(sessions, run, wtPath) {
+  const s = findSession(sessions, run, wtPath);
+  return run && run.status === 'starting' && !isLive(s) ? undefined : s;
+}
 /** What to pass to `claude attach`: the session name when it is one word and unique, else the id. */
 const attachRef = (sessions, s) => (s.name && !/\s/.test(s.name) && sessions.filter((x) => x.name === s.name).length === 1 ? s.name : s.id);
 
@@ -1298,6 +1306,8 @@ function specs(inp) {
       }
     }
     if (isLive(findSession(sessions, run, wtPath))) { skip('a session is still running on it'); continue; }
+    // Being started right now (by another autopilot): a second session on the same worktree is never wanted.
+    if (runState(slug, sessions, root).status === 'starting') { skip('is starting: its session is not working yet'); continue; }
     if (run && run.status === 'blocked' && !(wanted && wanted.has(slug))) {
       skip(`blocked last time: ${String(run.details || '').split('\n')[0]} - fix it, then start it by name`);
       continue;
@@ -1998,7 +2008,7 @@ function restart(inp) {
  */
 function runState(slug, sessions, root) {
   const run = readRun(slug) || { slug, status: 'unknown' };
-  const s = findSession(sessions, run, path.join(root, WORKTREES, slug));
+  const s = runSession(sessions, run, path.join(root, WORKTREES, slug));
   const attach = s && s.id ? { attach: `claude attach ${attachRef(sessions, s)}` } : {};
   const young = Date.now() - Date.parse(run.at) < START_GRACE_MS;
   // A blocked run whose session works again (resumed or restarted by hand, not through restart/answer-decision, which
@@ -2098,7 +2108,7 @@ function status(inp) {
       : state.phase === 'IDLE' && row.status === 'running' && progress && progress.open ? 'review' : '';
     const spec = featureFile(row.slug, 'spec.md', root, base) || '';
     const source = spec ? parseSpec(spec).source : '';
-    const s = findSession(sessions, run, wt);
+    const s = runSession(sessions, run, wt);
     const issueUrl = /^https?:\/\/\S+$/.test(source) ? source : '';
     return { ...row, task: own && state.task ? String(state.task) : '', phase, issueUrl,
       title: spec ? specTitle(spec) : '', session: s ? s.name || s.id || '' : '', sessionState: s ? s.state || s.status || '' : '', at: run.at || '',

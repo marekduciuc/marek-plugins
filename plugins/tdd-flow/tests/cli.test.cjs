@@ -499,11 +499,36 @@ test('a blocked run whose session works again is running, not blocked (restarted
   // Just reported: the session is still finishing its turn, so it stays blocked.
   assert.strictEqual(stateOf(), 'blocked');
   // Reported long ago and the session works again: running.
-  const rf = execFileSync('git', ['-C', dir, 'rev-parse', '--git-common-dir']).toString().trim();
-  const f = path.join(path.resolve(dir, rf), 'tdd-flow', 'runs', '12-csv.json');
-  const r = JSON.parse(fs.readFileSync(f, 'utf8'));
-  fs.writeFileSync(f, JSON.stringify({ ...r, at: new Date(Date.now() - 5 * 60000).toISOString() }) + '\n');
+  age(dir, '12-csv', 5);
   assert.strictEqual(stateOf(), 'running');
+});
+
+test('a starting row does not offer the previous session: no attach, session or sessionState, also once stalled', () => {
+  const { dir } = trackedRepo();
+  const wt = run(dir, 'worktree', { slug: '12-csv' }, fakeClaude([])).result.path;
+  const old = (state) => fakeClaude([{ id: 's-0', kind: 'background', name: 'csv-export-flow', state, cwd: wt }]);
+  const row = (env) => run(dir, 'status', { slugs: ['12-csv'] }, env).result.rows[0];
+  const idle = row(old('done'));
+  assert.deepStrictEqual([idle.status, idle.attach, idle.session, idle.sessionState], ['starting', '', '', '']);
+  assert.deepStrictEqual(run(dir, 'runs-wait', { slugs: ['12-csv'], maxMinutes: 0.005 }, old('done')).result.running, [{ slug: '12-csv' }]);
+  const live = row(old('working'));
+  assert.deepStrictEqual([live.status, live.attach, live.session], ['running', 'claude attach csv-export-flow', 'csv-export-flow']);
+  age(dir, '12-csv', 5);
+  const late = row(old('done'));
+  assert.deepStrictEqual([late.status, late.attach, late.session], ['stalled', '', '']);
+});
+
+test('specs skips a spec that is starting, also when named, and lists it again after the grace', () => {
+  const { dir } = trackedRepo();
+  const none = fakeClaude([]);
+  run(dir, 'worktree', { slug: '12-csv' }, none);
+  for (const inp of [{}, { slugs: ['12-csv'] }]) {
+    const r = run(dir, 'specs', inp, none).result;
+    assert.deepStrictEqual(r.runnable.map((s) => s.slug), []);
+    assert.deepStrictEqual(r.skipped.filter((s) => s.slug === '12-csv').map((s) => s.why), ['is starting: its session is not working yet']);
+  }
+  age(dir, '12-csv', 5);
+  assert.deepStrictEqual(run(dir, 'specs', {}, none).result.runnable.map((s) => s.slug), ['12-csv']);
 });
 
 test('a spec whose worktree exists but whose session has not reported yet is starting, then stalled after the grace', () => {
@@ -2065,6 +2090,16 @@ test('restart starts a blocked run without decision again: old session removed, 
   assert.deepStrictEqual([r.runFileJson().status, r.runFileJson().session], ['running', 'new-7']);
   // A second restart is refused: the new session is starting.
   assert.match(r.restart().error, /is starting/);
+});
+
+test('restart refuses a young starting run file and restarts one older than the grace', () => {
+  const r = restartable(null, []); // withWorktree() ran the worktree command: the run file says starting
+  assert.strictEqual(r.runFileJson().status, 'starting');
+  assert.match(r.restart().error, /is starting/);
+  age(r.dir, '12-csv', 5);
+  const out = r.restart();
+  assert.strictEqual(out.ok, true, out.error);
+  assert.deepStrictEqual([r.runFileJson().status, r.runFileJson().session], ['running', 'new-7']);
 });
 
 test('restart keeps a working old session, takes a given name, and restarts a stalled run or one without any session', () => {
