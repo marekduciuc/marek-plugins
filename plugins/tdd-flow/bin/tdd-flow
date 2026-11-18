@@ -1610,14 +1610,16 @@ function worktree(inp) {
 /**
  * The `worktree` command, which the autopilot runs before it starts a spec's session: the worktree, and the run
  * recorded as `starting` until the session reports, so the status pane does not show the spec as stalled meanwhile.
- * Only a missing, blocked or starting run is replaced: a done run keeps its PR, a running one its session, and a
- * blocked one whose session works again (or when `claude agents` fails and that cannot be told) stays as it is.
+ * Kept as they are: a done run (its PR), a blocked run with a decision (answer-decision restarts it), a running run
+ * inside the start grace, and any run whose session works, or when `claude agents` fails and that cannot be told. A
+ * stalled spec (running, its session gone after the grace) is replaced: the autopilot starts it again.
  */
 function startWorktree(inp) {
   const w = worktree(inp);
   const slug = inp.slug;
   const run = readRun(slug);
-  if (run && !['blocked', 'starting'].includes(run.status)) return w;
+  if (run && (run.status === 'done' || run.decision)) return w;
+  if (run && run.status === 'running' && Date.now() - Date.parse(run.at) < START_GRACE_MS) return w;
   if (run) {
     const sessions = claudeSessions(true);
     if (!sessions || isLive(findSession(sessions, run, w.path))) return w;

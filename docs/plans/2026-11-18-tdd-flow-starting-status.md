@@ -2,7 +2,11 @@
 
 Date: 18.11.2026. Target: tdd-flow 0.28.0 (after 0.27.1, the blocked-session-resumed change in `runState`).
 
-Status: approved 18.11.2026, not implemented.
+Status: implemented in tdd-flow 0.28.0. Changes against the design below, decided during implementation:
+
+- `starting` is written by the `worktree` CLI command only, not inside the shared `worktree()` function: the simplify approval calls `worktree()` without starting a session.
+- The `worktree` command keeps a `done` run, a run waiting on a decision, a `running` run inside the grace, a run whose session works, and any run while `claude agents` fails. Everything else, including a stalled spec, becomes `starting`.
+- `restartSpec` does not write `starting` before `claude --bg`. It writes `running` right after, and the pane shows "restarting…" meanwhile. A failed `--bg` keeps the blocked run.
 
 ## Problem
 

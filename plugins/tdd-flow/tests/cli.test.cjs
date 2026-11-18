@@ -545,7 +545,7 @@ test('runs-wait keeps waiting on a starting spec and returns it as stalled when 
   assert.deepStrictEqual(r.finished.map((f) => [f.slug, f.status]), [['12-csv', 'stalled']]);
 });
 
-test('worktree replaces only a missing, blocked or starting run with starting', () => {
+test('worktree records starting, but keeps a done run, a decision, a young running run and a working session', () => {
   const { dir } = trackedRepo();
   const none = fakeClaude([]);
   const keeps = (report, env) => {
@@ -559,9 +559,18 @@ test('worktree replaces only a missing, blocked or starting run with starting', 
   keeps({ status: 'running', session: 's-1' }, failingClaude());
   keeps({ status: 'blocked', session: 's-1', details: 'tests fail' }, fakeClaude([{ id: 's-1', kind: 'background', name: 'x', state: 'working' }]));
   keeps({ status: 'blocked', session: 's-1', details: 'tests fail' }, failingClaude());
-  run(dir, 'run-report', { slug: '12-csv', status: 'blocked', session: 's-1', details: 'tests fail' });
-  run(dir, 'worktree', { slug: '12-csv' }, none);
-  assert.strictEqual(runFile(dir, '12-csv').status, 'starting');
+  keeps({ status: 'blocked', session: 's-1', details: 'needs a decision', decision: Q2_DECISION }, none); // answer-decision restarts it
+  const replaced = (report, env, minutes = 0) => {
+    run(dir, 'run-report', { slug: '12-csv', ...report });
+    if (minutes) age(dir, '12-csv', minutes);
+    run(dir, 'worktree', { slug: '12-csv' }, env);
+    assert.strictEqual(runFile(dir, '12-csv').status, 'starting', JSON.stringify(report));
+  };
+  replaced({ status: 'blocked', session: 's-1', details: 'tests fail' }, none);
+  // Stalled (running, the session gone after the grace): the autopilot starts it again, so it is starting meanwhile.
+  replaced({ status: 'running', session: 's-1' }, none, 5);
+  replaced({ status: 'running', session: 's-1' }, fakeClaude([{ id: 's-1', kind: 'background', name: 'x', state: 'done' }]), 5);
+  keeps({ status: 'running', session: 's-1' }, failingClaude());
 });
 
 test('status with pane writes a heartbeat; board and runs-wait say paneOpen while it is younger than 60 s', () => {
