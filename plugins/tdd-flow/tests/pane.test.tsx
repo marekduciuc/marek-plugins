@@ -371,3 +371,56 @@ test('the restart button is on blocked rows without a decision and stalled rows 
   expect(w.ran).toEqual([]) // no skill, no model
   expect(w.submitted).toEqual([])
 })
+
+const STARTING: StatusRow = { ...RUNNING, slug: '43-new', status: 'starting', sessionState: '' }
+
+test('a starting row sorts between stalled and running and has no restart button', async ($, on) => {
+  const stalled: StatusRow = { ...RUNNING, slug: '42-stalled', status: 'stalled', details: 'session is idle without a report' }
+  world(on, { rows: [RUNNING, STARTING, stalled] })
+  const clock = mock.clock(on)
+  await $.session.start(SESSION)
+  await clock.advance(1)
+  const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...PANE })
+  const words = (await ui.findAll({ type: 'Text', text: /^(running|stalled|starting)$/ })).map(t => t.text)
+  expect(words).toEqual(['stalled', 'starting', 'running'])
+  expect(await ui.find({ type: 'Button', key: 'restart:43-new' })).toBeUndefined()
+  expect(await ui.find({ type: 'Button', key: 'restart:42-stalled' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a starting spec opens the pane by itself where it docks', async ($, on) => {
+  const w = world(on, { rows: [STARTING] })
+  const clock = mock.clock(on)
+  on('ui.render', () => ({ type: 'Text', props: {}, children: [''] }))
+  await $.session.start(SESSION)
+  await $.ui.render({ component: 'PromptHint', surface: 'terminal', requestId: 'hint', props: { isDraft: false, isWorking: false, hint: '' }, viewport: { columns: 180, rows: 48, isFullscreen: true } })
+  await clock.advance(10_000)
+  expect(w.opened).toEqual(['tdd-status'])
+})
+
+test('"answer sent" clears once the answered spec is starting', async ($, on) => {
+  const w = world(on, { rows: [RUNNING, DECISION] })
+  const clock = mock.clock(on)
+  await $.session.start(SESSION)
+  await clock.advance(1)
+  const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...PANE })
+  await ui.press({ key: 'option:23-csv:1' })
+  expect((await ui.find({ type: 'Text', text: /answer sent/ }))?.text).toBe('answer sent')
+  await ui.unmount()
+  w.rows = [RUNNING, { ...DECISION, status: 'starting', decision: undefined }]
+  await clock.advance(10_000)
+  w.rows = [RUNNING, DECISION]
+  await clock.advance(10_000)
+  const again = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...PANE })
+  expect(await again.find({ type: 'Text', text: /answer sent/ })).toBeUndefined()
+  expect(await again.find({ type: 'Button', key: 'option:23-csv:0' })).toBeDefined()
+  await again.unmount()
+})
+
+test('the status line counts starting specs as running', async ($, on) => {
+  const w = world(on, { rows: [RUNNING, { ...RUNNING, slug: '43-new', status: 'starting' }] })
+  const clock = mock.clock(on)
+  await $.session.start(SESSION)
+  await clock.advance(1)
+  expect(w.statuses.at(-1)).toBe('tdd-flow: 2 running, 0 waiting')
+})

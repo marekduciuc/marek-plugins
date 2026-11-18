@@ -6,6 +6,7 @@ export type Decision = { id: string; question: string; recommendation: string; o
 /** One row of `tdd-flow status`: a spec with a worktree or a run file. */
 export type StatusRow = {
   slug: string
+  /** running, starting (session not working yet, at most 90 s), blocked, stalled, queued or done. */
   status: string
   done: number | null
   total: number | null
