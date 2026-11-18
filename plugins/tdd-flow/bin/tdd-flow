@@ -1607,6 +1607,27 @@ function worktree(inp) {
   return { path: abs, branch, created: true };
 }
 
+/**
+ * The `worktree` command, which the autopilot runs before it starts a spec's session: the worktree, and the run
+ * recorded as `starting` until the session reports, so the status pane does not show the spec as stalled meanwhile.
+ * Kept as they are: a done run (its PR), a blocked run with a decision (answer-decision restarts it), a running run
+ * inside the start grace, and any run whose session works, or when `claude agents` fails and that cannot be told. A
+ * stalled spec (running, its session gone after the grace) is replaced: the autopilot starts it again.
+ */
+function startWorktree(inp) {
+  const w = worktree(inp);
+  const slug = inp.slug;
+  const run = readRun(slug);
+  if (run && (run.status === 'done' || run.decision)) return w;
+  if (run && run.status === 'running' && Date.now() - Date.parse(run.at) < START_GRACE_MS) return w;
+  if (run) {
+    const sessions = claudeSessions(true);
+    if (!sessions || isLive(findSession(sessions, run, w.path))) return w;
+  }
+  writeRun(slug, { slug, status: 'starting', at: new Date().toISOString() });
+  return w;
+}
+
 /** A blocked run's question for the user, checked: {id: Q-<n>, question, recommendation, options?: [...], tasks?: [...]}. */
 function checkDecision(d) {
   if (!d || typeof d !== 'object') throw new Error('decision must be an object {id, question, recommendation, options, tasks}');
@@ -1815,16 +1836,26 @@ function restart(inp) {
   return { slug, session, name, attach: `claude attach ${name}`, notes };
 }
 
-/** State of one autopilot run: its run file (done/blocked/running), or "stalled" when the session is idle or gone. */
+/**
+ * State of one autopilot run: its run file (done/blocked), "running" while its session works, "starting" while a
+ * just started session does not work yet, or "stalled" when the session is idle or gone.
+ */
 function runState(slug, sessions, root) {
   const run = readRun(slug) || { slug, status: 'unknown' };
   const s = findSession(sessions, run, path.join(root, WORKTREES, slug));
   const attach = s && s.id ? { attach: `claude attach ${attachRef(sessions, s)}` } : {};
-  // A session that has just been started may not be listed as working yet.
-  const starting = run.status === 'running' && Date.now() - Date.parse(run.at) < START_GRACE_MS && !(s && s.state === 'done');
-  if (RUN_FINAL.includes(run.status)) return { ...run, ...attach };
-  if (!isLive(s) && !starting) return { slug, status: 'stalled', details: s ? `session is ${s.state || s.status} without a report` : 'no session found', ...attach };
-  return { slug, status: 'running', ...attach };
+  const young = Date.now() - Date.parse(run.at) < START_GRACE_MS;
+  // A blocked run whose session works again (resumed or restarted by hand, not through restart/answer-decision, which
+  // rewrite the run file) is running. A session that has just reported is still finishing its turn: grace applies.
+  const resumed = run.status === 'blocked' && isLive(s) && !young;
+  if (RUN_FINAL.includes(run.status) && !resumed) return { ...run, ...attach };
+  if (isLive(s)) return { slug, status: 'running', ...attach };
+  // A session that has just been started may not be listed as working yet. A starting run has no session id: the
+  // session found by its worktree may be the previous run's idle one, which does not end the grace.
+  if (young && (run.status === 'starting' || (run.status === 'running' && !(s && s.state === 'done')))) return { slug, status: 'starting', ...attach };
+  const details = run.status === 'starting' ? `session did not start within ${START_GRACE_MS / 1000} s`
+    : s ? `session is ${s.state || s.status} without a report` : 'no session found';
+  return { slug, status: 'stalled', details, ...attach };
 }
 
 /**
@@ -1954,7 +1985,7 @@ function boardTable(rows) {
 /**
  * Waits until at least one of the given runs has finished or ticked a task in its worktree's tasks.md (`progressed`).
  * A run is finished when its file says done or blocked, or "stalled" when its session is idle or gone without a
- * report (it asked a question or stopped early).
+ * report (it asked a question or stopped early). A starting run is waited on like a running one.
  * Input: {slugs: [...], progress?: {slug: ticked}, maxMinutes?: 240, ticks?: false}; `progress` is the board's map.
  * `ticks: false` (the status pane shows the ticks): return only when a run finishes, not on a ticked task.
  * Meant for a background Bash call, so it blocks without "again".
@@ -1979,7 +2010,7 @@ async function runsWait(inp) {
     const current = {};
     for (const slug of slugs) {
       const st = runState(slug, sessions, root);
-      if (st.status !== 'running') { finished.push(st); continue; }
+      if (!['running', 'starting'].includes(st.status)) { finished.push(st); continue; }
       running.push({ slug, ...(st.attach ? { attach: st.attach } : {}) });
       const p = taskProgress(slug, root, base);
       if (!p) continue;
@@ -2316,7 +2347,7 @@ async function suite(inp) {
 
 const COMMANDS = {
   plan, suite, phase, 'answer-decision': answerDecision, restart, branch, block, commit, 'close-out': closeOut, 'add-secret-scan': addSecretScan, preflight,
-  'ci-watch': ciWatch, 'ci-rerun': ciRerun, context, 'stack-fill': stackFill, specs, 'autopilot-check': autopilotCheck, worktree, cleanup, 'run-report': runReport, 'runs-wait': runsWait, board, status,
+  'ci-watch': ciWatch, 'ci-rerun': ciRerun, context, 'stack-fill': stackFill, specs, 'autopilot-check': autopilotCheck, worktree: startWorktree, cleanup, 'run-report': runReport, 'runs-wait': runsWait, board, status,
   areas, 'simplify-spec': simplifySpec, 'spec-branch': specBranch, 'set-aside': setAside, 'sync-base': syncBase, decisions,
 };
 

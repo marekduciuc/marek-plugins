@@ -28,6 +28,7 @@ const KINDS: readonly { kind: string; color: ThemeKey }[] = [
   { kind: 'decision', color: 'permission' },
   { kind: 'blocked', color: 'error' },
   { kind: 'stalled', color: 'warning' },
+  { kind: 'starting', color: 'suggestion' },
   { kind: 'running', color: 'suggestion' },
   { kind: 'queued', color: 'inactive' },
   { kind: 'done', color: 'success' },
@@ -38,7 +39,9 @@ const rankOf = (row: StatusRow): number => {
   return i < 0 ? KINDS.length : i
 }
 const colorOf = (row: StatusRow): ThemeKey => KINDS.find(k => k.kind === kindOf(row))?.color ?? 'subtle'
-const isActive = (row: StatusRow): boolean => ['running', 'blocked', 'stalled'].includes(row.status)
+/** Started or working: a session is (about to be) on it. */
+const isRunning = (row: StatusRow): boolean => ['starting', 'running'].includes(row.status)
+const isActive = (row: StatusRow): boolean => isRunning(row) || ['blocked', 'stalled'].includes(row.status)
 /** A blocked row without a decision or a stalled row: what `tdd-flow restart` takes, and whose reason the row shows. */
 const isRestartable = (row: StatusRow): boolean => !row.decision && ['blocked', 'stalled'].includes(row.status)
 
@@ -118,7 +121,7 @@ async function refresh($: EngineInterface): Promise<void> {
 
   // "answer sent" stays until the spec runs again (or its row is gone).
   const answered = await read($, sent)
-  const waiting = answered.filter(s => rows.some(r => r.slug === s.slug && r.status !== 'running'))
+  const waiting = answered.filter(s => rows.some(r => r.slug === s.slug && !isRunning(r)))
   if (waiting.length !== answered.length) await update($, sent, list => list.filter(s => waiting.some(w => w.slug === s.slug)))
 
   // "restarting…" stays until a status shows the spec no longer blocked or stalled (a status read before the restart
@@ -133,7 +136,7 @@ async function refresh($: EngineInterface): Promise<void> {
   const docks = viewport?.isFullscreen === true && viewport.columns >= DOCK_COLUMNS
   if (!pane && !closedByPerson && docks && rows.some(isActive)) await $.ui.open({ id: PANE, title: TITLE })
 
-  const running = rows.filter(r => r.status === 'running').length
+  const running = rows.filter(isRunning).length
   const decisions = rows.filter(r => r.decision).length
   $.ui.status(!pane && running + decisions > 0 ? `tdd-flow: ${running} running, ${decisions} waiting` : undefined)
   if (pane && (await read($, workflows)).length > 0) $.ui.invalidate('ui.render') // minutes running

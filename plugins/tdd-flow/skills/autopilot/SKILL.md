@@ -101,7 +101,7 @@ Run with the Bash tool and `run_in_background: true` (it blocks until a run fini
 
 ```bash
 tdd-flow runs-wait <<'TDD_FLOW_JSON'
-{"slugs": ["<every running slug>"], "progress": <progress from the last board>}
+{"slugs": ["<every running or starting slug>"], "progress": <progress from the last board>}
 TDD_FLOW_JSON
 ```
 
@@ -111,7 +111,7 @@ It returns when a run finishes or when a running spec ticks a task (`progressed`
 - `blocked` → note `details`. With a `decision`, the spec waits for the user's answer: see **Decisions** below.
 - `stalled` → the session went idle or disappeared without a report (it asked something or stopped early). Note its `attach` command (`runs-wait` gives the name, or the id when the name is ambiguous); do not restart it.
 
-Then start the next queued specs (step 2) until N are running again, and start `runs-wait` again for the running slugs with the latest `progress`. Leave finished slugs out: `runs-wait` returns at once for them. Repeat until nothing runs and nothing is queued. If `runs-wait` reports `timedOut`, list the running sessions with their `attach` commands and ask the user whether to keep waiting.
+Then start the next queued specs (step 2) until N are running again (a `starting` spec counts as running), and start `runs-wait` again for the running slugs with the latest `progress`. Leave finished slugs out: `runs-wait` returns at once for them. Repeat until nothing runs and nothing is queued. If `runs-wait` reports `timedOut`, list the running sessions with their `attach` commands and ask the user whether to keep waiting.
 
 ### Decisions
 
