@@ -1983,7 +1983,7 @@ function boardTable(rows) {
 /**
  * Waits until at least one of the given runs has finished or ticked a task in its worktree's tasks.md (`progressed`).
  * A run is finished when its file says done or blocked, or "stalled" when its session is idle or gone without a
- * report (it asked a question or stopped early).
+ * report (it asked a question or stopped early). A starting run is waited on like a running one.
  * Input: {slugs: [...], progress?: {slug: ticked}, maxMinutes?: 240, ticks?: false}; `progress` is the board's map.
  * `ticks: false` (the status pane shows the ticks): return only when a run finishes, not on a ticked task.
  * Meant for a background Bash call, so it blocks without "again".
@@ -2008,7 +2008,7 @@ async function runsWait(inp) {
     const current = {};
     for (const slug of slugs) {
       const st = runState(slug, sessions, root);
-      if (st.status !== 'running') { finished.push(st); continue; }
+      if (!['running', 'starting'].includes(st.status)) { finished.push(st); continue; }
       running.push({ slug, ...(st.attach ? { attach: st.attach } : {}) });
       const p = taskProgress(slug, root, base);
       if (!p) continue;

@@ -534,6 +534,17 @@ test('a running run inside the grace whose session is not listed yet is starting
   assert.strictEqual(run(dir, 'board', { slugs: ['12-csv'] }, done).result.rows[0].status, 'stalled');
 });
 
+test('runs-wait keeps waiting on a starting spec and returns it as stalled when the grace ends', () => {
+  const { dir } = trackedRepo();
+  const none = fakeClaude([]);
+  run(dir, 'worktree', { slug: '12-csv' }, none);
+  const t = run(dir, 'runs-wait', { slugs: ['12-csv'], maxMinutes: 0.005 }, none).result;
+  assert.deepStrictEqual([t.finished, t.running, t.timedOut], [[], [{ slug: '12-csv' }], true]);
+  age(dir, '12-csv', 5);
+  const r = run(dir, 'runs-wait', { slugs: ['12-csv'] }, none).result;
+  assert.deepStrictEqual(r.finished.map((f) => [f.slug, f.status]), [['12-csv', 'stalled']]);
+});
+
 test('worktree replaces only a missing, blocked or starting run with starting', () => {
   const { dir } = trackedRepo();
   const none = fakeClaude([]);
