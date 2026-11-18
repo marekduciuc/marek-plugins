@@ -45,7 +45,7 @@ production source roots:
 generate command:   (command that rebuilds the generated files from the sources, from the repo root, or `none`)
 generated files:    (comma-separated paths or globs that command writes and that are committed, e.g. `apps/backend/openapi.json`, or `none`)
 tests need:         (none | docker (...) | database (...) | services (...)) what the tests use outside the repo, e.g. `docker (Testcontainers)`, `database (local PostgreSQL)`
-shared paths:       (comma-separated repo paths, or `none`) the relative bind-mount sources (`./storage/postgres:/var/lib/...`, resolved against the compose file's directory) of every tracked compose file whose project has a fixed name (top-level `name:`, `container_name:`, `COMPOSE_PROJECT_NAME` in its `.env`); every worktree links them to the main checkout
+shared paths:       (comma-separated repo paths without backticks or notes, or `none`) every git-ignored path in the repo that holds local state a service or command started from a git worktree would use and that must be the same as in the main checkout, whatever the technology: a database data directory a compose file with a fixed name mounts (`./storage/postgres:/var/lib/...`, resolved against the compose file's directory), a SQLite file the app opens by a relative path, an uploads or media directory. Not build output, dependency directories or caches. Every worktree links these paths to the main checkout
 ci system:
 tracker:            (github | azure-devops | jira | none) + CLI available?
 default branch:

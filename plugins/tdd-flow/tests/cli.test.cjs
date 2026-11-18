@@ -499,11 +499,36 @@ test('a blocked run whose session works again is running, not blocked (restarted
   // Just reported: the session is still finishing its turn, so it stays blocked.
   assert.strictEqual(stateOf(), 'blocked');
   // Reported long ago and the session works again: running.
-  const rf = execFileSync('git', ['-C', dir, 'rev-parse', '--git-common-dir']).toString().trim();
-  const f = path.join(path.resolve(dir, rf), 'tdd-flow', 'runs', '12-csv.json');
-  const r = JSON.parse(fs.readFileSync(f, 'utf8'));
-  fs.writeFileSync(f, JSON.stringify({ ...r, at: new Date(Date.now() - 5 * 60000).toISOString() }) + '\n');
+  age(dir, '12-csv', 5);
   assert.strictEqual(stateOf(), 'running');
+});
+
+test('a starting row does not offer the previous session: no attach, session or sessionState, also once stalled', () => {
+  const { dir } = trackedRepo();
+  const wt = run(dir, 'worktree', { slug: '12-csv' }, fakeClaude([])).result.path;
+  const old = (state) => fakeClaude([{ id: 's-0', kind: 'background', name: 'csv-export-flow', state, cwd: wt }]);
+  const row = (env) => run(dir, 'status', { slugs: ['12-csv'] }, env).result.rows[0];
+  const idle = row(old('done'));
+  assert.deepStrictEqual([idle.status, idle.attach, idle.session, idle.sessionState], ['starting', '', '', '']);
+  assert.deepStrictEqual(run(dir, 'runs-wait', { slugs: ['12-csv'], maxMinutes: 0.005 }, old('done')).result.running, [{ slug: '12-csv' }]);
+  const live = row(old('working'));
+  assert.deepStrictEqual([live.status, live.attach, live.session], ['running', 'claude attach csv-export-flow', 'csv-export-flow']);
+  age(dir, '12-csv', 5);
+  const late = row(old('done'));
+  assert.deepStrictEqual([late.status, late.attach, late.session], ['stalled', '', '']);
+});
+
+test('specs skips a spec that is starting, also when named, and lists it again after the grace', () => {
+  const { dir } = trackedRepo();
+  const none = fakeClaude([]);
+  run(dir, 'worktree', { slug: '12-csv' }, none);
+  for (const inp of [{}, { slugs: ['12-csv'] }]) {
+    const r = run(dir, 'specs', inp, none).result;
+    assert.deepStrictEqual(r.runnable.map((s) => s.slug), []);
+    assert.deepStrictEqual(r.skipped.filter((s) => s.slug === '12-csv').map((s) => s.why), ['is starting: its session is not working yet']);
+  }
+  age(dir, '12-csv', 5);
+  assert.deepStrictEqual(run(dir, 'specs', {}, none).result.runnable.map((s) => s.slug), ['12-csv']);
 });
 
 test('a spec whose worktree exists but whose session has not reported yet is starting, then stalled after the grace', () => {
@@ -600,6 +625,113 @@ test('shared paths that are absolute, leave the repo, sit in tool dirs or are tr
     assert.strictEqual(out.ok, false, p);
     assert.match(out.error, new RegExp(`shared path ${esc(p)}: ${why.source}`), p);
   }
+});
+
+test('worktree names every rejected shared path', () => {
+  const { dir } = sharedRepo('/srv/x, ../y');
+  assert.match(run(dir, 'worktree', { slug: '12-csv' }, fakeClaude([])).error, /shared path \/srv\/x: absolute; shared path \.\.\/y: contains \.\./);
+});
+
+test('a tracked shared path is reported by worktree and autopilot-check only: status and board do not ask git about it', () => {
+  const { dir, write, g } = sharedRepo('src/tracked.js');
+  write('src/tracked.js', 'x\n');
+  g('add', 'src/tracked.js');
+  g('commit', '-qm', 'tracked');
+  run(dir, 'run-report', { slug: '12-csv', status: 'blocked', details: 'x' });
+  // A `git` first on PATH that logs its arguments and runs the real one.
+  const real = execFileSync('which', ['git']).toString().trim();
+  const log = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'tdd-flow-gitlog-')), 'log');
+  const wrapper = fakeBin('git', `echo "$@" >> "${log}"\nexec "${real}" "$@"`);
+  const env = { ...fakeClaude([]), PATH: `${path.dirname(wrapper)}:${process.env.PATH}` };
+  assert.strictEqual(run(dir, 'status', {}, env).ok, true);
+  assert.strictEqual(run(dir, 'board', { slugs: ['12-csv'] }, env).ok, true);
+  assert.doesNotMatch(fs.readFileSync(log, 'utf8'), /ls-files.*src\/tracked\.js/);
+  assert.match(run(dir, 'worktree', { slug: '12-csv' }, env).error, /shared path src\/tracked\.js: tracked by git/);
+  assert.match(fs.readFileSync(log, 'utf8'), /ls-files.*src\/tracked\.js/);
+  const check = autopilotCheck(dir, { runnable: 1 }, { settings: { permissions: { defaultMode: 'auto' } }, env: { TDD_FLOW_DOCKER_BIN: fakeBin('docker', 'exit 0') } });
+  assert.deepStrictEqual([check.ok, check.check('shared paths').status], [false, 'fail']);
+  assert.match(check.check('shared paths').details, /src\/tracked\.js: tracked by git/);
+});
+
+/** Sets (or, for '', removes) the `shared paths:` line of stack.md and commits. */
+function declare(dir, g, paths) {
+  const f = path.join(dir, '.tdd-flow/stack.md');
+  const rest = fs.readFileSync(f, 'utf8').split('\n').filter((l) => l && !l.startsWith('shared paths:'));
+  fs.writeFileSync(f, [...rest, ...(paths ? [`shared paths: ${paths}`] : [])].join('\n') + '\n');
+  g('commit', '-qam', `shared paths: ${paths || 'none'}`);
+}
+const excludeLines = (dir) => fs.readFileSync(path.join(dir, '.git/info/exclude'), 'utf8').split('\n');
+const isLink = (p) => { try { return fs.lstatSync(p).isSymbolicLink(); } catch { return false; } };
+
+test('a path removed from shared paths loses its exclude line and its links in every worktree', () => {
+  const { dir, write, g } = sharedRepo('storage, storage-old, storage/x'); // storage/x is dropped as nested
+  write('storage/PG_VERSION', '18\n');
+  fs.appendFileSync(path.join(dir, '.git/info/exclude'), '/mine\n/storage/keep\n');
+  const env = fakeClaude([]);
+  const wt = (slug) => run(dir, 'worktree', { slug }, env).result;
+  const a = wt('12-csv').path;
+  const b = wt('13-other').path;
+  assert.deepStrictEqual([isLink(path.join(a, 'storage')), isLink(path.join(b, 'storage')), isLink(path.join(b, 'storage-old'))], [true, true, true]);
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(path.join(dir, '.git/tdd-flow/shared-paths.json'), 'utf8')), { declared: ['storage', 'storage-old'], removed: [], excluded: ['storage', 'storage-old'] });
+
+  declare(dir, g, 'storage-old');
+  // Every worktree loses the link at once: without the exclude line git would show it as a new file there.
+  assert.deepStrictEqual(wt('12-csv').notes, ['removed the link storage (no longer a shared path)', 'removed the link storage in .claude/worktrees/13-other (no longer a shared path)']);
+  assert.ok(!fs.existsSync(path.join(a, 'storage')));
+  assert.strictEqual(execFileSync('git', ['-C', b, 'status', '--porcelain']).toString(), '');
+  assert.strictEqual(isLink(path.join(a, 'storage-old')), true);
+  assert.strictEqual(fs.readFileSync(path.join(dir, 'storage/PG_VERSION'), 'utf8'), '18\n');
+  assert.ok(!excludeLines(dir).includes('/storage'));
+  for (const kept of ['/storage-old', '/storage/keep', '/mine']) assert.ok(excludeLines(dir).includes(kept), kept);
+  assert.deepStrictEqual([isLink(path.join(b, 'storage')), isLink(path.join(b, 'storage-old'))], [false, true]);
+  assert.deepStrictEqual(wt('13-other').notes, []);
+  // Declared again: linked and excluded again.
+  declare(dir, g, 'storage, storage-old');
+  assert.deepStrictEqual(wt('12-csv').shared, [{ path: 'storage', linked: true }, { path: 'storage-old', linked: false }]);
+  assert.ok(excludeLines(dir).includes('/storage'));
+});
+
+test('cleanup leaves what it did not make: a missing path, a directory, a link elsewhere, a line of the user, a broken record', () => {
+  const { dir, write, g } = sharedRepo('storage');
+  write('storage/PG_VERSION', '18\n');
+  const env = fakeClaude([]);
+  const wt = () => run(dir, 'worktree', { slug: '12-csv' }, env);
+  const a = wt().result.path;
+  const at = path.join(a, 'storage');
+  // Declared while its exclude line was already there and not recorded: the user's line, kept when the path goes.
+  fs.appendFileSync(path.join(dir, '.git/info/exclude'), '/uploads\n');
+  declare(dir, g, 'storage, uploads');
+  wt();
+  declare(dir, g, '');
+  assert.deepStrictEqual(wt().result.notes, ['removed the link storage (no longer a shared path)', 'removed the link uploads (no longer a shared path)']);
+  assert.ok(excludeLines(dir).includes('/uploads'));
+  assert.ok(!excludeLines(dir).includes('/storage'));
+  // Nothing at the path, a directory with data, a link elsewhere: each call works and deletes nothing.
+  assert.deepStrictEqual(wt().result.notes, []);
+  fs.mkdirSync(at);
+  fs.writeFileSync(path.join(at, 'own'), 'x\n');
+  assert.deepStrictEqual([wt().ok, fs.readFileSync(path.join(at, 'own'), 'utf8')], [true, 'x\n']);
+  fs.rmSync(at, { recursive: true });
+  fs.symlinkSync(fs.mkdtempSync(path.join(os.tmpdir(), 'tdd-flow-other-')), at);
+  assert.deepStrictEqual([wt().ok, isLink(at)], [true, true]);
+  // A record that is not JSON counts as none.
+  const record = path.join(dir, '.git/tdd-flow/shared-paths.json');
+  fs.writeFileSync(record, 'not json');
+  declare(dir, g, 'storage-new');
+  assert.strictEqual(wt().ok, true);
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(record, 'utf8')), { declared: ['storage-new'], removed: [], excluded: ['storage-new'] });
+});
+
+test('cleanup of a removed nested path works when its parent in the worktree is a file', () => {
+  const { dir, g } = sharedRepo('data/db');
+  const env = fakeClaude([]);
+  const a = run(dir, 'worktree', { slug: '12-csv' }, env).result.path;
+  declare(dir, g, '');
+  fs.rmSync(path.join(a, 'data'), { recursive: true });
+  fs.writeFileSync(path.join(a, 'data'), 'a file now\n');
+  const out = run(dir, 'worktree', { slug: '12-csv' }, env);
+  assert.strictEqual(out.ok, true, out.error);
+  assert.deepStrictEqual(out.result.notes, []);
 });
 
 test('removing a worktree leaves the shared data in the main checkout', () => {
@@ -1988,7 +2120,7 @@ test('answer-decision stops at the restart when claude --bg prints no id, and a 
   const noId = loggingClaude([{ id: 'old-1', kind: 'background', name: 'csv-export-flow', state: 'done', cwd: '/x' }], { bgOut: 'something went wrong' });
   const r = b.answer({}, noId.env);
   assert.strictEqual(r.ok, false);
-  assert.match(r.error, /step 5.*backgrounded/);
+  assert.match(r.error, /step 6.*backgrounded/);
   assert.strictEqual(b.wg('log', '-1', '--format=%s'), 'docs(12-csv): answer Q-2'); // earlier steps stay
   assert.strictEqual(b.runFileJson().status, 'blocked');
   const again = b.answer({});
@@ -2065,6 +2197,27 @@ test('restart starts a blocked run without decision again: old session removed, 
   assert.deepStrictEqual([r.runFileJson().status, r.runFileJson().session], ['running', 'new-7']);
   // A second restart is refused: the new session is starting.
   assert.match(r.restart().error, /is starting/);
+});
+
+test('restart with a rejected shared path stops before the old session is removed', () => {
+  const r = restartable({ status: 'blocked', session: 'old-1', details: 'tests fail' });
+  fs.appendFileSync(path.join(r.dir, '.tdd-flow/stack.md'), 'shared paths: /srv/x\n');
+  const before = r.runFileJson();
+  const out = r.restart();
+  assert.strictEqual(out.ok, false);
+  assert.match(out.error, /restart step 4 \(prepare the worktree\): shared path \/srv\/x: absolute/);
+  assert.doesNotMatch(r.claude.log(), /^(rm|--bg) /m);
+  assert.deepStrictEqual(r.runFileJson(), before);
+});
+
+test('restart refuses a young starting run file and restarts one older than the grace', () => {
+  const r = restartable(null, []); // withWorktree() ran the worktree command: the run file says starting
+  assert.strictEqual(r.runFileJson().status, 'starting');
+  assert.match(r.restart().error, /is starting/);
+  age(r.dir, '12-csv', 5);
+  const out = r.restart();
+  assert.strictEqual(out.ok, true, out.error);
+  assert.deepStrictEqual([r.runFileJson().status, r.runFileJson().session], ['running', 'new-7']);
 });
 
 test('restart keeps a working old session, takes a given name, and restarts a stalled run or one without any session', () => {

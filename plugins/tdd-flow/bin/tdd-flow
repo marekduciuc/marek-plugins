@@ -124,15 +124,17 @@ function testsNeed(txt, field) {
 /** A repo path as one spelling: `./a//b/` → `a/b`. */
 const normalizeRepoPath = (p) => path.posix.normalize(String(p).trim()).replace(/^(\.\/)+/, '').replace(/\/+$/, '');
 
-/** Why a declared shared path cannot be shared ('' when it can): it must stay inside the repo, outside git's and tdd-flow's directories, untracked. */
+/** Why a declared shared path cannot be shared ('' when it can): it must stay inside the repo, outside git's and tdd-flow's directories. No git call: every CLI command reads stack.md. */
 function sharedPathError(p) {
   if (path.posix.isAbsolute(p)) return 'absolute';
   if (p === '..' || p.startsWith('../') || p.split('/').includes('..')) return 'contains ..';
   for (const dir of ['.git', '.tdd-flow', WORKTREES]) if (p === dir || p.startsWith(`${dir}/`)) return `inside ${dir}`;
   if (p === '.' || !p) return 'is the repo root';
-  if (gitOut('ls-files', '--', p)) return 'tracked by git';
   return '';
 }
+
+/** The declared shared paths git tracks, as `shared path <p>: tracked by git`: a link there would be a change in every worktree. For the commands that act on the paths. */
+const trackedSharedPaths = (paths) => paths.filter((p) => gitOut('ls-files', '--', `:/${p}`)).map((p) => `shared path ${p}: tracked by git`);
 
 /** Paths without duplicates and without any that lie inside another one (the outer link covers them). */
 const outermost = (paths) => [...new Set(paths)].filter((p, _, all) => !all.some((q) => q !== p && p.startsWith(`${q}/`)));
@@ -181,6 +183,64 @@ function linkShared(root, wtPath, paths) {
     shared.push({ path: p, linked: true });
   }
   return { shared, notes };
+}
+
+/**
+ * What tdd-flow did for shared paths, so a path taken out of stack.md can be cleaned up: {declared, removed, excluded}.
+ * `removed` keeps every path that was once declared and is not now (worktrees prepared later lose their links too);
+ * `excluded` are the declared paths whose exclude line tdd-flow added itself. null when missing or not readable.
+ */
+const SHARED_RECORD = () => path.join(commonDir(), 'tdd-flow', 'shared-paths.json');
+function readSharedRecord() {
+  const r = readJSON(SHARED_RECORD());
+  const ok = r && ['declared', 'removed', 'excluded'].every((k) => Array.isArray(r[k]) && r[k].every((x) => typeof x === 'string'));
+  return ok ? r : null;
+}
+
+/**
+ * Brings the exclude file and the record in line with the declared shared paths: adds `wanted` lines that are missing,
+ * deletes the lines tdd-flow added for paths no longer declared (never a line it did not add). Without a record (the
+ * first call, or 0.29.0 before) every declared path counts as added by tdd-flow. Returns the removed paths.
+ */
+function syncSharedExcludes(declared, wanted) {
+  const exclude = path.join(commonDir(), 'info', 'exclude');
+  const ex = read(exclude) || '';
+  const lines = ex.split('\n');
+  const rec = readSharedRecord();
+  const drop = rec ? rec.excluded.filter((p) => !declared.includes(p)).map((p) => `/${p}`) : [];
+  const kept = lines.filter((l) => !drop.includes(l));
+  const add = wanted.filter((l) => !kept.includes(l));
+  if (add.length || kept.length !== lines.length) {
+    const body = kept.join('\n');
+    writeAtomic(exclude, body + (body && !body.endsWith('\n') ? '\n' : '') + add.map((l) => `${l}\n`).join(''));
+  }
+  const excluded = rec ? declared.filter((p) => rec.excluded.includes(p) || !lines.includes(`/${p}`)) : declared;
+  const removed = rec ? [...new Set([...rec.removed, ...rec.declared])].filter((p) => !declared.includes(p)) : [];
+  const next = { declared, removed, excluded };
+  if ((rec || declared.length) && JSON.stringify(next) !== JSON.stringify(rec)) writeAtomic(SHARED_RECORD(), JSON.stringify(next) + '\n');
+  return removed;
+}
+
+/**
+ * Deletes the worktree's links of paths that are no longer shared: only a link that points at the main checkout's
+ * path, never another link, a file, a directory or anything behind a linked parent. Returns a note per deleted link
+ * (`where` names the worktree when it is not the one being prepared).
+ */
+function forgetSharedLinks(root, wtPath, removed, where = '') {
+  const notes = [];
+  // A parent that is a file (ENOTDIR) is not a link either.
+  const isLink = (p) => { try { return fs.lstatSync(p).isSymbolicLink(); } catch { return false; } };
+  for (const p of removed) {
+    const at = path.join(wtPath, p);
+    let behindLink = false;
+    for (let up = path.dirname(at); up.length > wtPath.length; up = path.dirname(up)) behindLink = behindLink || isLink(up);
+    if (behindLink || !isLink(at)) continue;
+    const target = path.join(root, p);
+    if (realpath(at) !== realpath(target) && path.resolve(path.dirname(at), fs.readlinkSync(at)) !== target) continue;
+    fs.unlinkSync(at);
+    notes.push(`removed the link ${p}${where} (no longer a shared path)`);
+  }
+  return notes;
 }
 
 /** Fields of .tdd-flow/stack.md (see agents/stack-detector.md), or null if the file is missing. */
@@ -1141,6 +1201,14 @@ function findSession(sessions, run, wtPath) {
   return sessions.find((s) => s.kind === 'background' && s.cwd && realpath(s.cwd) === wtPath);
 }
 const isLive = (s) => !!s && s.state === 'working';
+/**
+ * The session a run's row shows. A starting run has no session id, so the one found by its worktree is the previous
+ * run's unless it works: not shown, so the row offers no `claude attach` to a session that is over.
+ */
+function runSession(sessions, run, wtPath) {
+  const s = findSession(sessions, run, wtPath);
+  return run && run.status === 'starting' && !isLive(s) ? undefined : s;
+}
 /** What to pass to `claude attach`: the session name when it is one word and unique, else the id. */
 const attachRef = (sessions, s) => (s.name && !/\s/.test(s.name) && sessions.filter((x) => x.name === s.name).length === 1 ? s.name : s.id);
 
@@ -1298,6 +1366,8 @@ function specs(inp) {
       }
     }
     if (isLive(findSession(sessions, run, wtPath))) { skip('a session is still running on it'); continue; }
+    // Being started right now (by another autopilot): a second session on the same worktree is never wanted.
+    if (runState(slug, sessions, root).status === 'starting') { skip('is starting: its session is not working yet'); continue; }
     if (run && run.status === 'blocked' && !(wanted && wanted.has(slug))) {
       skip(`blocked last time: ${String(run.details || '').split('\n')[0]} - fix it, then start it by name`);
       continue;
@@ -1720,7 +1790,7 @@ async function autopilotCheck(inp) {
   checks.push(suiteCheck);
 
   const shared = stack ? stack.sharedPaths : [];
-  const sharedCheck = sharedPathsCheck(root, shared, stack ? stack.sharedPathErrors : []);
+  const sharedCheck = sharedPathsCheck(root, shared, stack ? [...stack.sharedPathErrors, ...trackedSharedPaths(shared)] : []);
   if (sharedCheck) checks.push(sharedCheck);
 
   // Outside state the sessions share: what the tests need, and the shared paths' data.
@@ -1742,16 +1812,22 @@ function worktree(inp) {
   // Kept out of `git status` in the main checkout and out of every commit, without touching .gitignore.
   // Shared paths too (a link is not matched by a .gitignore pattern with a trailing slash).
   const stack = readStack() || { sharedPaths: [], sharedPathErrors: [] };
-  if (stack.sharedPathErrors.length) throw new Error(stack.sharedPathErrors[0]);
-  const exclude = path.join(commonDir(), 'info', 'exclude');
-  const ex = read(exclude) || '';
-  const add = [`/${WORKTREES}/`, `/${STATE}`, ...stack.sharedPaths.map((p) => `/${p}`)].filter((l) => !ex.split('\n').includes(l));
-  if (add.length) { fs.mkdirSync(path.dirname(exclude), { recursive: true }); fs.appendFileSync(exclude, (ex && !ex.endsWith('\n') ? '\n' : '') + add.join('\n') + '\n'); }
+  const rejected = [...stack.sharedPathErrors, ...trackedSharedPaths(stack.sharedPaths)];
+  if (rejected.length) throw new Error(rejected.join('; '));
+  const removed = syncSharedExcludes(stack.sharedPaths, [`/${WORKTREES}/`, `/${STATE}`, ...stack.sharedPaths.map((p) => `/${p}`)]);
   const rel = `${WORKTREES}/${slug}`;
   const abs = path.join(root, rel);
   const branch = `feature/${slug}`;
   const listed = gitOut('worktree', 'list', '--porcelain').split('\n').some((l) => l.startsWith('worktree ') && realpath(l.slice(9)) === abs);
-  if (listed) return { path: abs, branch, created: false, ...linkShared(root, abs, stack.sharedPaths) };
+  // The exclude line of a removed path is gone for every worktree at once, so every worktree loses the link now: git
+  // would show it as a new file there (a session could commit it, and cleanup could not remove the worktree).
+  const others = removed.length ? worktreeList().filter((w) => path.dirname(w.path) === realpath(path.join(root, WORKTREES)) && w.path !== realpath(abs)) : [];
+  const forgotElsewhere = others.flatMap((w) => forgetSharedLinks(root, w.path, removed, ` in ${WORKTREES}/${path.basename(w.path)}`));
+  if (listed) {
+    const forgot = forgetSharedLinks(root, abs, removed);
+    const linked = linkShared(root, abs, stack.sharedPaths);
+    return { path: abs, branch, created: false, shared: linked.shared, notes: [...forgot, ...forgotElsewhere, ...linked.notes] };
+  }
   if (fs.existsSync(abs)) throw new Error(`${rel} exists but is not a git worktree`);
   const hasBranch = git('rev-parse', '--verify', '--quiet', `refs/heads/${branch}`).code === 0;
   const r = hasBranch ? git('worktree', 'add', rel, branch) : git('worktree', 'add', '-b', branch, rel, baseBranch());
@@ -1760,7 +1836,8 @@ function worktree(inp) {
   const tasks = read(path.join(abs, featureDir(slug), 'tasks.md'));
   const open = tasks == null ? undefined : parseTasks(tasks).find((t) => !t.done);
   writeJSON(path.join(abs, STATE), { feature: slug, phase: 'IDLE', task: open ? open.id : '' });
-  return { path: abs, branch, created: true, ...linkShared(root, abs, stack.sharedPaths) };
+  const linked = linkShared(root, abs, stack.sharedPaths);
+  return { path: abs, branch, created: true, shared: linked.shared, notes: [...forgotElsewhere, ...linked.notes] };
 }
 
 /**
@@ -1865,8 +1942,9 @@ function resolveQuestion(spec, id, answer, where, date) {
  * where?, name?}. The model has already edited what the answer changes in the worktree's spec (criteria, tasks,
  * tasks.md, a new task for an implemented spec). Steps, each stopping with an error that names it and leaves the
  * earlier ones in place (a rerun skips what is done): 1 check the run waits on this question, 2 move it to Resolved
- * questions (an implemented spec needs an open task, then goes back to approved), 3 commit the spec folder, 4 remove the
- * old session unless it is working, 5 start the spec again in its worktree and record the run as running.
+ * questions (an implemented spec needs an open task, then goes back to approved), 3 commit the spec folder, 4 prepare the
+ * worktree, 5 remove the old session unless it is working, 6 start the spec again in the worktree and record the run
+ * as running.
  */
 function answerDecision(inp) {
   const slug = checkSlug(inp.slug);
@@ -1924,17 +2002,19 @@ function answerDecision(inp) {
 }
 
 /**
- * Starts a spec's session again, the end of answer-decision and all of restart: step 4 removes the old session
- * (`oldSession`, an id) unless it is working, step 5 starts `/tdd-flow:implement-spec <slug> <base>` in the spec's
- * worktree (created or reused) and records the run as running with the new id. The name is `name`, else the old
+ * Starts a spec's session again, the end of answer-decision and all of restart: step 4 prepares the spec's worktree
+ * (created or reused; an error there, such as a rejected shared path, leaves the old session and the run as they
+ * are), step 5 removes the old session (`oldSession`, an id) unless it is working, step 6 starts
+ * `/tdd-flow:implement-spec <slug> <base>` in the worktree and records the run as running with the new id. The name is `name`, else the old
  * session's when free, else the first three words of the slug without its number (plus the number when another
  * session has those words), as the autopilot names sessions. `sessions` is null when `claude agents` failed; what
  * was not done goes into `notes`; `step(n, what, fn)` names the step in an error. Returns {session, name}.
  */
 function restartSpec({ slug, oldSession, sessions, name: wanted, notes, step }) {
   const old = sessions && oldSession ? sessions.find((s) => s.id === oldSession || s.sessionId === oldSession) : null;
+  const w = step(4, 'prepare the worktree', () => worktree({ slug }));
   let removed = false;
-  step(4, 'remove the old session', () => {
+  step(5, 'remove the old session', () => {
     if (!oldSession) notes.push('the run names no session: none removed');
     else if (!sessions) notes.push(`claude agents is not available: old session ${oldSession} not removed`);
     else if (isLive(old)) notes.push(`old session ${oldSession} is still working: not removed`);
@@ -1954,8 +2034,7 @@ function restartSpec({ slug, oldSession, sessions, name: wanted, notes, step }) 
     name = taken(words) && num ? `${words}-${num}` : words;
   }
 
-  const session = step(5, 'restart', () => {
-    const w = worktree({ slug });
+  const session = step(6, 'restart', () => {
     const r = exec(claudeBin(), ['--bg', '-n', name, `/tdd-flow:implement-spec ${slug} ${baseBranch()}`], undefined, false, w.path);
     const printed = `${r.out}\n${r.err}`.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '');
     const m = printed.match(/backgrounded\s*·\s*(\S+)\s*·/);
@@ -1998,7 +2077,7 @@ function restart(inp) {
  */
 function runState(slug, sessions, root) {
   const run = readRun(slug) || { slug, status: 'unknown' };
-  const s = findSession(sessions, run, path.join(root, WORKTREES, slug));
+  const s = runSession(sessions, run, path.join(root, WORKTREES, slug));
   const attach = s && s.id ? { attach: `claude attach ${attachRef(sessions, s)}` } : {};
   const young = Date.now() - Date.parse(run.at) < START_GRACE_MS;
   // A blocked run whose session works again (resumed or restarted by hand, not through restart/answer-decision, which
@@ -2098,7 +2177,7 @@ function status(inp) {
       : state.phase === 'IDLE' && row.status === 'running' && progress && progress.open ? 'review' : '';
     const spec = featureFile(row.slug, 'spec.md', root, base) || '';
     const source = spec ? parseSpec(spec).source : '';
-    const s = findSession(sessions, run, wt);
+    const s = runSession(sessions, run, wt);
     const issueUrl = /^https?:\/\/\S+$/.test(source) ? source : '';
     return { ...row, task: own && state.task ? String(state.task) : '', phase, issueUrl,
       title: spec ? specTitle(spec) : '', session: s ? s.name || s.id || '' : '', sessionState: s ? s.state || s.status || '' : '', at: run.at || '',
