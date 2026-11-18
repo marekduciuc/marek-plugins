@@ -121,6 +121,57 @@ function testsNeed(txt, field) {
   return { need: 'none', inferred: false };
 }
 
+/** A repo path as one spelling: `./a//b/` → `a/b`. */
+const normalizeRepoPath = (p) => path.posix.normalize(String(p).trim()).replace(/^(\.\/)+/, '').replace(/\/+$/, '');
+
+/** Why a declared shared path cannot be shared ('' when it can): it must stay inside the repo, outside git's and tdd-flow's directories, untracked. */
+function sharedPathError(p) {
+  if (path.posix.isAbsolute(p)) return 'absolute';
+  if (p === '..' || p.startsWith('../') || p.split('/').includes('..')) return 'contains ..';
+  for (const dir of ['.git', '.tdd-flow', WORKTREES]) if (p === dir || p.startsWith(`${dir}/`)) return `inside ${dir}`;
+  if (p === '.' || !p) return 'is the repo root';
+  if (gitOut('ls-files', '--', p)) return 'tracked by git';
+  return '';
+}
+
+/** `shared paths:` of stack.md as {paths, errors}: normalized, without duplicates; rejected entries go to errors as `shared path <p>: <reason>`. */
+function sharedPaths(field) {
+  if (none(field)) return { paths: [], errors: [] };
+  const paths = [], errors = [];
+  for (const raw of field.split(',').map((s) => s.trim()).filter(Boolean)) {
+    const p = path.posix.isAbsolute(raw) || raw.split('/').includes('..') ? raw : normalizeRepoPath(raw);
+    const why = sharedPathError(p);
+    if (why) errors.push(`shared path ${raw}: ${why}`);
+    else if (!paths.includes(p)) paths.push(p);
+  }
+  return { paths, errors };
+}
+
+/**
+ * Links each shared path of the worktree at `wtPath` to the main checkout's (created there when missing). A right link
+ * (also one made by hand, relative) stays; another link or an empty directory is replaced; anything else is an error,
+ * and nothing is deleted. Returns {shared: [{path, linked}], notes}.
+ */
+function linkShared(root, wtPath, paths) {
+  const shared = [], notes = [];
+  for (const p of paths) {
+    const target = path.join(root, p);
+    if (!fs.existsSync(target)) { fs.mkdirSync(target, { recursive: true }); notes.push(`created ${p} in the main checkout`); }
+    const at = path.join(wtPath, p);
+    let st = null;
+    try { st = fs.lstatSync(at); } catch { /* missing */ }
+    if (st && st.isSymbolicLink()) {
+      if (realpath(at) === realpath(target)) { shared.push({ path: p, linked: false }); continue; }
+      fs.unlinkSync(at);
+    } else if (st && st.isDirectory() && fs.readdirSync(at).length === 0) fs.rmdirSync(at);
+    else if (st) throw new Error(`${p} in the worktree holds data of its own; move it away, then run again`);
+    fs.mkdirSync(path.dirname(at), { recursive: true });
+    fs.symlinkSync(target, at);
+    shared.push({ path: p, linked: true });
+  }
+  return { shared, notes };
+}
+
 /** Fields of .tdd-flow/stack.md (see agents/stack-detector.md), or null if the file is missing. */
 function readStack() {
   const txt = read('.tdd-flow/stack.md');
@@ -133,8 +184,9 @@ function readStack() {
     return (bt ? bt[1] : v.replace(/^`+|`+$/g, '')).trim();
   };
   const needs = testsNeed(txt, get('tests need'));
+  const shared = sharedPaths(get('shared paths'));
   return {
-    testsNeed: needs.need, testsNeedInferred: needs.inferred,
+    testsNeed: needs.need, testsNeedInferred: needs.inferred, sharedPaths: shared.paths, sharedPathErrors: shared.errors,
     language: get('language(s)'), testAll: get('test command (all)', true), testSingle: get('test command (single file / filter)', true),
     lint: get('lint/format command', true), typeCheck: get('type check command', true), tracker: get('tracker'), defaultBranch: get('default branch'), ci: get('ci system'),
     baseline: get('baseline test run'), generate: get('generate command', true), generatedFiles: get('generated files'),
@@ -1587,15 +1639,18 @@ function worktree(inp) {
   const slug = checkSlug(inp.slug);
   const root = mainRoot();
   // Kept out of `git status` in the main checkout and out of every commit, without touching .gitignore.
+  // Shared paths too (a link is not matched by a .gitignore pattern with a trailing slash).
+  const stack = readStack() || { sharedPaths: [], sharedPathErrors: [] };
+  if (stack.sharedPathErrors.length) throw new Error(stack.sharedPathErrors[0]);
   const exclude = path.join(commonDir(), 'info', 'exclude');
   const ex = read(exclude) || '';
-  const add = [`/${WORKTREES}/`, `/${STATE}`].filter((l) => !ex.split('\n').includes(l));
+  const add = [`/${WORKTREES}/`, `/${STATE}`, ...stack.sharedPaths.map((p) => `/${p}`)].filter((l) => !ex.split('\n').includes(l));
   if (add.length) { fs.mkdirSync(path.dirname(exclude), { recursive: true }); fs.appendFileSync(exclude, (ex && !ex.endsWith('\n') ? '\n' : '') + add.join('\n') + '\n'); }
   const rel = `${WORKTREES}/${slug}`;
   const abs = path.join(root, rel);
   const branch = `feature/${slug}`;
   const listed = gitOut('worktree', 'list', '--porcelain').split('\n').some((l) => l.startsWith('worktree ') && realpath(l.slice(9)) === abs);
-  if (listed) return { path: abs, branch, created: false };
+  if (listed) return { path: abs, branch, created: false, ...linkShared(root, abs, stack.sharedPaths) };
   if (fs.existsSync(abs)) throw new Error(`${rel} exists but is not a git worktree`);
   const hasBranch = git('rev-parse', '--verify', '--quiet', `refs/heads/${branch}`).code === 0;
   const r = hasBranch ? git('worktree', 'add', rel, branch) : git('worktree', 'add', '-b', branch, rel, baseBranch());
@@ -1604,7 +1659,7 @@ function worktree(inp) {
   const tasks = read(path.join(abs, featureDir(slug), 'tasks.md'));
   const open = tasks == null ? undefined : parseTasks(tasks).find((t) => !t.done);
   writeJSON(path.join(abs, STATE), { feature: slug, phase: 'IDLE', task: open ? open.id : '' });
-  return { path: abs, branch, created: true };
+  return { path: abs, branch, created: true, ...linkShared(root, abs, stack.sharedPaths) };
 }
 
 /**

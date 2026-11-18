@@ -534,6 +534,83 @@ test('a running run inside the grace whose session is not listed yet is starting
   assert.strictEqual(run(dir, 'board', { slugs: ['12-csv'] }, done).result.rows[0].status, 'stalled');
 });
 
+/** A tracked repo whose stack.md declares `shared paths: <paths>`, with storage/ ignored, committed. */
+function sharedRepo(paths) {
+  const r = trackedRepo();
+  fs.appendFileSync(path.join(r.dir, '.gitignore'), 'storage/\n');
+  fs.appendFileSync(path.join(r.dir, '.tdd-flow/stack.md'), `shared paths: ${paths}\n`);
+  r.g('commit', '-qam', 'shared paths');
+  return r;
+}
+
+test('worktree links each shared path to the main checkout, excludes it, and keeps the worktree clean', () => {
+  const { dir, write } = sharedRepo('./storage/postgres/, storage//uploads');
+  write('storage/postgres/PG_VERSION', '18\n');
+  const r = run(dir, 'worktree', { slug: '12-csv' }, fakeClaude([])).result;
+  assert.deepStrictEqual(r.shared, [{ path: 'storage/postgres', linked: true }, { path: 'storage/uploads', linked: true }]);
+  assert.strictEqual(fs.realpathSync(path.join(r.path, 'storage/postgres')), fs.realpathSync(path.join(dir, 'storage/postgres')));
+  assert.strictEqual(fs.readFileSync(path.join(r.path, 'storage/postgres/PG_VERSION'), 'utf8'), '18\n');
+  assert.deepStrictEqual(r.notes, ['created storage/uploads in the main checkout']);
+  assert.match(fs.readFileSync(path.join(dir, '.git/info/exclude'), 'utf8'), /^\/storage\/postgres$/m);
+  assert.strictEqual(execFileSync('git', ['-C', r.path, 'status', '--porcelain']).toString(), '');
+  // Second call: nothing to do. A reused worktree without the link gets it.
+  assert.deepStrictEqual(run(dir, 'worktree', { slug: '12-csv' }, fakeClaude([])).result.shared.map((s) => s.linked), [false, false]);
+  fs.unlinkSync(path.join(r.path, 'storage/uploads'));
+  assert.deepStrictEqual(run(dir, 'worktree', { slug: '12-csv' }, fakeClaude([])).result.shared.map((s) => s.linked), [false, true]);
+});
+
+test('worktree keeps a hand-made link, replaces a wrong one and an empty directory, and refuses a directory with data', () => {
+  const { dir, write } = sharedRepo('storage/postgres');
+  write('storage/postgres/PG_VERSION', '18\n');
+  const wt = run(dir, 'worktree', { slug: '12-csv' }, fakeClaude([])).result.path;
+  const link = path.join(wt, 'storage/postgres');
+  const again = () => run(dir, 'worktree', { slug: '12-csv' }, fakeClaude([]));
+  // Made by hand before 0.29.0: a relative link to the same directory.
+  fs.unlinkSync(link);
+  fs.symlinkSync('../../../../storage/postgres', link);
+  assert.deepStrictEqual(again().result.shared, [{ path: 'storage/postgres', linked: false }]);
+  assert.strictEqual(fs.readlinkSync(link), '../../../../storage/postgres');
+  // A link to somewhere else, and an empty directory: replaced.
+  fs.unlinkSync(link);
+  fs.symlinkSync(fs.mkdtempSync(path.join(os.tmpdir(), 'tdd-flow-other-')), link);
+  assert.deepStrictEqual(again().result.shared, [{ path: 'storage/postgres', linked: true }]);
+  fs.unlinkSync(link);
+  fs.mkdirSync(link);
+  assert.deepStrictEqual(again().result.shared, [{ path: 'storage/postgres', linked: true }]);
+  assert.strictEqual(fs.realpathSync(link), fs.realpathSync(path.join(dir, 'storage/postgres')));
+  // A directory with data of its own: refused, nothing deleted.
+  fs.unlinkSync(link);
+  fs.mkdirSync(link);
+  fs.writeFileSync(path.join(link, 'PG_VERSION'), 'own\n');
+  const out = again();
+  assert.strictEqual(out.ok, false);
+  assert.match(out.error, /storage\/postgres in the worktree holds data of its own; move it away, then run again/);
+  assert.strictEqual(fs.readFileSync(path.join(link, 'PG_VERSION'), 'utf8'), 'own\n');
+});
+
+test('shared paths that are absolute, leave the repo, sit in tool dirs or are tracked are rejected', () => {
+  const cases = [['/srv/x', /absolute/], ['../x', /contains \.\./], ['.git/x', /inside \.git/], ['.tdd-flow/x', /inside \.tdd-flow/],
+    ['.claude/worktrees/x', /inside \.claude\/worktrees/], ['src/tracked.js', /tracked by git/]];
+  for (const [p, why] of cases) {
+    const { dir, write, g } = sharedRepo(p);
+    write('src/tracked.js', 'x\n');
+    g('add', 'src/tracked.js');
+    g('commit', '-qm', 'tracked');
+    const out = run(dir, 'worktree', { slug: '12-csv' }, fakeClaude([]));
+    assert.strictEqual(out.ok, false, p);
+    assert.match(out.error, new RegExp(`shared path ${esc(p)}: ${why.source}`), p);
+  }
+});
+
+test('removing a worktree leaves the shared data in the main checkout', () => {
+  const { dir, write } = sharedRepo('storage/postgres');
+  write('storage/postgres/PG_VERSION', '18\n');
+  const wt = run(dir, 'worktree', { slug: '12-csv' }, fakeClaude([])).result.path;
+  execFileSync('git', ['-C', dir, 'worktree', 'remove', wt]);
+  assert.ok(!fs.existsSync(wt));
+  assert.strictEqual(fs.readFileSync(path.join(dir, 'storage/postgres/PG_VERSION'), 'utf8'), '18\n');
+});
+
 test('runs-wait keeps waiting on a starting spec and returns it as stalled when the grace ends', () => {
   const { dir } = trackedRepo();
   const none = fakeClaude([]);
