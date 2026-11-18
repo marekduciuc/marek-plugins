@@ -2,7 +2,11 @@
 
 Date: 18.11.2026. Target: tdd-flow 0.29.0.
 
-Status: approved 18.11.2026 (share the data, plus a pre-flight check; builder's calls accepted), not implemented.
+Status: implemented in tdd-flow 0.29.0. Changes against the design below, decided during implementation:
+
+- A compose file is pinned when any compose file in its directory is pinned, or its `.env` sets `COMPOSE_PROJECT_NAME`: compose merges the files of one directory (`compose.override.yml`) into one project.
+- A flow-style `volumes: [...]` warns like a `${...}` source: a line scan cannot read it.
+- The fix line lists the declared paths first, then the missing ones in alphabetical order.
 
 ## Problem
 
