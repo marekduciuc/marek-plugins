@@ -534,6 +534,83 @@ test('a running run inside the grace whose session is not listed yet is starting
   assert.strictEqual(run(dir, 'board', { slugs: ['12-csv'] }, done).result.rows[0].status, 'stalled');
 });
 
+/** A tracked repo whose stack.md declares `shared paths: <paths>`, with storage/ ignored, committed. */
+function sharedRepo(paths) {
+  const r = trackedRepo();
+  fs.appendFileSync(path.join(r.dir, '.gitignore'), 'storage/\n');
+  fs.appendFileSync(path.join(r.dir, '.tdd-flow/stack.md'), `shared paths: ${paths}\n`);
+  r.g('commit', '-qam', 'shared paths');
+  return r;
+}
+
+test('worktree links each shared path to the main checkout, excludes it, and keeps the worktree clean', () => {
+  const { dir, write } = sharedRepo('./storage/postgres/, storage//uploads');
+  write('storage/postgres/PG_VERSION', '18\n');
+  const r = run(dir, 'worktree', { slug: '12-csv' }, fakeClaude([])).result;
+  assert.deepStrictEqual(r.shared, [{ path: 'storage/postgres', linked: true }, { path: 'storage/uploads', linked: true }]);
+  assert.strictEqual(fs.realpathSync(path.join(r.path, 'storage/postgres')), fs.realpathSync(path.join(dir, 'storage/postgres')));
+  assert.strictEqual(fs.readFileSync(path.join(r.path, 'storage/postgres/PG_VERSION'), 'utf8'), '18\n');
+  assert.deepStrictEqual(r.notes, ['created storage/uploads in the main checkout']);
+  assert.match(fs.readFileSync(path.join(dir, '.git/info/exclude'), 'utf8'), /^\/storage\/postgres$/m);
+  assert.strictEqual(execFileSync('git', ['-C', r.path, 'status', '--porcelain']).toString(), '');
+  // Second call: nothing to do. A reused worktree without the link gets it.
+  assert.deepStrictEqual(run(dir, 'worktree', { slug: '12-csv' }, fakeClaude([])).result.shared.map((s) => s.linked), [false, false]);
+  fs.unlinkSync(path.join(r.path, 'storage/uploads'));
+  assert.deepStrictEqual(run(dir, 'worktree', { slug: '12-csv' }, fakeClaude([])).result.shared.map((s) => s.linked), [false, true]);
+});
+
+test('worktree keeps a hand-made link, replaces a wrong one and an empty directory, and refuses a directory with data', () => {
+  const { dir, write } = sharedRepo('storage/postgres');
+  write('storage/postgres/PG_VERSION', '18\n');
+  const wt = run(dir, 'worktree', { slug: '12-csv' }, fakeClaude([])).result.path;
+  const link = path.join(wt, 'storage/postgres');
+  const again = () => run(dir, 'worktree', { slug: '12-csv' }, fakeClaude([]));
+  // Made by hand before 0.29.0: a relative link to the same directory.
+  fs.unlinkSync(link);
+  fs.symlinkSync('../../../../storage/postgres', link);
+  assert.deepStrictEqual(again().result.shared, [{ path: 'storage/postgres', linked: false }]);
+  assert.strictEqual(fs.readlinkSync(link), '../../../../storage/postgres');
+  // A link to somewhere else, and an empty directory: replaced.
+  fs.unlinkSync(link);
+  fs.symlinkSync(fs.mkdtempSync(path.join(os.tmpdir(), 'tdd-flow-other-')), link);
+  assert.deepStrictEqual(again().result.shared, [{ path: 'storage/postgres', linked: true }]);
+  fs.unlinkSync(link);
+  fs.mkdirSync(link);
+  assert.deepStrictEqual(again().result.shared, [{ path: 'storage/postgres', linked: true }]);
+  assert.strictEqual(fs.realpathSync(link), fs.realpathSync(path.join(dir, 'storage/postgres')));
+  // A directory with data of its own: refused, nothing deleted.
+  fs.unlinkSync(link);
+  fs.mkdirSync(link);
+  fs.writeFileSync(path.join(link, 'PG_VERSION'), 'own\n');
+  const out = again();
+  assert.strictEqual(out.ok, false);
+  assert.match(out.error, /storage\/postgres in the worktree holds data of its own; move it away, then run again/);
+  assert.strictEqual(fs.readFileSync(path.join(link, 'PG_VERSION'), 'utf8'), 'own\n');
+});
+
+test('shared paths that are absolute, leave the repo, sit in tool dirs or are tracked are rejected', () => {
+  const cases = [['/srv/x', /absolute/], ['../x', /contains \.\./], ['.git/x', /inside \.git/], ['.tdd-flow/x', /inside \.tdd-flow/],
+    ['.claude/worktrees/x', /inside \.claude\/worktrees/], ['src/tracked.js', /tracked by git/]];
+  for (const [p, why] of cases) {
+    const { dir, write, g } = sharedRepo(p);
+    write('src/tracked.js', 'x\n');
+    g('add', 'src/tracked.js');
+    g('commit', '-qm', 'tracked');
+    const out = run(dir, 'worktree', { slug: '12-csv' }, fakeClaude([]));
+    assert.strictEqual(out.ok, false, p);
+    assert.match(out.error, new RegExp(`shared path ${esc(p)}: ${why.source}`), p);
+  }
+});
+
+test('removing a worktree leaves the shared data in the main checkout', () => {
+  const { dir, write } = sharedRepo('storage/postgres');
+  write('storage/postgres/PG_VERSION', '18\n');
+  const wt = run(dir, 'worktree', { slug: '12-csv' }, fakeClaude([])).result.path;
+  execFileSync('git', ['-C', dir, 'worktree', 'remove', wt]);
+  assert.ok(!fs.existsSync(wt));
+  assert.strictEqual(fs.readFileSync(path.join(dir, 'storage/postgres/PG_VERSION'), 'utf8'), '18\n');
+});
+
 test('runs-wait keeps waiting on a starting spec and returns it as stalled when the grace ends', () => {
   const { dir } = trackedRepo();
   const none = fakeClaude([]);
@@ -1201,6 +1278,101 @@ test('autopilot-check: tests that need Docker check the engine and run one spec 
   assert.deepStrictEqual([plain.ok, plain.parallel, plain.check('docker'), plain.check('tests need')], [true, 3, undefined, undefined]);
   const bad = run(dir, 'autopilot-check', { parallel: 0 }, fakeGh([]));
   assert.match(bad.error, /parallel must be a positive whole number/);
+});
+
+/** autopilot-check on a tracked repo with the given stack.md extra lines and tracked files ({path: text}), committed. */
+function composeCheck(stackLines, files, input = { runnable: 1 }) {
+  const { dir, write, g } = trackedRepo();
+  write('.tdd-flow/stack.md', `test command (all): \`node -e 0\`\ntests need: none\n${stackLines}`);
+  for (const [p, text] of Object.entries(files)) write(p, text);
+  g('add', '-A');
+  g('commit', '-qm', 'compose');
+  return autopilotCheck(dir, input, { settings: { permissions: { defaultMode: 'auto' } }, env: { TDD_FLOW_DOCKER_BIN: fakeBin('docker', 'exit 0') } });
+}
+const PINNED_DB = 'services:\n  db:\n    image: postgres:18\n    container_name: app-db\n    volumes:\n      - ./storage/postgres:/var/lib/postgresql/data\n';
+
+test('autopilot-check: a pinned compose file must not bind-mount an undeclared relative path', () => {
+  const missing = composeCheck('', { 'docker-compose.yml': PINNED_DB });
+  assert.deepStrictEqual([missing.ok, missing.check('shared paths').status], [false, 'fail']);
+  assert.match(missing.check('shared paths').details, /docker-compose\.yml.*storage\/postgres/);
+  assert.match(missing.check('shared paths').fix, /`shared paths: storage\/postgres`/);
+  const declared = composeCheck('shared paths: storage/postgres\n', { 'docker-compose.yml': PINNED_DB });
+  assert.deepStrictEqual([declared.ok, declared.check('shared paths').status], [true, 'ok']);
+  const parent = composeCheck('shared paths: storage\n', { 'docker-compose.yml': PINNED_DB });
+  assert.deepStrictEqual([parent.ok, parent.check('shared paths').status], [true, 'ok']);
+});
+
+test('autopilot-check: top-level name, long bind syntax, a subdirectory, an override file and short-syntax variants are read', () => {
+  const r = composeCheck('', {
+    'compose.yaml': 'name: app\nservices:\n  web:\n    volumes:\n      - type: bind\n        source: ./data\n        target: /data\n      - "./a:/x"\n      - ./b:/x:ro\n      - ./c\n',
+    'compose.override.yml': 'services:\n  web:\n    volumes:\n      - ./d:/d\n',
+    'docker/compose.yml': 'services:\n  db:\n    container_name: db\n    volumes:\n      - ../storage/postgres:/data\n',
+    'svc/docker-compose.yml': 'services:\n  q:\n    volumes:\n      - ./e:/e\n',
+    'svc/.env': 'COMPOSE_PROJECT_NAME=svc\n',
+  });
+  assert.strictEqual(r.check('shared paths').status, 'fail');
+  assert.match(r.check('shared paths').fix, /`shared paths: a, b, c, d, data, storage\/postgres, svc\/e`/);
+});
+
+test('autopilot-check: an unpinned compose file, named volumes and absolute host paths pass with nothing declared', () => {
+  const r = composeCheck('', {
+    'docker-compose.yml': 'services:\n  db:\n    volumes:\n      - ./storage/postgres:/data\n',
+    'infra/compose.yml': 'services:\n  db:\n    container_name: db\n    volumes:\n      - pgdata:/var/lib/x\n      - /srv/x:/x\nvolumes:\n  pgdata:\n',
+  });
+  assert.strictEqual(r.ok, true);
+  assert.ok(!r.check('shared paths') || r.check('shared paths').status === 'ok');
+});
+
+test('autopilot-check: a ${VAR} source or an unreadable volumes value warns; a rejected declared path fails', () => {
+  const vars = composeCheck('', { 'docker-compose.yml': 'services:\n  db:\n    container_name: db\n    volumes:\n      - ${DATA_DIR}:/data\n' });
+  assert.deepStrictEqual([vars.ok, vars.check('shared paths').status], [true, 'warn']);
+  assert.match(vars.check('shared paths').details, /\$\{DATA_DIR\}/);
+  const flow = composeCheck('', { 'docker-compose.yml': 'services:\n  db:\n    container_name: db\n    volumes: ["./x:/x"]\n' });
+  assert.deepStrictEqual([flow.ok, flow.check('shared paths').status], [true, 'warn']);
+  const bad = composeCheck('shared paths: /srv/x\n', {});
+  assert.deepStrictEqual([bad.ok, bad.check('shared paths').status], [false, 'fail']);
+  assert.match(bad.check('shared paths').details, /shared path \/srv\/x: absolute/);
+});
+
+test('autopilot-check: tracked mounts and the repo root are code, not data; a placeholder-only data directory warns', () => {
+  const r = composeCheck('', {
+    'docker-compose.yml': 'services:\n  db:\n    container_name: db\n    volumes:\n      - ./nginx.conf:/etc/nginx/nginx.conf:ro\n      - .:/app\n      - ./db/init:/docker-entrypoint-initdb.d\n      - ./data/pg:/var/lib/postgresql/data\n',
+    'nginx.conf': 'events {}\n', 'db/init/01.sql': 'select 1;\n', 'data/pg/.gitkeep': '',
+  });
+  assert.deepStrictEqual([r.ok, r.check('shared paths').status], [true, 'warn']);
+  assert.match(r.check('shared paths').details, /data\/pg holds only tracked placeholders.*git rm --cached/);
+  assert.doesNotMatch(r.check('shared paths').details, /nginx\.conf|db\/init/);
+});
+
+test('autopilot-check: a list at the indent of volumes:, a long entry starting with source:, and a compose file in a subdirectory are read', () => {
+  const r = composeCheck('', {
+    'docker-compose.yml': 'services:\n  db:\n    container_name: db\n    volumes:\n    - ./storage/postgres:/var/lib/postgresql/data\n    - source: ./storage/uploads\n      type: bind\n      target: /u\n',
+    'infra/compose.yaml': 'services:\n  cache:\n    volumes:\n      - ./redis:/data\n', // project name "infra" in every worktree
+  });
+  assert.strictEqual(r.check('shared paths').status, 'fail');
+  assert.match(r.check('shared paths').fix, /`shared paths: infra\/redis, storage\/postgres, storage\/uploads`/);
+});
+
+test('shared paths inside another one are dropped; backticks are stripped; a path with spaces or parentheses is rejected', () => {
+  const { dir, write } = sharedRepo('`storage`, `storage/postgres`');
+  write('storage/postgres/PG_VERSION', '18\n');
+  const r = run(dir, 'worktree', { slug: '12-csv' }, fakeClaude([]));
+  assert.strictEqual(r.ok, true, r.error);
+  assert.deepStrictEqual(r.result.shared, [{ path: 'storage', linked: true }]);
+  assert.strictEqual(fs.lstatSync(path.join(dir, 'storage/postgres')).isDirectory(), true); // the main checkout is untouched
+  assert.strictEqual(fs.readFileSync(path.join(r.result.path, 'storage/postgres/PG_VERSION'), 'utf8'), '18\n');
+  const bad = sharedRepo('storage/postgres (database data)');
+  assert.match(run(bad.dir, 'worktree', { slug: '12-csv' }, fakeClaude([])).error, /shared path storage\/postgres \(database data\): not a plain path/);
+  const nested = composeCheck('', { 'docker-compose.yml': 'services:\n  db:\n    container_name: db\n    volumes:\n      - ./storage:/s\n      - ./storage/postgres:/p\n' });
+  assert.match(nested.check('shared paths').fix, /`shared paths: storage`/);
+});
+
+test('autopilot-check: shared paths run one spec at a time unless --parallel is passed', () => {
+  const one = composeCheck('shared paths: storage/postgres\n', {});
+  assert.strictEqual(one.parallel, 1);
+  assert.match(one.check('parallel').details, /^1 at a time, because worktrees share storage\/postgres/);
+  const two = composeCheck('shared paths: storage/postgres\n', {}, { runnable: 1, parallel: 2 });
+  assert.deepStrictEqual([two.parallel, two.check('parallel').status], [2, 'warn']);
 });
 
 test('autopilot-check: base suite runs once for two or more specs on a clean base checkout', () => {

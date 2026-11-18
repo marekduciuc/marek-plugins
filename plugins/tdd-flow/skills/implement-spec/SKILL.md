@@ -48,6 +48,8 @@ TDD_FLOW_JSON
 
 A new worktree has no installed dependencies. For JavaScript, install them for each directory that has a tracked lockfile (`git ls-files '*package-lock.json' '*pnpm-lock.yaml' '*yarn.lock' '*bun.lock' '*bun.lockb'`) and no `node_modules`, using the frozen command for its lockfile, in a subshell so the shell stays at the worktree root: `(cd apps/web && npm ci)`.
 
+The paths in `shared paths:` of `.tdd-flow/stack.md` are links to the main checkout's data (`tdd-flow worktree` made them). Never remove or replace them, and never delete or reset the data behind them.
+
 | Lockfile | Command |
 |---|---|
 | `package-lock.json` | `npm ci` |

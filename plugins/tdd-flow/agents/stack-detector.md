@@ -45,6 +45,7 @@ production source roots:
 generate command:   (command that rebuilds the generated files from the sources, from the repo root, or `none`)
 generated files:    (comma-separated paths or globs that command writes and that are committed, e.g. `apps/backend/openapi.json`, or `none`)
 tests need:         (none | docker (...) | database (...) | services (...)) what the tests use outside the repo, e.g. `docker (Testcontainers)`, `database (local PostgreSQL)`
+shared paths:       (comma-separated repo paths, or `none`) the relative bind-mount sources (`./storage/postgres:/var/lib/...`, resolved against the compose file's directory) of every tracked compose file whose project has a fixed name (top-level `name:`, `container_name:`, `COMPOSE_PROJECT_NAME` in its `.env`); every worktree links them to the main checkout
 ci system:
 tracker:            (github | azure-devops | jira | none) + CLI available?
 default branch:

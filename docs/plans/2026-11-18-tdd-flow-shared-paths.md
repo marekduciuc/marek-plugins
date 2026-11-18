@@ -2,7 +2,12 @@
 
 Date: 18.11.2026. Target: tdd-flow 0.29.0.
 
-Status: approved 18.11.2026 (share the data, plus a pre-flight check; builder's calls accepted), not implemented.
+Status: implemented in tdd-flow 0.29.0. Changes against the design below, decided during implementation:
+
+- A compose file is pinned when any compose file in its directory is pinned, or its `.env` sets `COMPOSE_PROJECT_NAME`: compose merges the files of one directory (`compose.override.yml`) into one project.
+- A flow-style `volumes: [...]` warns like a `${...}` source: a line scan cannot read it.
+- The fix line lists the paths in alphabetical order, without a path inside another one.
+- From the branch review: a compose file in a subdirectory counts as pinned (Compose names the project after that directory, the same in every worktree). A tracked mount (config file, init scripts, the repo root) is not asked for; a directory holding only tracked placeholders (`.gitkeep`) warns to untrack them. A declared path inside another one is dropped, backticks are stripped, a path with spaces or parentheses is rejected. A volumes list at the indent of `volumes:` and a long entry starting with `source:` are read.
 
 ## Problem
 

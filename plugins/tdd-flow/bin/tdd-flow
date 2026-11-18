@@ -121,6 +121,68 @@ function testsNeed(txt, field) {
   return { need: 'none', inferred: false };
 }
 
+/** A repo path as one spelling: `./a//b/` → `a/b`. */
+const normalizeRepoPath = (p) => path.posix.normalize(String(p).trim()).replace(/^(\.\/)+/, '').replace(/\/+$/, '');
+
+/** Why a declared shared path cannot be shared ('' when it can): it must stay inside the repo, outside git's and tdd-flow's directories, untracked. */
+function sharedPathError(p) {
+  if (path.posix.isAbsolute(p)) return 'absolute';
+  if (p === '..' || p.startsWith('../') || p.split('/').includes('..')) return 'contains ..';
+  for (const dir of ['.git', '.tdd-flow', WORKTREES]) if (p === dir || p.startsWith(`${dir}/`)) return `inside ${dir}`;
+  if (p === '.' || !p) return 'is the repo root';
+  if (gitOut('ls-files', '--', p)) return 'tracked by git';
+  return '';
+}
+
+/** Paths without duplicates and without any that lie inside another one (the outer link covers them). */
+const outermost = (paths) => [...new Set(paths)].filter((p, _, all) => !all.some((q) => q !== p && p.startsWith(`${q}/`)));
+
+/**
+ * `shared paths:` of stack.md as {paths, errors}: backticks stripped, normalized, outermost only; rejected entries go
+ * to errors as `shared path <p>: <reason>`.
+ */
+function sharedPaths(field) {
+  if (none(field)) return { paths: [], errors: [] };
+  const paths = [], errors = [];
+  for (const raw of field.split(',').map((s) => s.trim().replace(/^`+|`+$/g, '').trim()).filter(Boolean)) {
+    if (/[\s()]/.test(raw)) { errors.push(`shared path ${raw}: not a plain path (no spaces or notes)`); continue; }
+    const p = path.posix.isAbsolute(raw) || raw.split('/').includes('..') ? raw : normalizeRepoPath(raw);
+    const why = sharedPathError(p);
+    if (why) errors.push(`shared path ${raw}: ${why}`);
+    else paths.push(p);
+  }
+  return { paths: outermost(paths), errors };
+}
+
+/**
+ * Links each shared path of the worktree at `wtPath` to the main checkout's (created there when missing). A right link
+ * (also one made by hand, relative) stays; another link or an empty directory is replaced; anything else is an error,
+ * and nothing is deleted. Returns {shared: [{path, linked}], notes}.
+ */
+function linkShared(root, wtPath, paths) {
+  const shared = [], notes = [];
+  for (const p of paths) {
+    const target = path.join(root, p);
+    if (!fs.existsSync(target)) { fs.mkdirSync(target, { recursive: true }); notes.push(`created ${p} in the main checkout`); }
+    const at = path.join(wtPath, p);
+    // Through a linked parent, `at` would be the main checkout's own path.
+    for (let up = path.dirname(at); up.length > wtPath.length; up = path.dirname(up)) {
+      if (fs.lstatSync(up, { throwIfNoEntry: false })?.isSymbolicLink()) throw new Error(`${path.relative(wtPath, up)} in the worktree is a link, so ${p} cannot be linked inside it; share ${path.relative(wtPath, up)} instead`);
+    }
+    let st = null;
+    try { st = fs.lstatSync(at); } catch { /* missing */ }
+    if (st && st.isSymbolicLink()) {
+      if (realpath(at) === realpath(target)) { shared.push({ path: p, linked: false }); continue; }
+      fs.unlinkSync(at);
+    } else if (st && st.isDirectory() && fs.readdirSync(at).length === 0) fs.rmdirSync(at);
+    else if (st) throw new Error(`${p} in the worktree holds data of its own; move it away, then run again`);
+    fs.mkdirSync(path.dirname(at), { recursive: true });
+    fs.symlinkSync(target, at);
+    shared.push({ path: p, linked: true });
+  }
+  return { shared, notes };
+}
+
 /** Fields of .tdd-flow/stack.md (see agents/stack-detector.md), or null if the file is missing. */
 function readStack() {
   const txt = read('.tdd-flow/stack.md');
@@ -133,8 +195,9 @@ function readStack() {
     return (bt ? bt[1] : v.replace(/^`+|`+$/g, '')).trim();
   };
   const needs = testsNeed(txt, get('tests need'));
+  const shared = sharedPaths(get('shared paths'));
   return {
-    testsNeed: needs.need, testsNeedInferred: needs.inferred,
+    testsNeed: needs.need, testsNeedInferred: needs.inferred, sharedPaths: shared.paths, sharedPathErrors: shared.errors,
     language: get('language(s)'), testAll: get('test command (all)', true), testSingle: get('test command (single file / filter)', true),
     lint: get('lint/format command', true), typeCheck: get('type check command', true), tracker: get('tracker'), defaultBranch: get('default branch'), ci: get('ci system'),
     baseline: get('baseline test run'), generate: get('generate command', true), generatedFiles: get('generated files'),
@@ -1537,6 +1600,90 @@ async function baseSuiteCheck(base, runnable, stack, isBaseStale) {
  * --parallel}. Output: {ok (no check failed), parallel, testsNeed, checks: [{name, status ok|warn|fail|skipped|running, details, fix?}]},
  * plus `again` while the base suite still runs.
  */
+const COMPOSE_FILE = /^(docker-)?compose[^/]*\.ya?ml$/;
+
+/**
+ * The relative bind mounts of every tracked compose file, read line by line (the plugin has no YAML parser):
+ * [{file, pinned, sources, unresolved}]. `pinned`: the compose project in that directory has a fixed name (a top-level
+ * `name:`, a `container_name:` in any compose file there, or COMPOSE_PROJECT_NAME in its .env), so a session starting
+ * it from a worktree replaces the project's containers. `sources` are repo paths; `unresolved` the sources a line scan
+ * cannot resolve (`${...}`, a flow-style `volumes: [...]`).
+ */
+function composeBindMounts(root) {
+  const files = gitOut('ls-files', '--full-name', '--', ':/').split('\n').filter((f) => COMPOSE_FILE.test(path.posix.basename(f)));
+  const read1 = (f) => read(path.join(root, f)) || '';
+  const pinnedDirs = new Set(files.filter((f) => /^name\s*:/m.test(read1(f)) || /^\s+container_name\s*:/m.test(read1(f))).map((f) => path.posix.dirname(f)));
+  // A compose file in a subdirectory: the project is named after that directory, the same in every worktree.
+  const envPinned = (dir) => dir !== '.' || /^\s*COMPOSE_PROJECT_NAME\s*=/m.test(read(path.join(root, dir, '.env')) || '');
+  return files.map((file) => {
+    const dir = path.posix.dirname(file);
+    const sources = [], unresolved = [];
+    let volIndent = -1;
+    for (const line of read1(file).split(/\r?\n/)) {
+      if (!line.trim() || /^\s*#/.test(line)) continue;
+      const indent = line.match(/^\s*/)[0].length;
+      // A list may sit at the indent of `volumes:` itself (the style of `docker compose config` and yq).
+      if (volIndent >= 0 && (indent < volIndent || (indent === volIndent && !/^\s*-/.test(line)))) volIndent = -1;
+      const vol = line.match(/^(\s*)volumes\s*:\s*(.*)$/);
+      if (vol) {
+        if (vol[2].startsWith('[')) unresolved.push(`volumes: ${vol[2]}`);
+        else if (!vol[2]) volIndent = vol[1].length;
+        continue;
+      }
+      if (volIndent < 0) continue;
+      const entry = line.match(/^\s*-\s*(\w+)\s*:\s+["']?([^"'\s]*)/); // `- type: bind` opens a long-syntax entry
+      const m = entry ? (entry[1] === 'source' ? [null, entry[2]] : null)
+        : line.match(/^\s*-\s*["']?([^"'\s]+)/) || line.match(/^\s*source\s*:\s*["']?([^"'\s]+)/);
+      if (!m) continue;
+      const src = m[1].startsWith('${') ? m[1] : m[1].split(':')[0];
+      if (src.includes('${')) { unresolved.push(src); continue; }
+      if (!/^\.\.?(\/|$)/.test(src)) continue; // a named volume or an absolute host path
+      const p = path.posix.normalize(path.posix.join(dir, src));
+      if (p !== '..' && !p.startsWith('../')) sources.push(normalizeRepoPath(p));
+    }
+    return { file, pinned: pinnedDirs.has(dir) || envPinned(dir), sources, unresolved };
+  });
+}
+
+/**
+ * Pre-flight check of the shared paths: a rejected declared path, or a relative bind mount of a pinned compose project
+ * that no shared path covers, fails (a session that starts it from its worktree would replace the project's container
+ * with one on the worktree's copy of the data). A source the line scan cannot resolve warns. null when there is no
+ * pinned compose file and nothing is declared.
+ */
+function sharedPathsCheck(root, shared, errors) {
+  if (errors.length) return { name: 'shared paths', status: 'fail', details: errors.join('; '), fix: 'fix or remove the entry in `shared paths:` of .tdd-flow/stack.md' };
+  const pinned = composeBindMounts(root).filter((c) => c.pinned);
+  if (!pinned.length && !shared.length) return null;
+  const covered = (src) => shared.some((p) => src === p || src.startsWith(`${p}/`));
+  // A tracked mount (config, init scripts, the repo root) is code: each worktree mounts its own copy, as it should. A
+  // directory whose only tracked files are placeholders holds data, but cannot be shared while git tracks them.
+  const placeholders = [];
+  const isData = (src) => {
+    if (src === '.') return false;
+    const tracked = gitOut('ls-files', '--full-name', '--', `:/${src}`).split('\n').filter(Boolean);
+    if (!tracked.length) return true;
+    if (tracked.every((f) => ['.gitkeep', '.keep', '.gitignore'].includes(path.posix.basename(f)))) placeholders.push(src);
+    return false;
+  };
+  const missing = pinned.flatMap((c) => c.sources.filter((s) => !covered(s) && isData(s)).map((s) => ({ file: c.file, s })));
+  if (missing.length) {
+    const add = outermost([...shared, ...missing.map((m) => m.s)].sort());
+    return {
+      name: 'shared paths', status: 'fail',
+      details: `${missing.map((m) => `${m.file} mounts ${m.s}`).join(', ')} with a fixed container or project name: a session starting it from its worktree would replace the project's container with one on the worktree's copy`,
+      fix: `add \`shared paths: ${add.join(', ')}\` to .tdd-flow/stack.md (then every worktree links these paths to the main checkout)`,
+    };
+  }
+  const unresolved = pinned.flatMap((c) => c.unresolved.map((u) => `${c.file}: ${u}`));
+  const warns = [
+    ...[...new Set(placeholders)].map((p) => `${p} holds only tracked placeholders, so a worktree session mounts its own empty copy: \`git rm --cached\` them, then add ${p} to \`shared paths:\``),
+    ...(unresolved.length ? [`cannot tell where these mounts point: ${unresolved.join(', ')}; if one is inside the repo, add it to \`shared paths:\` in .tdd-flow/stack.md`] : []),
+  ];
+  if (warns.length) return { name: 'shared paths', status: 'warn', details: warns.join('; ') };
+  return { name: 'shared paths', status: 'ok', details: shared.length ? `worktrees share ${shared.join(', ')}` : 'no pinned compose file mounts a repo path' };
+}
+
 async function autopilotCheck(inp) {
   const root = mainRoot();
   const base = baseBranch();
@@ -1572,9 +1719,15 @@ async function autopilotCheck(inp) {
   const suiteCheck = await baseSuiteCheck(base, runnable, stack, fresh.status === 'fail');
   checks.push(suiteCheck);
 
-  const parallel = inp.parallel || (outside ? 1 : PARALLEL_DEFAULT);
-  if (outside && !inp.parallel) checks.push({ name: 'parallel', status: 'ok', details: `1 at a time, because the tests need ${need}; pass --parallel N to run more` });
-  else if (outside && parallel > 1) checks.push({ name: 'parallel', status: 'warn', details: `${parallel} at a time although the tests need ${need}: their tests may collide` });
+  const shared = stack ? stack.sharedPaths : [];
+  const sharedCheck = sharedPathsCheck(root, shared, stack ? stack.sharedPathErrors : []);
+  if (sharedCheck) checks.push(sharedCheck);
+
+  // Outside state the sessions share: what the tests need, and the shared paths' data.
+  const why = [outside && `the tests need ${need}`, shared.length && `worktrees share ${shared.join(', ')}`].filter(Boolean).join(' and ');
+  const parallel = inp.parallel || (why ? 1 : PARALLEL_DEFAULT);
+  if (why && !inp.parallel) checks.push({ name: 'parallel', status: 'ok', details: `1 at a time, because ${why}; pass --parallel N to run more` });
+  else if (why && parallel > 1) checks.push({ name: 'parallel', status: 'warn', details: `${parallel} at a time although ${why}: their tests may collide` });
   else checks.push({ name: 'parallel', status: 'ok', details: `${parallel} at a time` });
 
   // While the base suite still runs, the identical call continues it; until then the checks are not ok.
@@ -1587,15 +1740,18 @@ function worktree(inp) {
   const slug = checkSlug(inp.slug);
   const root = mainRoot();
   // Kept out of `git status` in the main checkout and out of every commit, without touching .gitignore.
+  // Shared paths too (a link is not matched by a .gitignore pattern with a trailing slash).
+  const stack = readStack() || { sharedPaths: [], sharedPathErrors: [] };
+  if (stack.sharedPathErrors.length) throw new Error(stack.sharedPathErrors[0]);
   const exclude = path.join(commonDir(), 'info', 'exclude');
   const ex = read(exclude) || '';
-  const add = [`/${WORKTREES}/`, `/${STATE}`].filter((l) => !ex.split('\n').includes(l));
+  const add = [`/${WORKTREES}/`, `/${STATE}`, ...stack.sharedPaths.map((p) => `/${p}`)].filter((l) => !ex.split('\n').includes(l));
   if (add.length) { fs.mkdirSync(path.dirname(exclude), { recursive: true }); fs.appendFileSync(exclude, (ex && !ex.endsWith('\n') ? '\n' : '') + add.join('\n') + '\n'); }
   const rel = `${WORKTREES}/${slug}`;
   const abs = path.join(root, rel);
   const branch = `feature/${slug}`;
   const listed = gitOut('worktree', 'list', '--porcelain').split('\n').some((l) => l.startsWith('worktree ') && realpath(l.slice(9)) === abs);
-  if (listed) return { path: abs, branch, created: false };
+  if (listed) return { path: abs, branch, created: false, ...linkShared(root, abs, stack.sharedPaths) };
   if (fs.existsSync(abs)) throw new Error(`${rel} exists but is not a git worktree`);
   const hasBranch = git('rev-parse', '--verify', '--quiet', `refs/heads/${branch}`).code === 0;
   const r = hasBranch ? git('worktree', 'add', rel, branch) : git('worktree', 'add', '-b', branch, rel, baseBranch());
@@ -1604,7 +1760,7 @@ function worktree(inp) {
   const tasks = read(path.join(abs, featureDir(slug), 'tasks.md'));
   const open = tasks == null ? undefined : parseTasks(tasks).find((t) => !t.done);
   writeJSON(path.join(abs, STATE), { feature: slug, phase: 'IDLE', task: open ? open.id : '' });
-  return { path: abs, branch, created: true };
+  return { path: abs, branch, created: true, ...linkShared(root, abs, stack.sharedPaths) };
 }
 
 /**
