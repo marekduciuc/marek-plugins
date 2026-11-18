@@ -2,7 +2,10 @@
 
 Date: 18.11.2026. Target: tdd-flow 0.30.0.
 
-Status: approved 18.11.2026, not implemented.
+Status: implemented in tdd-flow 0.30.0. Changes against the design below, decided during implementation:
+
+- The record file has a third field, `excluded`: the declared paths whose exclude line tdd-flow added itself. Only those lines are deleted when a path is removed; a line that was already there stays. Links are cleaned for every removed path, because each one is checked against the main checkout.
+- The `specs` result names the reason in its existing field `why`.
 
 ## Goal
 
