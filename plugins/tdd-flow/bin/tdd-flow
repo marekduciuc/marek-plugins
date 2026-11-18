@@ -203,7 +203,34 @@ function readSharedRecord() {
  * first call, or 0.29.0 before) every declared path counts as added by tdd-flow. Returns the removed paths.
  */
 function syncSharedExcludes(declared, wanted) {
-  const exclude = path.join(commonDir(), 'info', 'exclude');
+  return withExcludeLock(() => syncSharedExcludesLocked(declared, wanted));
+}
+
+const LOCK_STALE_MS = 60000; // a lock this old was left by a call that died
+/**
+ * Runs `fn` while holding <git common dir>/tdd-flow/exclude.lock: parallel `worktree` calls (the autopilot starts
+ * several specs) read, change and write the exclude file and the record one after the other. Waits for a held lock
+ * (TDD_FLOW_LOCK_WAIT_MS, default 5 s), takes over a stale one.
+ */
+function withExcludeLock(fn) {
+  const lock = path.join(commonDir(), 'tdd-flow', 'exclude.lock');
+  fs.mkdirSync(path.dirname(lock), { recursive: true });
+  const end = Date.now() + envMs('TDD_FLOW_LOCK_WAIT_MS', 5000);
+  for (;;) {
+    try { fs.writeFileSync(lock, String(process.pid), { flag: 'wx' }); break; } catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+      const st = fs.statSync(lock, { throwIfNoEntry: false });
+      if (st && Date.now() - st.mtimeMs > LOCK_STALE_MS) { fs.rmSync(lock, { force: true }); continue; }
+      if (Date.now() > end) throw new Error(`${lock} is held by another tdd-flow call; if none runs, delete it`);
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+    }
+  }
+  try { return fn(); } finally { fs.rmSync(lock, { force: true }); }
+}
+
+function syncSharedExcludesLocked(declared, wanted) {
+  // Through a link (an exclude file kept elsewhere), so the atomic rename does not replace the link by a file.
+  const exclude = realpath(path.join(commonDir(), 'info', 'exclude'));
   const ex = read(exclude) || '';
   const lines = ex.split('\n');
   const rec = readSharedRecord();
@@ -1202,12 +1229,15 @@ function findSession(sessions, run, wtPath) {
 }
 const isLive = (s) => !!s && s.state === 'working';
 /**
- * The session a run's row shows. A starting run has no session id, so the one found by its worktree is the previous
- * run's unless it works: not shown, so the row offers no `claude attach` to a session that is over.
+ * The session a run's row shows. A starting run has no session id, so during the start grace the one found by its
+ * worktree is the previous run's unless it works: not shown, so the row offers no `claude attach` to a session that
+ * is over. After the grace the row is stalled, and the session found may be the new one that went idle before its
+ * first report (it asked something): shown, so it can be attached to.
  */
 function runSession(sessions, run, wtPath) {
   const s = findSession(sessions, run, wtPath);
-  return run && run.status === 'starting' && !isLive(s) ? undefined : s;
+  const young = run && Date.now() - Date.parse(run.at) < START_GRACE_MS;
+  return run && run.status === 'starting' && young && !isLive(s) ? undefined : s;
 }
 /** What to pass to `claude attach`: the session name when it is one word and unique, else the id. */
 const attachRef = (sessions, s) => (s.name && !/\s/.test(s.name) && sessions.filter((x) => x.name === s.name).length === 1 ? s.name : s.id);
