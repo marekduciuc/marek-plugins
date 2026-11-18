@@ -653,6 +653,75 @@ test('a tracked shared path is reported by worktree and autopilot-check only: st
   assert.match(check.check('shared paths').details, /src\/tracked\.js: tracked by git/);
 });
 
+/** Sets (or, for '', removes) the `shared paths:` line of stack.md and commits. */
+function declare(dir, g, paths) {
+  const f = path.join(dir, '.tdd-flow/stack.md');
+  const rest = fs.readFileSync(f, 'utf8').split('\n').filter((l) => l && !l.startsWith('shared paths:'));
+  fs.writeFileSync(f, [...rest, ...(paths ? [`shared paths: ${paths}`] : [])].join('\n') + '\n');
+  g('commit', '-qam', `shared paths: ${paths || 'none'}`);
+}
+const excludeLines = (dir) => fs.readFileSync(path.join(dir, '.git/info/exclude'), 'utf8').split('\n');
+const isLink = (p) => { try { return fs.lstatSync(p).isSymbolicLink(); } catch { return false; } };
+
+test('a path removed from shared paths loses its exclude line and its links, in every worktree prepared afterwards', () => {
+  const { dir, write, g } = sharedRepo('storage, storage-old, storage/x'); // storage/x is dropped as nested
+  write('storage/PG_VERSION', '18\n');
+  fs.appendFileSync(path.join(dir, '.git/info/exclude'), '/mine\n/storage/keep\n');
+  const env = fakeClaude([]);
+  const wt = (slug) => run(dir, 'worktree', { slug }, env).result;
+  const a = wt('12-csv').path;
+  const b = wt('13-other').path;
+  assert.deepStrictEqual([isLink(path.join(a, 'storage')), isLink(path.join(b, 'storage')), isLink(path.join(b, 'storage-old'))], [true, true, true]);
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(path.join(dir, '.git/tdd-flow/shared-paths.json'), 'utf8')), { declared: ['storage', 'storage-old'], removed: [], excluded: ['storage', 'storage-old'] });
+
+  declare(dir, g, 'storage-old');
+  assert.deepStrictEqual(wt('12-csv').notes, ['removed the link storage (no longer a shared path)']);
+  assert.ok(!fs.existsSync(path.join(a, 'storage')));
+  assert.strictEqual(isLink(path.join(a, 'storage-old')), true);
+  assert.strictEqual(fs.readFileSync(path.join(dir, 'storage/PG_VERSION'), 'utf8'), '18\n');
+  assert.ok(!excludeLines(dir).includes('/storage'));
+  for (const kept of ['/storage-old', '/storage/keep', '/mine']) assert.ok(excludeLines(dir).includes(kept), kept);
+  // The other worktree is cleaned when it is prepared next; then nothing is left to do.
+  assert.strictEqual(isLink(path.join(b, 'storage')), true);
+  assert.deepStrictEqual(wt('13-other').notes, ['removed the link storage (no longer a shared path)']);
+  assert.deepStrictEqual(wt('13-other').notes, []);
+  // Declared again: linked and excluded again.
+  declare(dir, g, 'storage, storage-old');
+  assert.deepStrictEqual(wt('12-csv').shared, [{ path: 'storage', linked: true }, { path: 'storage-old', linked: false }]);
+  assert.ok(excludeLines(dir).includes('/storage'));
+});
+
+test('cleanup leaves what it did not make: a missing path, a directory, a link elsewhere, a line of the user, a broken record', () => {
+  const { dir, write, g } = sharedRepo('storage');
+  write('storage/PG_VERSION', '18\n');
+  const env = fakeClaude([]);
+  const wt = () => run(dir, 'worktree', { slug: '12-csv' }, env);
+  const a = wt().result.path;
+  const at = path.join(a, 'storage');
+  // Declared while its exclude line was already there and not recorded: the user's line, kept when the path goes.
+  fs.appendFileSync(path.join(dir, '.git/info/exclude'), '/uploads\n');
+  declare(dir, g, 'storage, uploads');
+  wt();
+  declare(dir, g, '');
+  assert.deepStrictEqual(wt().result.notes, ['removed the link storage (no longer a shared path)', 'removed the link uploads (no longer a shared path)']);
+  assert.ok(excludeLines(dir).includes('/uploads'));
+  assert.ok(!excludeLines(dir).includes('/storage'));
+  // Nothing at the path, a directory with data, a link elsewhere: each call works and deletes nothing.
+  assert.deepStrictEqual(wt().result.notes, []);
+  fs.mkdirSync(at);
+  fs.writeFileSync(path.join(at, 'own'), 'x\n');
+  assert.deepStrictEqual([wt().ok, fs.readFileSync(path.join(at, 'own'), 'utf8')], [true, 'x\n']);
+  fs.rmSync(at, { recursive: true });
+  fs.symlinkSync(fs.mkdtempSync(path.join(os.tmpdir(), 'tdd-flow-other-')), at);
+  assert.deepStrictEqual([wt().ok, isLink(at)], [true, true]);
+  // A record that is not JSON counts as none.
+  const record = path.join(dir, '.git/tdd-flow/shared-paths.json');
+  fs.writeFileSync(record, 'not json');
+  declare(dir, g, 'storage-new');
+  assert.strictEqual(wt().ok, true);
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(record, 'utf8')), { declared: ['storage-new'], removed: [], excluded: ['storage-new'] });
+});
+
 test('removing a worktree leaves the shared data in the main checkout', () => {
   const { dir, write } = sharedRepo('storage/postgres');
   write('storage/postgres/PG_VERSION', '18\n');
