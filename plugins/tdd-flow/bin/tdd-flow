@@ -1589,6 +1589,72 @@ async function baseSuiteCheck(base, runnable, stack, isBaseStale) {
  * --parallel}. Output: {ok (no check failed), parallel, testsNeed, checks: [{name, status ok|warn|fail|skipped|running, details, fix?}]},
  * plus `again` while the base suite still runs.
  */
+const COMPOSE_FILE = /^(docker-)?compose[^/]*\.ya?ml$/;
+
+/**
+ * The relative bind mounts of every tracked compose file, read line by line (the plugin has no YAML parser):
+ * [{file, pinned, sources, unresolved}]. `pinned`: the compose project in that directory has a fixed name (a top-level
+ * `name:`, a `container_name:` in any compose file there, or COMPOSE_PROJECT_NAME in its .env), so a session starting
+ * it from a worktree replaces the project's containers. `sources` are repo paths; `unresolved` the sources a line scan
+ * cannot resolve (`${...}`, a flow-style `volumes: [...]`).
+ */
+function composeBindMounts(root) {
+  const files = gitOut('ls-files', '--full-name', '--', ':/').split('\n').filter((f) => COMPOSE_FILE.test(path.posix.basename(f)));
+  const read1 = (f) => read(path.join(root, f)) || '';
+  const pinnedDirs = new Set(files.filter((f) => /^name\s*:/m.test(read1(f)) || /^\s+container_name\s*:/m.test(read1(f))).map((f) => path.posix.dirname(f)));
+  const envPinned = (dir) => /^\s*COMPOSE_PROJECT_NAME\s*=/m.test(read(path.join(root, dir, '.env')) || '');
+  return files.map((file) => {
+    const dir = path.posix.dirname(file);
+    const sources = [], unresolved = [];
+    let volIndent = -1;
+    for (const line of read1(file).split(/\r?\n/)) {
+      if (!line.trim() || /^\s*#/.test(line)) continue;
+      const indent = line.match(/^\s*/)[0].length;
+      if (volIndent >= 0 && indent <= volIndent) volIndent = -1;
+      const vol = line.match(/^(\s*)volumes\s*:\s*(.*)$/);
+      if (vol) {
+        if (vol[2].startsWith('[')) unresolved.push(`volumes: ${vol[2]}`);
+        else if (!vol[2]) volIndent = vol[1].length;
+        continue;
+      }
+      if (volIndent < 0) continue;
+      const m = line.match(/^\s*-\s*["']?([^"'\s]+)/) || line.match(/^\s*source\s*:\s*["']?([^"'\s]+)/);
+      if (!m || /^\s*-\s*\w+\s*:\s/.test(line)) continue; // `- type: bind` opens a long-syntax entry
+      const src = m[1].startsWith('${') ? m[1] : m[1].split(':')[0];
+      if (src.includes('${')) { unresolved.push(src); continue; }
+      if (!/^\.\.?(\/|$)/.test(src)) continue; // a named volume or an absolute host path
+      const p = path.posix.normalize(path.posix.join(dir, src));
+      if (p !== '..' && !p.startsWith('../')) sources.push(normalizeRepoPath(p));
+    }
+    return { file, pinned: pinnedDirs.has(dir) || envPinned(dir), sources, unresolved };
+  });
+}
+
+/**
+ * Pre-flight check of the shared paths: a rejected declared path, or a relative bind mount of a pinned compose project
+ * that no shared path covers, fails (a session that starts it from its worktree would replace the project's container
+ * with one on the worktree's copy of the data). A source the line scan cannot resolve warns. null when there is no
+ * pinned compose file and nothing is declared.
+ */
+function sharedPathsCheck(root, shared, errors) {
+  if (errors.length) return { name: 'shared paths', status: 'fail', details: errors.join('; '), fix: 'fix or remove the entry in `shared paths:` of .tdd-flow/stack.md' };
+  const pinned = composeBindMounts(root).filter((c) => c.pinned);
+  if (!pinned.length && !shared.length) return null;
+  const covered = (src) => shared.some((p) => src === p || src.startsWith(`${p}/`));
+  const missing = pinned.flatMap((c) => c.sources.filter((s) => !covered(s)).map((s) => ({ file: c.file, s })));
+  if (missing.length) {
+    const add = [...shared, ...[...new Set(missing.map((m) => m.s))].sort()];
+    return {
+      name: 'shared paths', status: 'fail',
+      details: `${missing.map((m) => `${m.file} mounts ${m.s}`).join(', ')} with a fixed container or project name: a session starting it from its worktree would replace the project's container with one on the worktree's copy`,
+      fix: `add \`shared paths: ${add.join(', ')}\` to .tdd-flow/stack.md (then every worktree links these paths to the main checkout)`,
+    };
+  }
+  const unresolved = pinned.flatMap((c) => c.unresolved.map((u) => `${c.file}: ${u}`));
+  if (unresolved.length) return { name: 'shared paths', status: 'warn', details: `cannot tell where these mounts point: ${unresolved.join(', ')}; if one is inside the repo, add it to \`shared paths:\` in .tdd-flow/stack.md` };
+  return { name: 'shared paths', status: 'ok', details: shared.length ? `worktrees share ${shared.join(', ')}` : 'no pinned compose file mounts a repo path' };
+}
+
 async function autopilotCheck(inp) {
   const root = mainRoot();
   const base = baseBranch();
@@ -1624,9 +1690,15 @@ async function autopilotCheck(inp) {
   const suiteCheck = await baseSuiteCheck(base, runnable, stack, fresh.status === 'fail');
   checks.push(suiteCheck);
 
-  const parallel = inp.parallel || (outside ? 1 : PARALLEL_DEFAULT);
-  if (outside && !inp.parallel) checks.push({ name: 'parallel', status: 'ok', details: `1 at a time, because the tests need ${need}; pass --parallel N to run more` });
-  else if (outside && parallel > 1) checks.push({ name: 'parallel', status: 'warn', details: `${parallel} at a time although the tests need ${need}: their tests may collide` });
+  const shared = stack ? stack.sharedPaths : [];
+  const sharedCheck = sharedPathsCheck(root, shared, stack ? stack.sharedPathErrors : []);
+  if (sharedCheck) checks.push(sharedCheck);
+
+  // Outside state the sessions share: what the tests need, and the shared paths' data.
+  const why = [outside && `the tests need ${need}`, shared.length && `worktrees share ${shared.join(', ')}`].filter(Boolean).join(' and ');
+  const parallel = inp.parallel || (why ? 1 : PARALLEL_DEFAULT);
+  if (why && !inp.parallel) checks.push({ name: 'parallel', status: 'ok', details: `1 at a time, because ${why}; pass --parallel N to run more` });
+  else if (why && parallel > 1) checks.push({ name: 'parallel', status: 'warn', details: `${parallel} at a time although ${why}: their tests may collide` });
   else checks.push({ name: 'parallel', status: 'ok', details: `${parallel} at a time` });
 
   // While the base suite still runs, the identical call continues it; until then the checks are not ok.

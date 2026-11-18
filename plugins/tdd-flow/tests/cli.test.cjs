@@ -1280,6 +1280,68 @@ test('autopilot-check: tests that need Docker check the engine and run one spec 
   assert.match(bad.error, /parallel must be a positive whole number/);
 });
 
+/** autopilot-check on a tracked repo with the given stack.md extra lines and tracked files ({path: text}), committed. */
+function composeCheck(stackLines, files, input = { runnable: 1 }) {
+  const { dir, write, g } = trackedRepo();
+  write('.tdd-flow/stack.md', `test command (all): \`node -e 0\`\ntests need: none\n${stackLines}`);
+  for (const [p, text] of Object.entries(files)) write(p, text);
+  g('add', '-A');
+  g('commit', '-qm', 'compose');
+  return autopilotCheck(dir, input, { settings: { permissions: { defaultMode: 'auto' } }, env: { TDD_FLOW_DOCKER_BIN: fakeBin('docker', 'exit 0') } });
+}
+const PINNED_DB = 'services:\n  db:\n    image: postgres:18\n    container_name: app-db\n    volumes:\n      - ./storage/postgres:/var/lib/postgresql/data\n';
+
+test('autopilot-check: a pinned compose file must not bind-mount an undeclared relative path', () => {
+  const missing = composeCheck('', { 'docker-compose.yml': PINNED_DB });
+  assert.deepStrictEqual([missing.ok, missing.check('shared paths').status], [false, 'fail']);
+  assert.match(missing.check('shared paths').details, /docker-compose\.yml.*storage\/postgres/);
+  assert.match(missing.check('shared paths').fix, /`shared paths: storage\/postgres`/);
+  const declared = composeCheck('shared paths: storage/postgres\n', { 'docker-compose.yml': PINNED_DB });
+  assert.deepStrictEqual([declared.ok, declared.check('shared paths').status], [true, 'ok']);
+  const parent = composeCheck('shared paths: storage\n', { 'docker-compose.yml': PINNED_DB });
+  assert.deepStrictEqual([parent.ok, parent.check('shared paths').status], [true, 'ok']);
+});
+
+test('autopilot-check: top-level name, long bind syntax, a subdirectory, an override file and short-syntax variants are read', () => {
+  const r = composeCheck('', {
+    'compose.yaml': 'name: app\nservices:\n  web:\n    volumes:\n      - type: bind\n        source: ./data\n        target: /data\n      - "./a:/x"\n      - ./b:/x:ro\n      - ./c\n',
+    'compose.override.yml': 'services:\n  web:\n    volumes:\n      - ./d:/d\n',
+    'docker/compose.yml': 'services:\n  db:\n    container_name: db\n    volumes:\n      - ../storage/postgres:/data\n',
+    'svc/docker-compose.yml': 'services:\n  q:\n    volumes:\n      - ./e:/e\n',
+    'svc/.env': 'COMPOSE_PROJECT_NAME=svc\n',
+  });
+  assert.strictEqual(r.check('shared paths').status, 'fail');
+  assert.match(r.check('shared paths').fix, /`shared paths: a, b, c, d, data, storage\/postgres, svc\/e`/);
+});
+
+test('autopilot-check: an unpinned compose file, named volumes and absolute host paths pass with nothing declared', () => {
+  const r = composeCheck('', {
+    'docker-compose.yml': 'services:\n  db:\n    volumes:\n      - ./storage/postgres:/data\n',
+    'infra/compose.yml': 'services:\n  db:\n    container_name: db\n    volumes:\n      - pgdata:/var/lib/x\n      - /srv/x:/x\nvolumes:\n  pgdata:\n',
+  });
+  assert.strictEqual(r.ok, true);
+  assert.ok(!r.check('shared paths') || r.check('shared paths').status === 'ok');
+});
+
+test('autopilot-check: a ${VAR} source or an unreadable volumes value warns; a rejected declared path fails', () => {
+  const vars = composeCheck('', { 'docker-compose.yml': 'services:\n  db:\n    container_name: db\n    volumes:\n      - ${DATA_DIR}:/data\n' });
+  assert.deepStrictEqual([vars.ok, vars.check('shared paths').status], [true, 'warn']);
+  assert.match(vars.check('shared paths').details, /\$\{DATA_DIR\}/);
+  const flow = composeCheck('', { 'docker-compose.yml': 'services:\n  db:\n    container_name: db\n    volumes: ["./x:/x"]\n' });
+  assert.deepStrictEqual([flow.ok, flow.check('shared paths').status], [true, 'warn']);
+  const bad = composeCheck('shared paths: /srv/x\n', {});
+  assert.deepStrictEqual([bad.ok, bad.check('shared paths').status], [false, 'fail']);
+  assert.match(bad.check('shared paths').details, /shared path \/srv\/x: absolute/);
+});
+
+test('autopilot-check: shared paths run one spec at a time unless --parallel is passed', () => {
+  const one = composeCheck('shared paths: storage/postgres\n', {});
+  assert.strictEqual(one.parallel, 1);
+  assert.match(one.check('parallel').details, /^1 at a time, because worktrees share storage\/postgres/);
+  const two = composeCheck('shared paths: storage/postgres\n', {}, { runnable: 1, parallel: 2 });
+  assert.deepStrictEqual([two.parallel, two.check('parallel').status], [2, 'warn']);
+});
+
 test('autopilot-check: base suite runs once for two or more specs on a clean base checkout', () => {
   const { dir, write, g } = trackedRepo();
   const suite = (runnable) => autopilotCheck(dir, { runnable }, { settings: { permissions: { defaultMode: 'auto' } } });
