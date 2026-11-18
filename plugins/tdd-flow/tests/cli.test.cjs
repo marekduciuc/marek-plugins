@@ -1334,6 +1334,39 @@ test('autopilot-check: a ${VAR} source or an unreadable volumes value warns; a r
   assert.match(bad.check('shared paths').details, /shared path \/srv\/x: absolute/);
 });
 
+test('autopilot-check: tracked mounts and the repo root are code, not data; a placeholder-only data directory warns', () => {
+  const r = composeCheck('', {
+    'docker-compose.yml': 'services:\n  db:\n    container_name: db\n    volumes:\n      - ./nginx.conf:/etc/nginx/nginx.conf:ro\n      - .:/app\n      - ./db/init:/docker-entrypoint-initdb.d\n      - ./data/pg:/var/lib/postgresql/data\n',
+    'nginx.conf': 'events {}\n', 'db/init/01.sql': 'select 1;\n', 'data/pg/.gitkeep': '',
+  });
+  assert.deepStrictEqual([r.ok, r.check('shared paths').status], [true, 'warn']);
+  assert.match(r.check('shared paths').details, /data\/pg holds only tracked placeholders.*git rm --cached/);
+  assert.doesNotMatch(r.check('shared paths').details, /nginx\.conf|db\/init/);
+});
+
+test('autopilot-check: a list at the indent of volumes:, a long entry starting with source:, and a compose file in a subdirectory are read', () => {
+  const r = composeCheck('', {
+    'docker-compose.yml': 'services:\n  db:\n    container_name: db\n    volumes:\n    - ./storage/postgres:/var/lib/postgresql/data\n    - source: ./storage/uploads\n      type: bind\n      target: /u\n',
+    'infra/compose.yaml': 'services:\n  cache:\n    volumes:\n      - ./redis:/data\n', // project name "infra" in every worktree
+  });
+  assert.strictEqual(r.check('shared paths').status, 'fail');
+  assert.match(r.check('shared paths').fix, /`shared paths: infra\/redis, storage\/postgres, storage\/uploads`/);
+});
+
+test('shared paths inside another one are dropped; backticks are stripped; a path with spaces or parentheses is rejected', () => {
+  const { dir, write } = sharedRepo('`storage`, `storage/postgres`');
+  write('storage/postgres/PG_VERSION', '18\n');
+  const r = run(dir, 'worktree', { slug: '12-csv' }, fakeClaude([]));
+  assert.strictEqual(r.ok, true, r.error);
+  assert.deepStrictEqual(r.result.shared, [{ path: 'storage', linked: true }]);
+  assert.strictEqual(fs.lstatSync(path.join(dir, 'storage/postgres')).isDirectory(), true); // the main checkout is untouched
+  assert.strictEqual(fs.readFileSync(path.join(r.result.path, 'storage/postgres/PG_VERSION'), 'utf8'), '18\n');
+  const bad = sharedRepo('storage/postgres (database data)');
+  assert.match(run(bad.dir, 'worktree', { slug: '12-csv' }, fakeClaude([])).error, /shared path storage\/postgres \(database data\): not a plain path/);
+  const nested = composeCheck('', { 'docker-compose.yml': 'services:\n  db:\n    container_name: db\n    volumes:\n      - ./storage:/s\n      - ./storage/postgres:/p\n' });
+  assert.match(nested.check('shared paths').fix, /`shared paths: storage`/);
+});
+
 test('autopilot-check: shared paths run one spec at a time unless --parallel is passed', () => {
   const one = composeCheck('shared paths: storage/postgres\n', {});
   assert.strictEqual(one.parallel, 1);

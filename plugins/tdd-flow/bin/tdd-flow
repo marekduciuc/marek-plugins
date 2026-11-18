@@ -134,17 +134,24 @@ function sharedPathError(p) {
   return '';
 }
 
-/** `shared paths:` of stack.md as {paths, errors}: normalized, without duplicates; rejected entries go to errors as `shared path <p>: <reason>`. */
+/** Paths without duplicates and without any that lie inside another one (the outer link covers them). */
+const outermost = (paths) => [...new Set(paths)].filter((p, _, all) => !all.some((q) => q !== p && p.startsWith(`${q}/`)));
+
+/**
+ * `shared paths:` of stack.md as {paths, errors}: backticks stripped, normalized, outermost only; rejected entries go
+ * to errors as `shared path <p>: <reason>`.
+ */
 function sharedPaths(field) {
   if (none(field)) return { paths: [], errors: [] };
   const paths = [], errors = [];
-  for (const raw of field.split(',').map((s) => s.trim()).filter(Boolean)) {
+  for (const raw of field.split(',').map((s) => s.trim().replace(/^`+|`+$/g, '').trim()).filter(Boolean)) {
+    if (/[\s()]/.test(raw)) { errors.push(`shared path ${raw}: not a plain path (no spaces or notes)`); continue; }
     const p = path.posix.isAbsolute(raw) || raw.split('/').includes('..') ? raw : normalizeRepoPath(raw);
     const why = sharedPathError(p);
     if (why) errors.push(`shared path ${raw}: ${why}`);
-    else if (!paths.includes(p)) paths.push(p);
+    else paths.push(p);
   }
-  return { paths, errors };
+  return { paths: outermost(paths), errors };
 }
 
 /**
@@ -158,6 +165,10 @@ function linkShared(root, wtPath, paths) {
     const target = path.join(root, p);
     if (!fs.existsSync(target)) { fs.mkdirSync(target, { recursive: true }); notes.push(`created ${p} in the main checkout`); }
     const at = path.join(wtPath, p);
+    // Through a linked parent, `at` would be the main checkout's own path.
+    for (let up = path.dirname(at); up.length > wtPath.length; up = path.dirname(up)) {
+      if (fs.lstatSync(up, { throwIfNoEntry: false })?.isSymbolicLink()) throw new Error(`${path.relative(wtPath, up)} in the worktree is a link, so ${p} cannot be linked inside it; share ${path.relative(wtPath, up)} instead`);
+    }
     let st = null;
     try { st = fs.lstatSync(at); } catch { /* missing */ }
     if (st && st.isSymbolicLink()) {
@@ -1602,7 +1613,8 @@ function composeBindMounts(root) {
   const files = gitOut('ls-files', '--full-name', '--', ':/').split('\n').filter((f) => COMPOSE_FILE.test(path.posix.basename(f)));
   const read1 = (f) => read(path.join(root, f)) || '';
   const pinnedDirs = new Set(files.filter((f) => /^name\s*:/m.test(read1(f)) || /^\s+container_name\s*:/m.test(read1(f))).map((f) => path.posix.dirname(f)));
-  const envPinned = (dir) => /^\s*COMPOSE_PROJECT_NAME\s*=/m.test(read(path.join(root, dir, '.env')) || '');
+  // A compose file in a subdirectory: the project is named after that directory, the same in every worktree.
+  const envPinned = (dir) => dir !== '.' || /^\s*COMPOSE_PROJECT_NAME\s*=/m.test(read(path.join(root, dir, '.env')) || '');
   return files.map((file) => {
     const dir = path.posix.dirname(file);
     const sources = [], unresolved = [];
@@ -1610,7 +1622,8 @@ function composeBindMounts(root) {
     for (const line of read1(file).split(/\r?\n/)) {
       if (!line.trim() || /^\s*#/.test(line)) continue;
       const indent = line.match(/^\s*/)[0].length;
-      if (volIndent >= 0 && indent <= volIndent) volIndent = -1;
+      // A list may sit at the indent of `volumes:` itself (the style of `docker compose config` and yq).
+      if (volIndent >= 0 && (indent < volIndent || (indent === volIndent && !/^\s*-/.test(line)))) volIndent = -1;
       const vol = line.match(/^(\s*)volumes\s*:\s*(.*)$/);
       if (vol) {
         if (vol[2].startsWith('[')) unresolved.push(`volumes: ${vol[2]}`);
@@ -1618,8 +1631,10 @@ function composeBindMounts(root) {
         continue;
       }
       if (volIndent < 0) continue;
-      const m = line.match(/^\s*-\s*["']?([^"'\s]+)/) || line.match(/^\s*source\s*:\s*["']?([^"'\s]+)/);
-      if (!m || /^\s*-\s*\w+\s*:\s/.test(line)) continue; // `- type: bind` opens a long-syntax entry
+      const entry = line.match(/^\s*-\s*(\w+)\s*:\s+["']?([^"'\s]*)/); // `- type: bind` opens a long-syntax entry
+      const m = entry ? (entry[1] === 'source' ? [null, entry[2]] : null)
+        : line.match(/^\s*-\s*["']?([^"'\s]+)/) || line.match(/^\s*source\s*:\s*["']?([^"'\s]+)/);
+      if (!m) continue;
       const src = m[1].startsWith('${') ? m[1] : m[1].split(':')[0];
       if (src.includes('${')) { unresolved.push(src); continue; }
       if (!/^\.\.?(\/|$)/.test(src)) continue; // a named volume or an absolute host path
@@ -1641,9 +1656,19 @@ function sharedPathsCheck(root, shared, errors) {
   const pinned = composeBindMounts(root).filter((c) => c.pinned);
   if (!pinned.length && !shared.length) return null;
   const covered = (src) => shared.some((p) => src === p || src.startsWith(`${p}/`));
-  const missing = pinned.flatMap((c) => c.sources.filter((s) => !covered(s)).map((s) => ({ file: c.file, s })));
+  // A tracked mount (config, init scripts, the repo root) is code: each worktree mounts its own copy, as it should. A
+  // directory whose only tracked files are placeholders holds data, but cannot be shared while git tracks them.
+  const placeholders = [];
+  const isData = (src) => {
+    if (src === '.') return false;
+    const tracked = gitOut('ls-files', '--full-name', '--', `:/${src}`).split('\n').filter(Boolean);
+    if (!tracked.length) return true;
+    if (tracked.every((f) => ['.gitkeep', '.keep', '.gitignore'].includes(path.posix.basename(f)))) placeholders.push(src);
+    return false;
+  };
+  const missing = pinned.flatMap((c) => c.sources.filter((s) => !covered(s) && isData(s)).map((s) => ({ file: c.file, s })));
   if (missing.length) {
-    const add = [...shared, ...[...new Set(missing.map((m) => m.s))].sort()];
+    const add = outermost([...shared, ...missing.map((m) => m.s)].sort());
     return {
       name: 'shared paths', status: 'fail',
       details: `${missing.map((m) => `${m.file} mounts ${m.s}`).join(', ')} with a fixed container or project name: a session starting it from its worktree would replace the project's container with one on the worktree's copy`,
@@ -1651,7 +1676,11 @@ function sharedPathsCheck(root, shared, errors) {
     };
   }
   const unresolved = pinned.flatMap((c) => c.unresolved.map((u) => `${c.file}: ${u}`));
-  if (unresolved.length) return { name: 'shared paths', status: 'warn', details: `cannot tell where these mounts point: ${unresolved.join(', ')}; if one is inside the repo, add it to \`shared paths:\` in .tdd-flow/stack.md` };
+  const warns = [
+    ...[...new Set(placeholders)].map((p) => `${p} holds only tracked placeholders, so a worktree session mounts its own empty copy: \`git rm --cached\` them, then add ${p} to \`shared paths:\``),
+    ...(unresolved.length ? [`cannot tell where these mounts point: ${unresolved.join(', ')}; if one is inside the repo, add it to \`shared paths:\` in .tdd-flow/stack.md`] : []),
+  ];
+  if (warns.length) return { name: 'shared paths', status: 'warn', details: warns.join('; ') };
   return { name: 'shared paths', status: 'ok', details: shared.length ? `worktrees share ${shared.join(', ')}` : 'no pinned compose file mounts a repo path' };
 }
 
