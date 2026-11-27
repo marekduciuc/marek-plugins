@@ -1936,6 +1936,41 @@ test('decisions parses resolved questions with continuation lines, skips malform
   assert.match(run(dir, 'decisions', { slug: '../x' }).error, /invalid feature slug/);
 });
 
+test('decisions leaves out the answers a background session decided itself', () => {
+  const { dir, g, write } = trackedRepo();
+  write('.tdd-flow/features/a-export/spec.md', decidedSpec('CSV export', [
+    '- Q-1 Delimiter? - **Answer:** semicolon (03.11.2026) → AC-1',
+    '- Q-2 How are T-2 and T-3 cut? - **Answer:** decided by the session: merge T-2 and T-3 (04.11.2026) → T-2',
+    '  Not taken: keep both and weaken the test.',
+  ].join('\n')));
+  g('add', '.tdd-flow');
+  g('commit', '-qm', 'spec with a session decision');
+  const r = run(dir, 'decisions', {});
+  assert.strictEqual(r.ok, true, r.error);
+  assert.deepStrictEqual(r.result.decisions.filter((d) => d.slug === 'a-export').map((d) => d.id), ['Q-1']);
+  assert.strictEqual(r.result.skippedLines, 0);
+});
+
+test('context with a feature reads the requirement from the spec Source and keeps the folder slug', () => {
+  const { dir, g, write } = trackedRepo();
+  write('docs/req.md', '# CSV export renamed\n\nUsers export a report.\n');
+  write('.tdd-flow/features/a-export/spec.md', decidedSpec('CSV export', '- Q-1 Delimiter? - **Answer:** semicolon (03.11.2026) → AC-1').replace('- Slug: x', '- Source: docs/req.md\n- Slug: a-export'));
+  write('.tdd-flow/features/b-text/spec.md', decidedSpec('From a prompt', '').replace('- Slug: x', '- Source: prompt\n- Slug: b-text'));
+  g('add', '.tdd-flow', 'docs');
+  g('commit', '-qm', 'specs');
+  const r = run(dir, 'context', { feature: 'a-export' });
+  assert.strictEqual(r.ok, true, r.error);
+  assert.deepStrictEqual(r.result.spec, { slug: 'a-export', title: 'CSV export', status: 'approved', source: 'docs/req.md' });
+  assert.deepStrictEqual([r.result.req.slug, r.result.req.text], ['a-export', '# CSV export renamed\n\nUsers export a report.\n']);
+  assert.ok(!r.result.otherSpecs.some((s) => s.slug === 'a-export'));
+  assert.deepStrictEqual(r.result.decisions.map((d) => d.slug), []);
+  // A spec written from prompt text has no requirement to fetch.
+  const t = run(dir, 'context', { feature: 'b-text' }).result;
+  assert.deepStrictEqual([t.spec.source, t.req], ['prompt', undefined]);
+  assert.match(run(dir, 'context', { feature: 'missing' }).error, /no spec at/);
+  assert.match(run(dir, 'context', { feature: '../x' }).error, /invalid feature slug/);
+});
+
 test('decisions prefers the worktree copy, reads feature/* branches, and works from a worktree', () => {
   const { dir, g, wt } = withWorktree();
   // A spec that exists only on its branch (spec-branch / an interactive run).

@@ -1153,8 +1153,22 @@ function kebab(s, max = 40) {
  * the other specs (a digest each) with their decisions.
  */
 function context(inp) {
-  const res = requirementContext(inp);
-  const others = allSpecs(res.req ? res.req.slug : null);
+  // {feature}: an existing spec is checked again (analyze-requirements, mode "recheck"). The requirement is fetched
+  // from the spec's Source line, and the slug is the spec folder, not one computed from a title that may have changed.
+  let res;
+  if (inp.feature != null) {
+    const slug = checkSlug(inp.feature);
+    const spec = read(`${featureDir(slug)}/spec.md`);
+    if (spec == null) throw new Error(`no spec at ${featureDir(slug)}/spec.md`);
+    const p = parseSpec(spec);
+    // A spec written from prompt text says `Source: prompt`: nothing to fetch, and no file of that name is read.
+    res = requirementContext({ input: /^prompt$/i.test(p.source) ? '' : p.source });
+    if (res.req) res.req.slug = slug;
+    res.spec = { slug, title: specTitle(spec), status: p.status || 'none', source: p.source || 'prompt' };
+  } else {
+    res = requirementContext(inp);
+  }
+  const others = allSpecs(res.spec ? res.spec.slug : res.req ? res.req.slug : null);
   return { ...res, otherSpecs: others.map(specDigest), decisions: collectDecisions(others).decisions };
 }
 
@@ -1333,6 +1347,8 @@ function allSpecs(skip) {
 // `- Q-<n> <question> - **Answer:** <answer> (<dd.MM.yyyy>) → <where>` (format of skills/resolve-questions).
 const DECISION_LINE = /^[-*]\s+(Q-\d+)\s+(.+?)\s+-\s+\*\*Answer:\*\*\s+(.+)\s+\((\d{2}\.\d{2}\.\d{4})\)\s*→\s*(.+)$/;
 
+const SESSION_ANSWER = /^decided by the session:/i;
+
 /** Entries of `## Resolved questions`; an indented line continues the entry above it. Lines that do not parse are counted. */
 function parseDecisions(spec) {
   const entries = [];
@@ -1360,7 +1376,8 @@ function collectDecisions(found) {
     const p = parseDecisions(s.text);
     skippedLines += p.skipped;
     const title = specTitle(s.text);
-    for (const d of p.decisions) decisions.push({ slug: s.slug, title, ...d });
+    // A plan question a background session answered itself (skills/implement-spec) is no precedent for other specs.
+    for (const d of p.decisions) if (!SESSION_ANSWER.test(d.answer)) decisions.push({ slug: s.slug, title, ...d });
   }
   return { decisions, conflicts: [], skippedLines };
 }
