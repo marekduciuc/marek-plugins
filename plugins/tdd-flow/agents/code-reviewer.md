@@ -1,7 +1,7 @@
 ---
 name: code-reviewer
 description: |
-  Use this agent to review a completed task or feature diff against its spec for correctness, test quality, security and maintainability. Read-only. Dispatched by the tdd-implement workflow after each task (including setup tasks) and before deploy.
+  Use this agent to review a completed task or feature diff against its spec for correctness, test quality, security and maintainability. Read-only. Dispatched by the tdd-implement workflow after each task (including setup tasks), and by the implement-spec and ship-feature skills for the final branch review when the built-in code review is not available.
 
   <example>
   Context: All cycles for task T-2 are green

@@ -1,12 +1,11 @@
 export const meta = {
   name: 'deploy',
-  description: 'Ship a tdd-flow feature through CI/CD: multi-lens verified review, PR, CI watch with fix loop; merge/release only with explicit approval',
-  whenToUse: 'mode "pr" (default): review + open PR + get CI green, then stop for approval. mode "merge" with approved:true (optional requireReview:true): check PR review status, merge, optional release, watch post-merge pipeline',
+  description: 'Ship a tdd-flow feature through CI/CD: open the PR; merge/release only with explicit approval and green CI',
+  whenToUse: 'mode "pr" (default): push and open the PR, then stop (review the branch with /code-review before, watch the PR with /steward after). mode "merge" with approved:true (optional requireReview:true): check PR review status and CI, merge, optional release, watch post-merge pipeline',
   phases: [
     { title: 'Preflight', detail: 'tasks, CLI auth, CI present' },
-    { title: 'Review', detail: '3 review lenses, adversarially verified' },
     { title: 'PR', detail: 'commit hygiene, push, open PR' },
-    { title: 'CI', detail: 'watch checks, fix and re-push (max 2 rounds)' },
+    { title: 'CI', detail: 'checks of the PR must pass before the merge' },
     { title: 'Merge', detail: 'review status check, approved merge/release, post-merge pipeline' },
   ],
 }
@@ -20,7 +19,9 @@ const strs = { type: 'array', items: { type: 'string' } }
 const M = Object.assign({ worker: 'sonnet', strong: 'opus', light: 'haiku' }, (typeof args === 'object' && args && args.models) || {})
 // Agent limits. Override per run with args {maxAgents, maxParallel} (positive integers).
 const posInt = (v, d) => (Number.isInteger(v) && v > 0 ? v : d)
-const MAX_AGENTS = posInt(opt.maxAgents, 20)
+// 10: mode "pr" needs preflight, secret scan and PR. Mode "merge" on GitHub, each CLI call with its relay retry:
+// preflight 2, pre-merge CI watch 2, merge 1, post-merge watch 2 and its cause 1, close-out 2.
+const MAX_AGENTS = posInt(opt.maxAgents, 10)
 const MAX_PARALLEL = posInt(opt.maxParallel, 2)
 const LIMIT = `tdd-flow: agent limit (${MAX_AGENTS}) reached`
 let spawned = 0, active = 0, limitHit = false
@@ -34,7 +35,6 @@ async function run(prompt, o) {
   else await new Promise(r => waiting.push(r))
   try { return await agent(prompt, o) } finally { if (waiting.length) waiting.shift()(); else active-- }
 }
-const MAX_CI_ROUNDS = 2
 
 const PRE = {
   type: 'object',
@@ -46,12 +46,6 @@ const PRE = {
     reviewDecision: { type: 'string', enum: ['APPROVED', 'CHANGES_REQUESTED', 'REVIEW_REQUIRED', 'NONE'] },
   },
 }
-const FIND = {
-  type: 'object', required: ['findings'],
-  properties: { findings: { type: 'array', items: { type: 'object', required: ['severity', 'where', 'issue'], properties: {
-    severity: { type: 'string', enum: ['blocker', 'major', 'minor'] }, where: str, issue: str, fix: str } } } },
-}
-const VERDICT = { type: 'object', required: ['refuted', 'why'], properties: { refuted: { type: 'boolean' }, why: str } }
 const PR = { type: 'object', required: ['prUrl'], properties: { prUrl: str, branch: str, notes: str } }
 const CI = {
   type: 'object', required: ['status'],
@@ -140,7 +134,7 @@ try {
   if (!pre) throw new Error('tdd-flow: preflight failed.')
   if (!pre.cliReady) throw new Error(`tdd-flow: tracker CLI not ready. Run: ${pre.cliFix || 'gh auth login / az login'}`)
   if (pre.branch === pre.base) throw new Error(`tdd-flow: you are on ${pre.base}. Deploy works from a feature branch.`)
-  // An identity problem (none, or one git made up from the hostname) is shown, not fatal: deploy commits only CI fixes.
+  // An identity problem (none, or one git made up from the hostname) is shown, not fatal: deploy commits only the secret-scan workflow.
   const warnings = pre.warnings || []
   warnings.forEach(w => log(`warning: ${w}`))
 
@@ -171,6 +165,18 @@ try {
     if (opt.requireReview === true && pre.reviewDecision !== 'APPROVED') {
       return { status: 'review_required', prUrl: pre.existingPr, reviewDecision: pre.reviewDecision || 'NONE', next: 'requireReview is set and the PR has no approving review yet. Wait for approval, then run the merge again.' }
     }
+    // The PR run no longer waits for CI (the user's /steward does), so the merge checks it: pending checks are waited
+    // for, and a red or unfinished pipeline is not merged, also where branch protection requires no checks.
+    if (pre.hasCi) {
+      phase('CI')
+      const ci = await watchCi({ pr: pre.existingPr }, 'pre-merge CI',
+        `Action: watch-ci for PR ${pre.existingPr}. Poll until all checks finish or 30 minutes pass. On failure fetch the failing job log, classify the root cause (code | test | infra | flaky | unknown) and summarise it in 3-5 lines.`)
+      // No checks at all (the pipeline runs only on the base branch, or path filters skip this PR): nothing to wait for.
+      if (ci && ci.status === 'none') log('the PR has no checks - merging without a CI result')
+      else if (!ci || ci.status !== 'passed') {
+        return { status: 'ci_not_green', prUrl: pre.existingPr, ci: ci || { status: 'unknown', rootCause: 'the CI watch agent failed' }, next: 'The checks of the PR did not pass, so nothing was merged. Show the root cause to the user. A /steward watch on the PR fixes failing checks; or fix it with /tdd-flow:tdd-implement {findings}, push, and run the merge again.' }
+      }
+    }
     phase('Merge')
     const merged = await run(
       `Action: merge${opt.release ? ' then release' : ''}. approved: true. Feature ${pre.slug}, branch ${pre.branch} into ${pre.base}, PR ${pre.existingPr}.\n` +
@@ -196,43 +202,6 @@ try {
   // ======================= PR MODE =======================
   if (pre.openTasks.length && !opt.force) throw new Error(`tdd-flow: unticked tasks: ${pre.openTasks.join(', ')}. Finish /tdd-flow:tdd-implement or pass {force: true}.`)
 
-  // ---------- Review: 3 lenses -> dedupe (barrier) -> adversarial verify ----------
-  phase('Review')
-  const LENSES = [
-    { key: 'spec', ask: 'SPEC COVERAGE & CORRECTNESS: every AC in the spec has a test that would fail if the behaviour broke (ACs of [setup] tasks are covered by their verify command passing, or a manual check recorded in tdd-log.md, instead of a test); logic errors; unhandled edge cases listed in the spec.' },
-    { key: 'security', ask: 'SECURITY: injection, unsafe deserialisation, secrets in code or config, path traversal, missing authorisation, unsafe defaults.' },
-    { key: 'quality', ask: 'TEST QUALITY & MAINTAINABILITY: non-deterministic tests, tests asserting implementation details, dead code, duplication, convention violations.' },
-  ]
-  const lensResults = await parallel(LENSES.map(l => () => run(
-    `Final pre-merge review of branch ${pre.branch} vs ${pre.base} (\`git diff ${pre.base}...HEAD\`) for feature ${pre.slug} (spec: .tdd-flow/features/${pre.slug}/spec.md).\nLens: ${l.ask}\nReport only findings within this lens. Do not edit files.`,
-    { agentType: A('code-reviewer'), model: M.strong, schema: FIND, label: `review:${l.key}`, phase: 'Review' })))
-  if (limitHit) throw new Error(LIMIT)
-  const seen = new Set()
-  const candidates = lensResults.filter(Boolean).flatMap(r => r.findings)
-    .filter(f => f.severity !== 'minor')
-    .filter(f => { const k = (f.where + '|' + f.issue).toLowerCase().slice(0, 160); if (seen.has(k)) return false; seen.add(k); return true })
-  log(`${candidates.length} blocker/major candidate finding(s) to verify`)
-  // Verify only if the skeptics (2 per finding) plus PR and the first CI watch fit in the agent limit.
-  if (spawned + 2 * candidates.length + 2 > MAX_AGENTS) {
-    log(`Verifying ${candidates.length} finding(s) needs ${2 * candidates.length + 2} more agents; only ${MAX_AGENTS - spawned} left`)
-    limitHit = true
-    throw new Error(LIMIT)
-  }
-
-  const verified = await pipeline(candidates, f => parallel([1, 2].map(n => () => run(
-    `Skeptic #${n}: try to REFUTE this code-review finding on branch ${pre.branch} (diff vs ${pre.base}). Read the code; if possible write a quick throwaway check (do not commit it). Default to refuted=true if the finding is speculative.\nFinding: ${JSON.stringify(f)}`,
-    { schema: VERDICT, model: M.worker, label: `verify:${f.where}`.slice(0, 60), phase: 'Review', effort: 'medium' })))
-    .then(votes => ({ ...f, refutedBy: votes.filter(Boolean).filter(v => v.refuted).length })))
-  if (limitHit) throw new Error(LIMIT)
-  const confirmed = verified.filter(Boolean).filter(f => f.refutedBy < 2)
-  if (confirmed.length) {
-    return {
-      status: 'changes_requested',
-      findings: confirmed,
-      next: 'Show the findings to the user. To fix them test-first, run /tdd-flow:tdd-implement with {findings: <these findings>}, then /tdd-flow:deploy again.',
-    }
-  }
-
   // ---------- PR ----------
   phase('PR')
   let secretScan = pre.secretScan || 'not_github'
@@ -254,62 +223,24 @@ try {
   }[secretScan] || ''
   const pr = await run(
     `Action: prepare-pr. Feature ${pre.slug}, base ${pre.base}, issue ${pre.issueId || 'none'}.${pre.existingPr ? ' A PR already exists (' + pre.existingPr + '): push and update it instead of opening a new one.' : ''}\n` +
-    `PR body: summary from .tdd-flow/features/${pre.slug}/spec.md, linked issue (use "Closes #id" / "AB#id" as the tracker expects), ACs covered, test evidence from tdd-log.md, docs changed, risks. Final review found no blocker/major issues.${scanNote}`,
+    `PR body: summary from .tdd-flow/features/${pre.slug}/spec.md, linked issue (use "Closes #id" / "AB#id" as the tracker expects), ACs covered, test evidence from tdd-log.md, docs changed, risks.${scanNote}`,
     { agentType: A('release-engineer'), schema: PR, label: 'open PR', phase: 'PR' })
   if (!pr) throw new Error('tdd-flow: opening the PR failed.')
   log(`PR: ${pr.prUrl}`)
   if (!pre.hasCi) return { status: 'pr_open_no_ci', prUrl: pr.prUrl, ...(warnings.length ? { warnings } : {}), next: 'This repo has no CI pipeline, so deployment cannot be automated. Merge manually or add a pipeline.' }
 
-  // ---------- CI watch + fix loop ----------
-  phase('CI')
-  let ci = null
-  let rerunUsed = false
-  for (let round = 0; round <= MAX_CI_ROUNDS; round++) {
-    ci = await watchCi({ pr: pr.prUrl }, `watch CI ${round + 1}`,
-      `Action: watch-ci for PR ${pr.prUrl}. Poll until all checks finish or 30 minutes pass. On failure fetch the failing job log, classify the root cause (code | test | infra | flaky | unknown) and summarise it in 3-5 lines. Also read the pipeline definition and describe in one line what merging into ${pre.base} will trigger (onMerge), and report the PR review status (reviewDecision).`)
-    if (!ci) throw new Error('tdd-flow: CI watch agent failed.')
-    if (ci.status !== 'failed') break
-    if (round === MAX_CI_ROUNDS) break
-    if ((ci.category === 'infra' || ci.category === 'flaky') && !rerunUsed) {
-      rerunUsed = true
-      log(`CI failed (${ci.category}): re-running once`)
-      if (scripted) await cli('ci-rerun', { pr: pr.prUrl }, { type: 'object', properties: { rerun: strs, failed: strs } }, { label: 'rerun CI', phase: 'CI' })
-      else await run(`Re-run the failed jobs for PR ${pr.prUrl} (e.g. \`gh run rerun --failed\` / \`az pipelines run\`). Do not change code.`,
-        { agentType: A('release-engineer'), label: 'rerun CI', phase: 'CI', effort: 'low' })
-      continue
-    }
-    if (ci.category !== 'code' && ci.category !== 'test') break
-    log(`CI failed (${ci.category}) - fixing test-first, round ${round + 1}`)
-    const red = await run(
-      `RED step. CI failed on PR ${pr.prUrl}: job ${ci.failingJob}. Root cause: ${ci.rootCause}\n${ci.log ? 'Failed-step log (tail):\n' + ci.log + '\n' : ''}Write (or adjust setup for) a local test that reproduces this failure, and confirm it fails locally. If it cannot be reproduced locally, return result ERROR with why.`,
-      { agentType: A('test-writer'), schema: { type: 'object', required: ['result', 'reason'], properties: { result: { type: 'string', enum: ['FAIL', 'PASS', 'ERROR'] }, reason: str, testFile: str, testName: str } }, label: `CI repro ${round + 1}`, phase: 'CI' })
-    if (!red || red.result !== 'FAIL') break
-    const green = await run(
-      `GREEN step. Make the reproducing test ${red.testFile} :: ${red.testName} pass with a minimal production fix (never weaken tests) and run the full suite. Do not commit or push.`,
-      { agentType: A('implementer'), schema: { type: 'object', required: ['suitePass', 'summary', 'filesChanged'], properties: { suitePass: { type: 'boolean' }, summary: str, filesChanged: strs } }, label: `CI fix ${round + 1}`, phase: 'CI', model: round === 0 ? M.worker : M.strong })
-    if (!green || !green.suitePass) break
-    const fixCommit = await run(
-      `Action: commit. Message: "fix(${pre.slug}): ${ci.failingJob || 'CI failure'}". Push the branch after committing.\nFiles:\n${[red.testFile, ...green.filesChanged].join('\n')}`,
-      { agentType: A('release-engineer'), model: M.light, schema: COMMIT, label: `CI fix commit ${round + 1}`, phase: 'CI', effort: 'low' })
-    if (!fixCommit || !fixCommit.committed) { log(`CI fix commit failed: ${fixCommit ? fixCommit.reason : 'agent failed'}`); break }
-  }
 
-  if (!ci || ci.status !== 'passed') {
-    return {
-      status: 'ci_not_green', prUrl: pr.prUrl, ci, ...(warnings.length ? { warnings } : {}),
-      next: 'Show the CI root cause to the user and decide together (fix via /tdd-flow:tdd-implement with findings, re-run, or investigate).',
-    }
-  }
+  // No CI watch and no fix loop here: the built-in /steward watches a PR for up to 7 days and handles failing checks,
+  // conflicts and review comments. Only the user can start it, so the run ends with the PR open.
+  const prNumber = (pr.prUrl.match(/\/(?:pull|pullrequest|merge_requests)\/(\d+)/) || [])[1] || pr.prUrl
   return {
-    status: 'ready_to_merge',
+    status: 'pr_open',
     prUrl: pr.prUrl,
     ...(warnings.length ? { warnings } : {}),
-    ciRun: ci.runUrl,
-    onMerge: ci.onMerge,
-    reviewDecision: ci.reviewDecision || 'NONE',
-    reviewCandidatesRefuted: candidates.length,
+    reviewDecision: pre.reviewDecision || 'NONE',
     secretScan,
-    next: 'GATE: show PR URL, green CI, review status and what merging triggers. Only after the user explicitly approves, run /tdd-flow:deploy with {mode: "merge", approved: true' + (opt.release ? ', release: true' : '') + (opt.requireReview ? ', requireReview: true' : '') + '}.',
+    next: `The PR is open. Tell the user to type \`/steward ${prNumber}\` in a separate Claude Code session in this checkout (GitHub only; it watches the PR for up to 7 days, fixes failing checks, conflicts and review comments, and never merges). ` +
+      'GATE: only after the user explicitly approves the merge, run /tdd-flow:deploy with {mode: "merge", approved: true' + (opt.release ? ', release: true' : '') + (opt.requireReview ? ', requireReview: true' : '') + '}. It waits for the checks, merges only when they passed, and closes the spec out. A merge made on GitHub instead leaves the spec at "implemented".',
   }
 } catch (e) {
   if (!limitHit) throw e

@@ -1,6 +1,6 @@
 ---
 name: autopilot
-description: This skill should be used when the user runs /tdd-flow:autopilot, or asks to "implement all approved specs", "run the specs in parallel", "work through the open specs" or "implement every spec that is not implemented yet". It starts one background Claude session per approved tdd-flow spec, each in its own git worktree (tasks through tdd-implement, superpowers code review, pull request), runs several at once and reports the pull requests.
+description: This skill should be used when the user runs /tdd-flow:autopilot, or asks to "implement all approved specs", "run the specs in parallel", "work through the open specs" or "implement every spec that is not implemented yet". It starts one background Claude session per approved tdd-flow spec, each in its own git worktree (tasks through tdd-implement, code review, pull request), runs several at once and reports the pull requests.
 argument-hint: "[slug ...] [--parallel N]"
 ---
 
@@ -108,7 +108,7 @@ TDD_FLOW_JSON
 
 It returns when a run finishes or when a running spec ticks a task (`progressed`), with the current `progress`. Pass that `progress` to the next `runs-wait`. Run `runs-wait` itself as the background command: never wrap it in a shell loop or filter its result in the shell. Every return, `progressed` included, must come back to you, so the table is printed after each ticked task. Every time it exits, run `board` again (same slugs, `queued` updated) and print its `table`. Then read `finished`:
 
-- `done` → note the `prUrl`.
+- `done` → note the `prUrl`. For the summary, keep the PR number and the worktree: the user can have the PR watched with the built-in `/steward`, which only they can start.
 - `blocked` → note `details`. With a `decision`, the spec waits for the user's answer: see **Decisions** below.
 - `stalled` → the session went idle or disappeared without a report (it asked something or stopped early). Note its `attach` command (`runs-wait` gives the name, or the id when the name is ambiguous); do not restart it.
 
@@ -140,6 +140,8 @@ The final `board` table (it has the PR URL, or the reason and `claude attach <na
 - set `Status: approved` again (for an implemented spec, add a task for the answer as in **Decisions** step 3);
 - commit in the worktree;
 - run `/tdd-flow:autopilot <slug>`.
+
+For each spec with an open PR on GitHub, print how to have it watched: `(cd .claude/worktrees/<slug> && claude)`, then type `/steward <PR number>` there. The built-in `/steward` watches the PR for up to 7 days and fixes failing checks, conflicts and review comments; it never merges. It must run in the spec's worktree, where the branch is checked out, and only the user can start it.
 
 Then list the skipped specs (slug - reason) and the worktree of each blocked or stalled spec. Then:
 
