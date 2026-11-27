@@ -29,7 +29,25 @@ TDD_FLOW_JSON
    - update the acceptance criteria, edge cases, task table, `tasks.md` and the **Verify** commands the answer changes, as the autopilot's **Decisions** step 3 does (`skills/autopilot/SKILL.md`), and keep `Status: approved`;
    - commit only the spec folder: `git add .tdd-flow/features/<slug> && git commit -m "docs(<slug>): answer Q-<n> from <other-slug> Q-<m>"`;
    - set the uncommitted work of the blocked task aside (`tdd-flow set-aside` with `{"slug": "<slug>", "label": "reuse-Q-<n>"}`), then run the blocked task again (step 1, or the step that stopped). Keep the question, the answer and the source (`<other-slug> Q-<m>`) for the PR body.
-3. Report a decision only when no earlier decision fits, or when two fit and disagree (name both, with slug and Q id, in the question). A reused decision that blocks the same task a second time is reported as a decision too: say in the question which earlier decision was tried.
+3. When no earlier decision fits, see **Decide a plan question yourself** below. Report a decision only for a question that is not a plan question, or when two earlier decisions fit and disagree (name both, with slug and Q id, in the question). A reused decision that blocks the same task a second time is reported as a decision too: say in the question which earlier decision was tried.
+
+**Decide a plan question yourself.** When no earlier decision fits, check what kind of question it is before you stop.
+
+A **plan question** is about how the approved behaviour gets built, and its answer changes only `tasks.md`, the task table, test files and **Verify** lines. No Given/When/Then outcome of any acceptance criterion or edge case changes. These count:
+- how tasks are cut or ordered, for example two tasks that must be one because the suite is red between them, or a check that belongs to a later task;
+- in which task an existing test is updated, when an approved criterion already states the new value that the test will assert;
+- a test fixture or verify command that must use a file tracked in git instead of an ignored one, with the same content checked.
+
+These do **not** count and stay a decision for the user: two criteria that contradict each other; a criterion that the code, the framework or the data cannot satisfy as written; removing or loosening an assertion of today's behaviour that no approved criterion changes; a criterion that forbids the test edit you need (an allow-list of test changes); a review finding that needs a product call. If you are not sure which kind it is, it is a decision for the user.
+
+For a plan question, do not stop:
+1. Pick the option that keeps every acceptance criterion as approved and the full suite green after each task.
+2. Write it into `## Resolved questions` of `.tdd-flow/features/<slug>/spec.md` (create the section after Open questions if it is missing), numbered after the highest `Q-<n>` in Open and Resolved questions: `- Q-<n> <question> - **Answer:** decided by the session: <answer> (<dd.MM.yyyy>) → <where it went: T-<n>, tasks.md, a Verify line>`. Put the options you did not take, each with its reason, on indented lines below it. The words `decided by the session:` are fixed: `tdd-flow decisions` leaves such answers out, so no other spec reuses them.
+3. Update the task table, `tasks.md` and the **Verify** lines the answer changes. Do not touch the Given/When/Then of any criterion, and keep `Status: approved`.
+4. Commit only the spec folder: `git add .tdd-flow/features/<slug> && git commit -m "docs(<slug>): decide Q-<n>"`.
+5. Set the uncommitted work of the blocked task aside (`tdd-flow set-aside` with `{"slug": "<slug>", "label": "decide-Q-<n>"}`), then run the blocked task again (step 1, or the step that stopped). Keep the question, the answer and the options not taken for the PR body.
+
+A task that blocks again after your own decision is reported as a decision for the user: say in the question what you decided and why it did not hold.
 
 **Report a decision and stop** is the same as report blocked, for a block that only the user can resolve because it needs a choice, not a fix. Examples: the spec contradicts itself or the code, an acceptance criterion allows two behaviours, or a review finding needs a product call. Technical failures (a red test, the environment, a merge conflict, the agent limit) stay **report blocked**. Do not guess the answer and do not go on with later tasks.
 1. Add the question to `## Open questions` in `.tdd-flow/features/<slug>/spec.md`, numbered after the highest `Q-<n>` in Open and Resolved questions: `- Q-<n> <question> - *assumption if unanswered:* <your recommendation>`. Then the options and the tasks it blocks, on indented lines.
@@ -136,6 +154,7 @@ Minor findings are not fixed; they go into the PR body.
    - **Tasks**: the commits from step 1 (`git log --oneline <base>..HEAD`), and refactor tasks skipped with their reason
    - **Simplification**: the changes step 2 applied (commits). Also, with their reasons: proposals refuted by the verifier (`dropped`), proposals set aside, with the patch path, and proposals that no longer applied. "Lean already" if there were none.
    - **Decisions reused**: each question answered from an earlier decision (question, answer, source spec and Q id), if any
+   - **Decisions made by the session**: each plan question you decided yourself (Q id, question, answer, the options not taken and why), if any, so the reviewer can overrule them before the merge
    - **Code review**: counts per severity; what the fix round fixed; Minor findings as a list; findings set aside, with the reason
    - **Not verified here**: the `unverified` list from step 1 (verify commands that could not run), if any
    - **Test plan**: the test command from `.tdd-flow/stack.md`, that the push-gate ran it before the push, and whether `sync-base` merged `<base>` or regenerated files

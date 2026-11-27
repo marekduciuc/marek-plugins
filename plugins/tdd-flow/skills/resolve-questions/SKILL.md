@@ -30,7 +30,16 @@ For each question, in order:
 
 A skipped question stays under `## Open questions` as it is.
 
-## 3. Finish
+## 3. Check the spec again
+
+Skip this step when no answer changed the acceptance criteria, edge cases or tasks, or when it already ran in this conversation (once only, so questions and rechecks cannot go in circles).
+
+An answer can bring in what the critics removed before: a task after which the suite is red, a criterion that contradicts another one or an existing test. First copy `spec.md` and `tasks.md` to a new temporary folder (`mktemp -d`): the answers are not committed, so `git diff` could not tell them from what the recheck changes. Then run the workflow `tdd-flow:analyze-requirements` with args `{"feature": "<slug>", "mode": "recheck"}` and wait for it. It runs the critics on the spec as it is now and revises it. It never changes what `## Resolved questions` decided, and it leaves ticked tasks as they are.
+
+- `spec_rechecked` → show what it changed (`diff -u <copy> <file>` for both files; with `specChanged: false` say that nothing changed), and `existingTestsChanged`, `crossSpecFindings` and `unresolvedFindings` if they are not empty. Ask the questions that are open now and were not asked yet, one at a time, as in step 2.
+- `agent_limit` or an error → say so and go on; the spec is as the answers left it.
+
+## 4. Finish
 
 Print the result:
 - the answered questions, each with where it went;
