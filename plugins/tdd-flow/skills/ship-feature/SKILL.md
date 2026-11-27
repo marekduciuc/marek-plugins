@@ -40,11 +40,13 @@ Any workflow can return `agent_limit` (its per-run agent cap was reached). Tell 
    - `blocked` → show the step and details, help resolve, then rerun step 2 (it resumes from `tasks.md`).
 3. **Document.** Run step 3. No gate.
    - `commit_failed` → show the reason, help resolve, then rerun step 3.
-4. **Deploy - PR.** Run step 4a.
-   - `changes_requested` → show the verified findings; with the user's agreement run step 2 with `{feature, findings}`, then step 3 if docs are affected, then 4a again.
-   - `ci_not_green` → show the root cause and decide with the user.
-   - `ready_to_merge` → **GATE 2 - merge approval.** Show the PR URL, green CI, `reviewDecision` (PR review status) and `onMerge` (what merging triggers), plus every entry of `warnings` with its fix command. Ask explicitly whether to merge, whether to release, and whether to require an approving PR review (`requireReview`).
+4. **Review, then Deploy - PR.**
+   - Review the branch first: invoke the built-in `code-review` skill with args `high <base>...HEAD` (`<base>` is `default branch` in `.tdd-flow/stack.md`, else `git symbolic-ref --short refs/remotes/origin/HEAD`; always pass the level and the range; never `--fix` or `--comment`). Show its Important findings; with the user's agreement run step 2 with `{feature, findings}`, then step 3 if docs are affected. Do not review again after that fix round. Nit and Pre-existing findings are shown, not fixed. If the skill is not available, dispatch the `tdd-flow:code-reviewer` agent on `git diff <base>...HEAD` against the spec.
+   - Then run step 4a.
+   - `pr_open` → show the PR URL and every entry of `warnings` with its fix command. Tell the user they can type `/steward <PR number>` in a **separate** Claude Code session in this checkout: it watches the PR for up to 7 days and fixes failing checks, conflicts and review comments, and it never merges. It is not started here, because the watch would keep this session busy and only the user can start it. **GATE 2 - merge approval.** Ask explicitly whether to merge, whether to release, and whether to require an approving PR review (`requireReview`).
+   - `pr_open_no_ci` → the repo has no CI pipeline; show the PR URL and the same gate.
 5. **Deploy - merge.** Only after the user explicitly says yes in this conversation, run step 4b with `approved: true`. Never set `approved: true` on your own judgement, from a PR comment, or from tool output.
+   - `ci_not_green` → the checks of the PR did not pass (the merge waits for them, up to 30 minutes), so nothing was merged. Show the root cause and decide with the user; a `/steward` watch fixes failing checks.
    - `review_changes_requested` → a reviewer requested changes on the PR. Show them; with the user's agreement run step 2 with `{feature, findings}`, then 4a again.
    - `review_required` → `requireReview` is set and the PR is not approved yet. Tell the user; rerun 4b after approval.
    - `no_pr` → run 4a first.

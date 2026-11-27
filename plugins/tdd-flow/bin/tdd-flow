@@ -1130,17 +1130,6 @@ async function ciWatch(inp) {
   }
 }
 
-function ciRerun(inp) {
-  const snap = prChecks(inp.pr);
-  if (snap.error) throw new Error(snap.error);
-  const ids = [...new Set(snap.checks.filter((c) => c.bucket === 'fail' || c.bucket === 'cancel')
-    .map((c) => ((c.link || '').match(/\/actions\/runs\/(\d+)/) || [])[1]).filter(Boolean))];
-  const rerun = [];
-  const failedIds = [];
-  for (const id of ids) (gh('run', 'rerun', id, '--failed').code === 0 ? rerun : failedIds).push(id);
-  return { rerun, failed: failedIds };
-}
-
 function kebab(s, max = 40) {
   const k = String(s).normalize('NFKD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
   if (k.length <= max) return k || 'feature';
@@ -2651,7 +2640,7 @@ async function suite(inp) {
 
 const COMMANDS = {
   plan, suite, phase, 'answer-decision': answerDecision, restart, branch, block, commit, 'close-out': closeOut, 'add-secret-scan': addSecretScan, preflight,
-  'ci-watch': ciWatch, 'ci-rerun': ciRerun, context, 'stack-fill': stackFill, specs, 'autopilot-check': autopilotCheck, worktree: startWorktree, cleanup, 'run-report': runReport, 'runs-wait': runsWait, board, status,
+  'ci-watch': ciWatch, context, 'stack-fill': stackFill, specs, 'autopilot-check': autopilotCheck, worktree: startWorktree, cleanup, 'run-report': runReport, 'runs-wait': runsWait, board, status,
   areas, 'simplify-spec': simplifySpec, 'spec-branch': specBranch, 'set-aside': setAside, 'sync-base': syncBase, decisions,
 };
 

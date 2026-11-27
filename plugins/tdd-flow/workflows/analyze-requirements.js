@@ -153,7 +153,7 @@ const SPEC = {
 const CRIT = {
   type: 'object',
   required: ['issues'],
-  properties: { issues: { type: 'array', items: { type: 'object', required: ['severity', 'where', 'problem', 'fix'], properties: { severity: { type: 'string', enum: ['blocker', 'major', 'minor'] }, where: str, problem: str, fix: str } } } },
+  properties: { issues: { type: 'array', items: { type: 'object', required: ['severity', 'where', 'problem', 'fix', 'evidence'], properties: { severity: { type: 'string', enum: ['blocker', 'major', 'minor'] }, where: str, problem: str, fix: str, evidence: str } } } },
 }
 
 try {
@@ -315,6 +315,30 @@ try {
   ]
   // A rechecked spec can be partly built (a spec the autopilot stopped with a decision): its commits must keep matching tasks.md.
   const DONE_TASKS = 'Tasks ticked "[x]" in tasks.md are implemented and committed: judge only the open tasks, and never change, merge, renumber or untick a ticked one; a change a ticked task needs goes into a new task.\n'
+  // What counts as proof of a blocker or major issue, per critic. A replay on 8 approved specs gave about 19 serious
+  // issues per spec; each one starts a revision and some become questions for the user, so a serious issue needs proof.
+  const SPEC_LINE = 'the spec line it is about, quoted'
+  const FILE_LINE = 'the file:line you read in the repo, with the line quoted'
+  const PROOF = {
+    testability: SPEC_LINE, consistency: 'both spec lines, quoted', completeness: 'the sentence of the requirement, quoted',
+    'existing-tests': FILE_LINE, 'task-order': FILE_LINE, grounding: FILE_LINE, 'cross-spec': 'the other spec\'s slug and id, with its line quoted',
+  }
+  const MAX_MAJOR = 3
+  // A serious issue without proof, and a major one past the limit, counts as minor: it is logged, not revised.
+  // Not limited: existing-tests and cross-spec, which list facts the approval gate shows (every broken test counts),
+  // and round two, where an issue reported again is one the revision did not fix and must not look fixed.
+  const LISTS_FACTS = ['existing-tests', 'cross-spec']
+  const tame = (issues, key, earlier) => {
+    let majors = 0
+    return issues.map(issue => {
+      if (issue.severity === 'minor') return issue
+      if (earlier && earlier.some(e => e.critic === key && e.where === issue.where)) return issue
+      const why = !(issue.evidence || '').trim() ? 'no proof' : issue.severity === 'major' && !earlier && !LISTS_FACTS.includes(key) && ++majors > MAX_MAJOR ? `over the limit of ${MAX_MAJOR} major issues` : ''
+      if (!why) return issue
+      log(`critic:${key}: "${issue.where}" counted as minor (${why})`)
+      return { ...issue, severity: 'minor', was: issue.severity }
+    })
+  }
   // One round of critics. Round two gets the round-one issues: it checks the fixes and what the revision broke.
   const critique = async (list, earlier) => (await parallel(list.map(c => () => run(
     `You are a skeptical reviewer of ${dir}/spec.md and ${dir}/tasks.md. ${c.ask}\n` +
@@ -323,10 +347,12 @@ try {
         `Round-one issues (yours have critic "${c.key}"):\n${JSON.stringify(earlier, null, 1)}\n`
       : '') +
     (recheck ? DONE_TASKS : '') +
+    'Severity: blocker or major only when implementation would stop, or a test could not be written or would fail as specified. Wording, style and detail that would be nice to have are minor. ' +
+    `Every blocker or major issue needs proof in \`evidence\`: ${PROOF[c.key]}. Without proof, report it as minor. ${earlier || LISTS_FACTS.includes(c.key) ? '' : `Report at most ${MAX_MAJOR} major issues, the ones most likely to stop implementation, most likely first; blockers are not limited.`}\n` +
     'Only report real problems; do not edit files. This reviews the spec text, not code: do not run the test suite or lint.' +
     (req.text ? `\n\nRaw requirement:\n"""${req.text}"""` : ''),
     { schema: CRIT, model: M.worker, label: `critic:${c.key}${earlier ? ' (round 2)' : ''}`, phase: 'Critique', agentType: A('code-reviewer') },
-  )))).flatMap((c, i) => (c ? c.issues : []).map(issue => ({ ...issue, critic: list[i].key })))
+  )))).flatMap((c, i) => tame(c ? c.issues : [], list[i].key, earlier).map(issue => ({ ...issue, critic: list[i].key })))
   // The last revision is checked by no critic: it says itself what it could not fix (deferred).
   const revise = (issues, last) => run(
     `Revise ${dir}/spec.md and ${dir}/tasks.md to fix these review issues. Where an issue needs information only the user has, add it to Open questions with your assumption instead of guessing.\n` +

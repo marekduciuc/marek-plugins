@@ -1,6 +1,6 @@
 ---
 name: implement-spec
-description: This skill should be used when the user runs /tdd-flow:implement-spec, usually as the prompt of a background session the tdd-flow autopilot started in a spec's worktree. It implements one approved spec unattended - all tasks through tdd-implement, a simplification pass over the whole PR, a superpowers code review with one fix round, then push and a pull request - and records the result for the autopilot.
+description: This skill should be used when the user runs /tdd-flow:implement-spec, usually as the prompt of a background session the tdd-flow autopilot started in a spec's worktree. It implements one approved spec unattended - all tasks through tdd-implement, a simplification pass over the whole PR, a code review (the built-in `/code-review`) with one fix round, then push and a pull request - and records the result for the autopilot.
 argument-hint: "<feature-slug> [base-branch]"
 ---
 
@@ -111,26 +111,26 @@ Skip this step when `spec.md` has `Source: tdd-flow simplify-codebase`, because 
      ```
      It saves the uncommitted changes as a patch in the shared git dir and restores the working tree. Note the finding, the reason and the `patch` path, then continue with the next finding.
 
-## 3. Code review (superpowers)
+## 3. Code review
 
-Invoke the `superpowers:requesting-code-review` skill and follow it, with:
+Invoke the built-in `code-review` skill with the Skill tool and args `high <base>...HEAD`, and wait for its findings.
 
-- `BASE_SHA` = `git merge-base <base> HEAD`, `HEAD_SHA` = `git rev-parse HEAD` (the review covers the simplification commits too)
-- `{DESCRIPTION}` = the spec's goal (first paragraph of `.tdd-flow/features/<slug>/spec.md`) and the list of tasks
-- `{PLAN_OR_REQUIREMENTS}` = "`.tdd-flow/features/<slug>/spec.md` (acceptance criteria and edge cases)"
+- Always pass the level `high`: without one the skill reuses the level somebody typed last.
+- Always pass the range: every change of this branch is committed, so a review of the working tree alone would find nothing. The range covers the simplification commits too.
+- Never pass `--fix` or `--comment`: fixes go test-first through step 4, and the PR does not exist yet.
 
-If that skill is not available, dispatch the `tdd-flow:code-reviewer` agent on `git diff <base>...HEAD` against the spec instead, and sort its blocker/major/minor findings into Critical/Important/Minor.
+Its findings are tagged **Important**, **Nit** or **Pre-existing**. Check each Important finding against the spec (`.tdd-flow/features/<slug>/spec.md`, acceptance criteria and edge cases): drop one only with a technical reason, and keep the reason for the PR body.
 
-Sort the findings by severity. You act as the executor in that skill: drop a finding only with a technical reason, and keep the reason for the PR body.
+If the skill is not available, or it returns no result, dispatch the `tdd-flow:code-reviewer` agent on `git diff <base>...HEAD` against the spec instead. Its blocker and major findings count as Important, its minor findings as Nit.
 
 ## 4. One fix round
 
-If there are Critical or Important findings, run the workflow `tdd-flow:tdd-implement` once more with `{"feature": "<slug>", "findings": [...]}`. Write each finding as one string: `"<severity>: <file:line> - <issue>. Expected: <fix>"`.
+If there are Important findings, run the workflow `tdd-flow:tdd-implement` once more with `{"feature": "<slug>", "findings": [...]}`. Write each finding as one string: `"Important: <file:line> - <issue>. Expected: <fix>"`.
 
 - `implemented` → continue. Do **not** review again (one review pass per change).
 - `blocked`, `agent_limit` or an error → report blocked with the details, and say which findings are still open. A finding that needs a product call → **report a decision**.
 
-Minor findings are not fixed; they go into the PR body.
+Nit and Pre-existing findings are not fixed; they go into the PR body.
 
 ## 5. Push and open the PR
 
@@ -155,7 +155,7 @@ Minor findings are not fixed; they go into the PR body.
    - **Simplification**: the changes step 2 applied (commits). Also, with their reasons: proposals refuted by the verifier (`dropped`), proposals set aside, with the patch path, and proposals that no longer applied. "Lean already" if there were none.
    - **Decisions reused**: each question answered from an earlier decision (question, answer, source spec and Q id), if any
    - **Decisions made by the session**: each plan question you decided yourself (Q id, question, answer, the options not taken and why), if any, so the reviewer can overrule them before the merge
-   - **Code review**: counts per severity; what the fix round fixed; Minor findings as a list; findings set aside, with the reason
+   - **Code review**: counts per tag; what the fix round fixed; Nit and Pre-existing findings as a list; findings dropped or set aside, with the reason
    - **Not verified here**: the `unverified` list from step 1 (verify commands that could not run), if any
    - **Test plan**: the test command from `.tdd-flow/stack.md`, that the push-gate ran it before the push, and whether `sync-base` merged `<base>` or regenerated files
    - the attribution line your instructions give for PR descriptions

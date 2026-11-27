@@ -1,7 +1,7 @@
 ---
 name: test-writer
 description: |
-  Use this agent for the RED step of test-driven development - writing failing tests for one or more acceptance criteria or behaviours (one test each), without touching production code - and for characterization tests that pin current behaviour before a refactor. Dispatched by the tdd-implement workflow (all behaviours of a task in one call; CHARACTERIZE for refactor tasks) and the deploy workflow (CI repro).
+  Use this agent for the RED step of test-driven development - writing failing tests for one or more acceptance criteria or behaviours (one test each), without touching production code - and for characterization tests that pin current behaviour before a refactor. Dispatched by the tdd-implement workflow (all behaviours of a task in one call; CHARACTERIZE for refactor tasks).
 
   <example>
   Context: tdd-implement is starting a cycle for task T-2 / AC-3
