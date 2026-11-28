@@ -96,8 +96,8 @@ const REVIEW = {
   required: ['verdict', 'testsPass', 'findings', 'uncoveredAcs'],
   properties: {
     verdict: { type: 'string', enum: ['APPROVE', 'CHANGES_REQUESTED'] }, testsPass: { type: 'boolean' }, lintPass: { type: 'boolean' },
-    findings: { type: 'array', items: { type: 'object', required: ['severity', 'where', 'issue', 'behavioural'], properties: {
-      severity: { type: 'string', enum: ['blocker', 'major', 'minor'] }, where: str, issue: str, fix: str, behavioural: { type: 'boolean' },
+    findings: { type: 'array', items: { type: 'object', required: ['severity', 'where', 'issue', 'evidence', 'behavioural'], properties: {
+      severity: { type: 'string', enum: ['blocker', 'major', 'minor'] }, where: str, issue: str, evidence: str, fix: str, behavioural: { type: 'boolean' },
     } } },
     uncoveredAcs: strs,
   },
@@ -607,7 +607,8 @@ try {
         `Review task ${task.id} (${task.title}). ${ctx}\nScope: uncommitted changes (\`git diff HEAD\` plus untracked files). ${scope}\n` +
         (suite ? `The CLI ran the full suite on these files: ${suite.pass ? 'PASS' : 'FAIL'} (\`${suite.command}\`).${suite.pass ? '' : '\n' + suite.summary}\n` : '') +
         (testFixes.length ? `These tests were changed by the test-writer after the implementer reported them as wrong, so they were never seen failing in that form. Check each still asserts its behaviour fully (no weakened or removed assertion); a weakened one is a blocker with behavioural=true:\n${testFixes.map(f => '- ' + f).join('\n')}\n` : '') +
-        `Write your review to ${dir}/review.md (append a "## ${task.id} round ${round}" section). Mark each finding behavioural=true if fixing it changes observable behaviour (needs a test), false for structure/naming/style.`,
+        `Write your review to ${dir}/review.md (append a "## ${task.id} round ${round}" section). Mark each finding behavioural=true if fixing it changes observable behaviour (needs a test), false for structure/naming/style. ` +
+        'Put the proof of each finding in `evidence`: the quoted line(s) or the command output. A blocker or major finding you cannot prove is minor.',
         { agentType: A('code-reviewer'), model: M.worker, schema: REVIEW, label: `${task.id} review ${round}`, phase: 'Review' })
       if (!review) return await blocked(task, 'REVIEW', 'reviewer agent failed')
       if (suite && !suite.pass) review.testsPass = false

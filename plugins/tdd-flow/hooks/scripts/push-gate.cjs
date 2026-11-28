@@ -1,6 +1,7 @@
 'use strict';
 // push-gate: PreToolUse gate for Bash. Before Claude runs `git push` or `gh pr create`, run the target
-// repo's type check, lint and tests, and scan the unpushed commits for secrets with gitleaks.
+// repo's type check, lint and tests, and scan the unpushed commits for secrets with gitleaks. A git command
+// that skips the repo's own hooks (`--no-verify`) is blocked outright.
 // Exit 2 blocks the command and feeds stderr back to Claude. See plugins/tdd-flow/README.md "push-gate".
 const { execSync, spawn } = require('child_process');
 const crypto = require('crypto');
@@ -37,18 +38,10 @@ function publishesNothing(seg) {
  * not commands. `bash -c "..."` and `eval` are not parsed (known gap).
  */
 function pushTargets(cmd, cwd) {
-  let s = cmd.replace(/\\\r?\n/g, ' ');
-  const subs = [];
-  const SUB_RE = /\$\(([^()]*)\)|`([^`]*)`/g;
-  while (SUB_RE.test(s)) {
-    SUB_RE.lastIndex = 0;
-    s = s.replace(SUB_RE, (_, a, b) => { subs.push(a ?? b); return "''"; });
-  }
-  const strip = (p) => p.replace(/'[^']*'|"(?:\\.|[^"\\])*"|(^|\s)#[^\n]*/g, (m, pre) => pre ?? "''");
   const out = [];
-  for (const piece of [s, ...subs.filter((b) => !/^\s*cat\s*<</.test(b))]) {
+  for (const piece of pieces(cmd)) {
     let dir = cwd;
-    for (const seg of strip(piece).split(/[;&|\n]+/)) {
+    for (const seg of piece.split(/[;&|\n]+/)) {
       const cd = seg.match(/^\s*cd\s+([^\s']+)\s*$/);
       if (cd) { dir = path.resolve(dir, cd[1].replace(/^~(?=\/|$)/, process.env.HOME || '~')); continue; }
       if (!PUSH_RE.test(seg)) continue;
@@ -57,6 +50,61 @@ function pushTargets(cmd, cwd) {
     }
   }
   return out;
+}
+
+/** The command and each of its `$(...)` / backtick substitutions, with quoted text and comments replaced by ''. */
+function pieces(cmd) {
+  let s = cmd.replace(/\\\r?\n/g, ' ');
+  const subs = [];
+  const SUB_RE = /\$\(([^()]*)\)|`([^`]*)`/g;
+  while (SUB_RE.test(s)) {
+    SUB_RE.lastIndex = 0;
+    s = s.replace(SUB_RE, (_, a, b) => { subs.push(a ?? b); return "''"; });
+  }
+  const strip = (p) => p.replace(/'[^']*'|"(?:\\.|[^"\\])*"|(^|\s)#[^\n]*/g, (m, pre) => pre ?? "''");
+  return [s, ...subs.filter((b) => !/^\s*cat\s*<</.test(b))].map(strip);
+}
+
+// A git command at the start of a segment (after `(`, shell keywords such as `then`, and VAR=value words), its global options, then the subcommand.
+const GIT_CMD_RE = /^[\s({]*(?:(?:then|do|else|time|command|exec|!)\s+)*((?:[A-Za-z_]\w*=\S*\s+)*)(?:\S*\/)?git((?:\s+(?:-[Cc]\s+\S+|--[\w-]+(?:=\S+)?))*)\s+(commit|push|merge|rebase|am|cherry-pick)(?![\w-])(.*)$/;
+const TAKES_VALUE_SHORT = 'mFCct'; // `git commit` short options whose value is the next word
+const ATTACHED_VALUE_SHORT = 'uS'; // ... and those whose value is the rest of the same word (-uno)
+const TAKES_VALUE_LONG = /^--(message|file|author|date|template|reuse-message|reedit-message|fixup|squash|cleanup|trailer|pathspec-from-file)$/;
+
+/**
+ * Why a command would skip the repo's git hooks, or '' when it does not: `--no-verify` (git also takes the
+ * abbreviations `--no-veri` and `--no-verif`) on commit, push, merge, rebase, am or cherry-pick, `-n` on commit
+ * (also inside a cluster such as `-anm`) and on am, `-c core.hooksPath=...`, or `HUSKY=0` in front of the command.
+ * `git push -n` is a dry run. Text in quotes and in a heredoc body is a message, not a command.
+ */
+function skipsHooks(cmd) {
+  // Heredoc bodies and single-quoted text go first: a backtick inside them is text, not a substitution.
+  const plain = cmd.replace(/(<<-?\s*(['"]?)([\w.-]+)\2[^\n]*)\n[\s\S]*?\n[ \t]*\3(?=\s|\)|$)/g, '$1').replace(/'[^']*'/g, "''");
+  for (const piece of pieces(plain)) {
+    for (const seg of piece.split(/[;&|\n]+/)) {
+      const m = seg.match(GIT_CMD_RE);
+      if (!m) continue;
+      const [, envWords, globals, sub, rest] = m;
+      if (/(^|\s)HUSKY=0\s/.test(envWords)) return `HUSKY=0 in front of \`git ${sub}\``;
+      if (/\s-c\s+core\.hookspath=/i.test(globals)) return `-c core.hooksPath on \`git ${sub}\``;
+      const toks = rest.split(/\s+/).map((t) => t.replace(/\)+$/, '')).filter(Boolean); // `(cd app && git commit -n)`
+      for (let i = 0; i < toks.length; i++) {
+        const t = toks[i];
+        if (t === '--') break;
+        if (/^--no-veri(f|fy)?$/.test(t)) return `${t} on \`git ${sub}\``;
+        if (sub === 'am' && t === '-n') return '-n (--no-verify) on `git am`';
+        if (sub !== 'commit') continue;
+        if (TAKES_VALUE_LONG.test(t)) { i++; continue; }
+        if (!/^-[A-Za-z]/.test(t)) continue;
+        for (const ch of t.slice(1)) {
+          if (ch === 'n') return `-n (--no-verify) on \`git commit\``;
+          if (ATTACHED_VALUE_SHORT.includes(ch)) break;
+          if (TAKES_VALUE_SHORT.includes(ch)) { if (t.endsWith(ch)) i++; break; }
+        }
+      }
+    }
+  }
+  return '';
 }
 
 const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -154,6 +202,9 @@ async function main(input, env = process.env) {
     cmd = data.tool_input?.command || '';
     if (data.cwd) cwd = data.cwd;
   } catch { return res; } // not hook JSON: let it through
+  // Before anything is filtered out: a force push or a dry run that skips the hooks is still a skip.
+  const skip = skipsHooks(cmd);
+  if (skip) return block(`${skip} skips the repo's git hooks. Run the command without it and fix what the hook reports. If the hook itself is broken, tell the user instead of going around it.`);
   const targets = pushTargets(cmd, cwd).filter((t) => !publishesNothing(t.seg));
   if (!targets.length) return res;
   // A plain force push is denied by the global git guard anyway; don't make the user wait for the suite.
@@ -233,4 +284,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { main, pushTargets, publishesNothing, detectChecks, stackField, stackTestCommand, runCheck };
+module.exports = { main, pushTargets, skipsHooks, publishesNothing, detectChecks, stackField, stackTestCommand, runCheck };

@@ -85,3 +85,19 @@ test('tdd-guard lets everything through outside RED, outside a repo and without 
   const r = spawnSync('bash', [GUARD], { input: JSON.stringify({ tool_input: {} }), encoding: 'utf8' });
   assert.strictEqual(r.status, 0);
 });
+
+test('tdd-guard locks linter, formatter, type-check, CI and git hook settings during RED only', () => {
+  const dir = repo('RED');
+  const run = (rel) => guard(path.join(dir, rel), dir);
+  for (const locked of ['tsconfig.json', 'apps/web/tsconfig.build.json', '.eslintrc.json', 'eslint.config.mjs', '.prettierrc', 'biome.json',
+    '.github/workflows/ci.yml', '.github/workflows/unit_test.yml', '.husky/pre-commit', '.pre-commit-config.yaml', 'config/checkstyle.xml', 'ruff.toml', '.golangci.yml',
+    'mypy.ini', '.eslintignore']) assert.strictEqual(run(locked).code, 2, locked);
+  assert.match(run('tsconfig.json').stderr, /'tsconfig\.json' sets what the linter.*needs a setup step/);
+  // Test-runner settings, package manifests and settings inside a test folder or with a test name stay editable.
+  for (const free of ['jest.config.js', 'vitest.config.ts', 'jest.config.json', 'pytest.ini', 'package.json', 'pyproject.toml', 'pom.xml', 'setup.cfg', 'tests/tsconfig.json',
+    'tsconfig.spec.json', '.github/ISSUE_TEMPLATE/bug.md', 'docs/tsconfig.md']) assert.strictEqual(run(free).code, 0, free);
+  for (const phase of ['GREEN', 'REFACTOR', 'IDLE']) {
+    const other = repo(phase);
+    assert.strictEqual(guard(path.join(other, 'tsconfig.json'), other).code, 0, phase);
+  }
+});
