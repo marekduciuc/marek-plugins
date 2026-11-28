@@ -1,5 +1,5 @@
 {
-  "description": "tdd-guard: blocks production-code edits and locks linter, formatter, type-check, CI and git hook settings while a tdd-flow cycle is in the RED phase, also when a shell command writes the file (tdd-guard-bash). push-gate: runs type check, lint, tests and a gitleaks scan before Claude runs git push or gh pr create, and blocks git commands that skip the hooks (--no-verify). register.tsx: the status pane (/tdd-status).",
+  "description": "tdd-guard: blocks production-code edits and locks linter, formatter, type-check, CI and git hook settings while a tdd-flow cycle is in the RED phase, also when a shell command writes the file (tdd-guard-bash). push-gate: runs type check, lint, tests and a gitleaks scan before Claude runs git push or gh pr create, and blocks git commands that skip the hooks (--no-verify). run-state: notes why an autopilot session waits (permission prompt, question, usage limit, API error, ended) for the board; it exits at once outside a spec worktree. register.tsx: the status pane (/tdd-status).",
   "hooks": {
     "PreToolUse": [
       {
@@ -28,7 +28,58 @@
           }
         ]
       }
+    ],
+    "Notification": [
+      {
+        "matcher": "permission_prompt|elicitation_dialog|idle_prompt",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/run-state.cjs\"",
+            "timeout": 5,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/run-state.cjs\"",
+            "timeout": 5,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/run-state.cjs\"",
+            "timeout": 5,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/run-state.cjs\"",
+            "timeout": 5,
+            "async": true
+          }
+        ]
+      }
     ]
   },
-  "modules": ["./register.tsx"]
+  "modules": [
+    "./register.tsx"
+  ]
 }

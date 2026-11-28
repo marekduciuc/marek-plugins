@@ -313,13 +313,16 @@ test('the restart button is on blocked rows without a decision and stalled rows 
   const blocked: StatusRow = { ...RUNNING, slug: '41-blocked', status: 'blocked', details: 'tests fail', sessionState: 'done' }
   const stalled: StatusRow = { ...RUNNING, slug: '42-stalled', status: 'stalled', details: 'session is idle without a report' }
   const done: StatusRow = { ...RUNNING, slug: '43-done', status: 'done' }
-  const w = world(on, { rows: [RUNNING, DECISION, blocked, stalled, done] })
+  // A session that waits for a permission is not restarted (its work would be thrown away): the reason shows, no button.
+  const asking: StatusRow = { ...RUNNING, slug: '44-asking', status: 'stalled', details: 'needs permission: Bash(npm ci)', waiting: 'permission' }
+  const w = world(on, { rows: [RUNNING, DECISION, blocked, stalled, done, asking] })
   const clock = mock.clock(on)
   await $.session.start(SESSION)
   await clock.advance(1)
   let ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...PANE })
   const keys = (await ui.findAll({ type: 'Button' })).map(b => b.key).filter(k => k?.startsWith('restart:'))
   expect(keys).toEqual(['restart:41-blocked', 'restart:42-stalled'])
+  expect((await ui.find({ type: 'Text', text: /needs permission/ }))?.text).toBe('  needs permission: Bash(npm ci)')
 
   // In flight: "restarting…" instead of the button, so it cannot be pressed twice.
   // A press resolves once the work it started settles, so it is awaited only after the restart is released.

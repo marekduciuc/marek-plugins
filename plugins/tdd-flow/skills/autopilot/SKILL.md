@@ -110,7 +110,11 @@ It returns when a run finishes or when a running spec ticks a task (`progressed`
 
 - `done` → note the `prUrl`. For the summary, keep the PR number and the worktree: the user can have the PR watched with the built-in `/steward`, which only they can start.
 - `blocked` → note `details`. With a `decision`, the spec waits for the user's answer: see **Decisions** below.
-- `stalled` → the session went idle or disappeared without a report (it asked something or stopped early). Note its `attach` command (`runs-wait` gives the name, or the id when the name is ambiguous); do not restart it.
+- `stalled` → the session went idle or disappeared without a report. Its `details` say why when a hook saw it: `needs permission: <tool>`, `asks a question`, `usage limit reached`, `API error: <kind>`, `session ended`. Note its `attach` command (`runs-wait` gives the name, or the id when the name is ambiguous); do not restart it yourself. For `needs permission` and `asks a question`, tell the user at once: the session waits for them (`claude attach <name>`).
+
+`runs-wait` restarts a session that is gone (not one that is idle or waiting) by itself, at most twice per run, and lists it under `restarted` (slug, new session, attempt). Say so in one line and treat the spec as running. A spec that is gone a third time comes back as `stalled`.
+
+When `runs-wait` returns `limited: true`, a session stopped at the usage limit. Start no queued spec: it would stop at the same limit. Tell the user which specs wait and that they continue when the limit resets (the session may resume by itself; otherwise `/tdd-flow:autopilot <slug>` starts it again). Keep waiting on the running specs, and start queued ones again only after the user says so or after a limited spec is `running` again.
 
 Then start the next queued specs (step 2) until N are running again (a `starting` spec counts as running), and start `runs-wait` again for the running slugs with the latest `progress`. Leave finished slugs out: `runs-wait` returns at once for them. Repeat until nothing runs and nothing is queued. If `runs-wait` reports `timedOut`, list the running sessions with their `attach` commands and ask the user whether to keep waiting.
 
@@ -143,7 +147,14 @@ tdd-flow conflicts <<'TDD_FLOW_JSON'
 TDD_FLOW_JSON
 ```
 
-Print its `text` below the table when it names a conflict; leave it out when it predicts none or was skipped. It is a prediction against the base as last fetched: do not rebase, merge or change any branch because of it.
+Print its `text` below the table when it names a conflict; leave it out when it predicts none or was skipped. For a pair in which one spec is done and the other still runs, leave the running one a note, so its session merges the base before its next task once the first PR is merged:
+
+```bash
+tdd-flow note <<'TDD_FLOW_JSON'
+{"slug": "<the running slug>", "text": "<done slug> changes the same files (<files>). When its PR is merged, run sync-base before the next task."}
+TDD_FLOW_JSON
+```
+ It is a prediction against the base as last fetched: do not rebase, merge or change any branch because of it.
 
 The final `board` table (it has the PR URL, or the reason and `claude attach <name>` for blocked and stalled specs, or `decision Q-<n>: ...`), then the open decisions: slug, question, recommendation. To answer one later:
 - run `/tdd-flow:resolve-questions <slug>` in the worktree;

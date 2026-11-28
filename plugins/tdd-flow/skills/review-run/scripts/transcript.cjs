@@ -16,7 +16,8 @@ const USAGE = `usage:
   transcript.cjs locate <session-id | job name | spec slug>   find the transcript file(s) and workflow dirs
   transcript.cjs summary <file.jsonl>                          key events with line numbers (questions, run-report, PRs, ...)
   transcript.cjs show <file.jsonl> [--grep <regex>] [--from <line>] [--to <line>] [--max <chars>] [--lines <n>] [--role user|assistant|tool|result]
-  transcript.cjs agents <file.jsonl | session-dir>             the subagents and tdd-flow workflow runs of a session (what started each, their transcript files)`;
+  transcript.cjs agents <file.jsonl | session-dir>             the subagents and tdd-flow workflow runs of a session (what started each, their transcript files)
+  transcript.cjs cost <file.jsonl> [--json]                    token use of a session and its subagents: requests, shares of fresh input, cache reads, cache writes and output`;
 
 function arg(flag, def) { const i = process.argv.indexOf(flag); return i > 0 && process.argv[i + 1] != null ? process.argv[i + 1] : def; }
 const fmtTime = (ts) => (ts ? String(ts).slice(0, 19).replace('T', ' ') : '');
@@ -237,11 +238,77 @@ function agents(sessionDir) {
   return 0;
 }
 
+const COLD_GAP_MS = 60 * 60 * 1000; // longer than the longest prompt-cache lifetime: the next request rereads everything
+
+/** Every .jsonl under a session's subagents folder (plain subagents and workflow agents). */
+function subagentFiles(file) {
+  const out = [];
+  const walk = (dir) => {
+    let entries = [];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) walk(p);
+      else if (e.name.endsWith('.jsonl') && e.name !== 'journal.jsonl') out.push(p);
+    }
+  };
+  walk(path.join(file.replace(/\.jsonl$/, ''), 'subagents'));
+  return out;
+}
+
+/** Usage of one transcript: a streamed response repeats its usage on every line, so each message id counts once (its last line). */
+async function usageOf(file) {
+  const byId = new Map();
+  const rl = readline.createInterface({ input: fs.createReadStream(file), crlfDelay: Infinity });
+  for await (const line of rl) {
+    if (!line.includes('"usage"')) continue;
+    let j;
+    try { j = JSON.parse(line); } catch { continue; }
+    const m = j.message;
+    if (!m || !m.usage || j.type !== 'assistant') continue;
+    byId.set(m.id || `line-${byId.size}`, { at: Date.parse(j.timestamp) || 0, u: m.usage });
+  }
+  const t = { requests: 0, input: 0, cacheRead: 0, cacheWrite: 0, output: 0, coldRequests: 0 };
+  let last = 0;
+  for (const { at, u } of [...byId.values()].sort((a, b) => a.at - b.at)) {
+    t.requests++;
+    t.input += u.input_tokens || 0;
+    t.cacheRead += u.cache_read_input_tokens || 0;
+    t.cacheWrite += u.cache_creation_input_tokens || 0;
+    t.output += u.output_tokens || 0;
+    if (last && at && at - last > COLD_GAP_MS) t.coldRequests++;
+    if (at) last = at;
+  }
+  return t;
+}
+
+/**
+ * Token use of a session with its subagents. Proportions only: how a subscription weighs the four kinds of tokens is
+ * not published, so this says where the tokens went, not what they cost. The usage fields are read from the
+ * transcript as Claude Code writes it today; they are not a documented contract.
+ */
+async function cost(file) {
+  const files = [file, ...subagentFiles(file)];
+  const total = { requests: 0, input: 0, cacheRead: 0, cacheWrite: 0, output: 0, coldRequests: 0 };
+  for (const f of files) {
+    const t = await usageOf(f);
+    for (const k of Object.keys(total)) total[k] += t[k];
+  }
+  const all = total.input + total.cacheRead + total.cacheWrite + total.output;
+  const share = (n) => (all ? Math.round((n / all) * 100) : 0);
+  const res = { transcripts: files.length, ...total, tokens: all,
+    shares: { input: share(total.input), cacheRead: share(total.cacheRead), cacheWrite: share(total.cacheWrite), output: share(total.output) } };
+  res.line = `${res.requests} requests in ${res.transcripts} transcript(s), ${(all / 1e6).toFixed(1)} M tokens: ${res.shares.cacheRead}% rereading cached context, ` +
+    `${res.shares.cacheWrite}% writing the cache, ${res.shares.input}% fresh input, ${res.shares.output}% output; ${res.coldRequests} request(s) after a pause of over an hour`;
+  console.log(process.argv.includes('--json') ? JSON.stringify(res) : res.line);
+  return 0;
+}
+
 (async () => {
   const [cmd, target] = process.argv.slice(2);
   if (!cmd || !target) { console.error(USAGE); process.exit(2); }
   if (cmd !== 'locate' && !fs.existsSync(target)) { console.error(`not found: ${target}`); process.exit(2); }
-  const run = { locate, summary, show, agents }[cmd];
+  const run = { locate, summary, show, agents, cost }[cmd];
   if (!run) { console.error(USAGE); process.exit(2); }
   process.exit(await run(target));
 })();

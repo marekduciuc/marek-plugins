@@ -16,6 +16,7 @@ The helper script is `scripts/transcript.cjs` in this skill's base directory (pr
 node <base>/scripts/transcript.cjs locate <id | name | slug>      # transcript path(s), job state, run file
 node <base>/scripts/transcript.cjs summary <file.jsonl>            # key events with line numbers
 node <base>/scripts/transcript.cjs show <file.jsonl> --from 410 --to 480 [--grep <regex>] [--role tool|result|user|assistant] [--max 1500] [--lines 300]
+node <base>/scripts/transcript.cjs cost <file.jsonl>               # token use of the session and its subagents (shares, not money)
 node <base>/scripts/transcript.cjs agents <file.jsonl>             # subagents and workflow runs, with their transcript files
 ```
 

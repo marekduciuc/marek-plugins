@@ -16,6 +16,8 @@ export type StatusRow = {
   attach: string
   /** Branches this spec's branch is predicted to conflict with: other slugs, or the base (`origin/main`). */
   conflicts?: string[]
+  /** Why a stalled session waits, when a hook saw it: permission, question, idle, limit, error or ended. */
+  waiting?: string
   decision?: Decision
   task: string
   phase: string
