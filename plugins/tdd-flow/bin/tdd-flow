@@ -2176,6 +2176,129 @@ function restart(inp) {
   return { slug, session, name, attach: `claude attach ${name}`, notes };
 }
 
+// ---------- open-session: the status pane's open button (macOS, iTerm2 and Terminal) ----------
+/** The first osascript call can wait on the macOS Automation consent dialog. */
+const OPEN_TIMEOUT_MS = 60000;
+const ATTACH_COMMAND = /^claude attach ([A-Za-z0-9._-]+)$/;
+/**
+ * The terminal apps, in the order a new tab prefers them. `focus` selects the tab whose tty is argv 1 and prints
+ * "focused" (nothing while the app is not running: the check does not launch it); `open` types argv 1 into a new tab
+ * (iTerm2; a new window when it has none) or a new window (Terminal, whose tabs AppleScript cannot make). Values reach
+ * the scripts only as argv.
+ */
+const TERMINAL_APPS = [
+  {
+    name: 'iTerm', bundle: 'iTerm.app', termProgram: 'iTerm.app',
+    focus: `on run argv
+  if application id "com.googlecode.iterm2" is not running then return ""
+  tell application id "com.googlecode.iterm2"
+    repeat with w in windows
+      repeat with t in tabs of w
+        repeat with s in sessions of t
+          if tty of s is (item 1 of argv) then
+            select w
+            select t
+            select s
+            activate
+            return "focused"
+          end if
+        end repeat
+      end repeat
+    end repeat
+  end tell
+  return ""
+end run`,
+    open: `on run argv
+  tell application id "com.googlecode.iterm2"
+    activate
+    if (count of windows) is 0 then
+      set w to (create window with default profile)
+    else
+      set w to current window
+      tell w to create tab with default profile
+    end if
+    tell current session of w to write text (item 1 of argv)
+  end tell
+  return "opened"
+end run`,
+  },
+  {
+    name: 'Terminal', bundle: null, termProgram: 'Apple_Terminal',
+    focus: `on run argv
+  if application id "com.apple.Terminal" is not running then return ""
+  tell application id "com.apple.Terminal"
+    repeat with w in windows
+      repeat with t in tabs of w
+        if tty of t is (item 1 of argv) then
+          set selected tab of w to t
+          set index of w to 1
+          activate
+          return "focused"
+        end if
+      end repeat
+    end repeat
+  end tell
+  return ""
+end run`,
+    open: `on run argv
+  tell application id "com.apple.Terminal"
+    activate
+    do script (item 1 of argv)
+  end tell
+  return "opened"
+end run`,
+  },
+];
+
+/** The terminal apps on this Mac: iTerm2 when its bundle is in an Applications folder; Terminal always. */
+function installedTerminals() {
+  const dirs = process.env.TDD_FLOW_APPS_DIRS ? process.env.TDD_FLOW_APPS_DIRS.split(':') : ['/Applications', path.join(os.homedir(), 'Applications')];
+  return TERMINAL_APPS.filter((app) => !app.bundle || dirs.some((d) => fs.existsSync(path.join(d, app.bundle))));
+}
+
+/** `/dev/ttys…` of each running `claude attach <ref>` (claude as a binary on the PATH, a full path or under node). */
+function attachTtys(ref) {
+  const r = spawnSync(process.env.TDD_FLOW_PS_BIN || 'ps', ['-axo', 'tty=,args='], { encoding: 'utf8', timeout: OPEN_TIMEOUT_MS });
+  if (r.error || r.status !== 0) throw new Error(`ps failed: ${r.error ? r.error.message : (r.stderr || '').trim() || `exit ${r.status}`}`);
+  const ttys = [];
+  for (const line of r.stdout.split('\n')) {
+    const [tty, ...words] = line.trim().split(/\s+/);
+    if (!tty || tty === '??' || words.length < 3 || words.at(-2) !== 'attach' || words.at(-1) !== ref) continue;
+    if (words.slice(0, -2).some((w) => path.basename(w) === 'claude' || (/claude/.test(w) && w.endsWith('cli.js')))) ttys.push(`/dev/${tty}`);
+  }
+  return ttys;
+}
+
+/** Runs one of the AppleScripts above with `arg` as its only argv; returns what it printed. */
+function appleScript(app, script, arg) {
+  const r = spawnSync(process.env.TDD_FLOW_OSASCRIPT_BIN || 'osascript', ['-e', script, arg], { encoding: 'utf8', timeout: OPEN_TIMEOUT_MS });
+  if (r.error && r.error.code === 'ENOENT') throw new Error('osascript not found: open works on macOS only (copy the command instead)');
+  if (r.error) throw new Error(`osascript for ${app.name} failed: ${r.error.message}`);
+  const err = (r.stderr || '').trim();
+  if (/-1743/.test(err)) throw new Error(`not allowed to control ${app.name}: allow it in System Settings > Privacy & Security > Automation`);
+  if (r.status !== 0) throw new Error(`osascript for ${app.name} failed: ${err.split('\n')[0] || `exit ${r.status}`}`);
+  return r.stdout.trim();
+}
+
+/**
+ * Brings a background session to the front: the status pane's open button. Input: {attach} ("claude attach <ref>").
+ * A tab of iTerm2 or Terminal where that command runs (found by its tty) is selected and its app activated; otherwise
+ * the command runs in a new tab of the terminal Claude Code runs in (TERM_PROGRAM), else iTerm2 when installed, else
+ * Terminal. A session attached under another ref (its id instead of its name) is not found: a second attach opens.
+ * Returns {attach, app, action: "focused" | "opened"}.
+ */
+function openSession(inp) {
+  const m = ATTACH_COMMAND.exec(String(inp.attach ?? ''));
+  if (!m) throw new Error(`attach must be "claude attach <name or id>", not ${JSON.stringify(inp.attach)}`);
+  const apps = installedTerminals();
+  for (const tty of attachTtys(m[1])) {
+    for (const app of apps) if (appleScript(app, app.focus, tty) === 'focused') return { attach: inp.attach, app: app.name, action: 'focused' };
+  }
+  const app = apps.find((a) => a.termProgram === process.env.TERM_PROGRAM) || apps[0];
+  appleScript(app, app.open, inp.attach);
+  return { attach: inp.attach, app: app.name, action: 'opened' };
+}
+
 /**
  * State of one autopilot run: its run file (done/blocked), "running" while its session works, "starting" while a
  * just started session does not work yet, or "stalled" when the session is idle or gone.
@@ -2890,7 +3013,7 @@ async function suite(inp) {
 }
 
 const COMMANDS = {
-  plan, suite, phase, 'answer-decision': answerDecision, restart, branch, block, commit, 'close-out': closeOut, 'add-secret-scan': addSecretScan, preflight,
+  plan, suite, phase, 'answer-decision': answerDecision, restart, 'open-session': openSession, branch, block, commit, 'close-out': closeOut, 'add-secret-scan': addSecretScan, preflight,
   'ci-watch': ciWatch, context, 'stack-fill': stackFill, specs, 'autopilot-check': autopilotCheck, worktree: startWorktree, cleanup, 'run-report': runReport, 'runs-wait': runsWait, board, status,
   areas, 'simplify-spec': simplifySpec, 'spec-branch': specBranch, 'set-aside': setAside, 'sync-base': syncBase, decisions, conflicts, note, notes,
 };

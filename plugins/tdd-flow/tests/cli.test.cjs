@@ -2540,3 +2540,74 @@ test('note and notes: a note is delivered once, to the spec it was written for',
   note({ slug: '12-csv', text: 'third' });
   assert.deepStrictEqual(run(w.dir, 'notes', { slug: '12-csv' }).result.notes.map((n) => n.n), [3]);
 });
+
+// ---------- open-session: the status pane's open button (0.39.0) ----------
+/**
+ * open-session against a fake `ps` (the given lines) and a fake `osascript` that logs `<app> <focus|open> <arg>` and
+ * prints "focused" for a focus call of `focused` ("<app> <tty>"). `apps`: the bundles in the Applications folder.
+ */
+function openSession(input, { psLines = [], focused = '', apps = ['iTerm.app'], termProgram = '', osascriptBody = '' } = {}) {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'tdd-flow-open-'));
+  const appsDir = path.join(d, 'Applications');
+  for (const a of apps) fs.mkdirSync(path.join(appsDir, a), { recursive: true });
+  const log = path.join(d, 'log');
+  const ps = fakeBin('ps', `cat <<'PS'\n${psLines.join('\n')}\nPS`);
+  const osascript = fakeBin('osascript', osascriptBody || [
+    'case "$2" in *com.googlecode.iterm2*) app=iTerm ;; *) app=Terminal ;; esac',
+    'case "$2" in *"tty of"*) kind=focus ;; *) kind=open ;; esac',
+    `echo "$app $kind $3" >> '${log}'`,
+    `if [ "$kind" = focus ] && [ "$app $3" = '${focused}' ]; then echo focused; elif [ "$kind" = open ]; then echo opened; fi`,
+  ].join('\n'));
+  const out = run(d, 'open-session', input, { TDD_FLOW_PS_BIN: ps, TDD_FLOW_OSASCRIPT_BIN: osascript, TDD_FLOW_APPS_DIRS: appsDir, TERM_PROGRAM: termProgram });
+  return { out, calls: fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n') : [] };
+}
+
+test('open-session refuses anything but "claude attach <ref>", before running ps or osascript', () => {
+  for (const attach of [undefined, 'claude attach', 'claude attach a b', 'claude attach x; rm -rf ~', 'claude attach "x"', 'ls']) {
+    const { out, calls } = openSession({ attach });
+    assert.strictEqual(out.ok, false, String(attach));
+    assert.match(out.error, /attach must be "claude attach <name or id>"/);
+    assert.deepStrictEqual(calls, []);
+  }
+});
+
+test('open-session focuses the tab where the session is attached, in whichever app holds it', () => {
+  const psLines = [
+    '??       /Users/x/.local/bin/claude daemon run',
+    'ttys001  claude attach other-session',
+    'ttys004  -zsh',
+    'ttys007  /Users/x/.local/bin/claude attach csv-export-flow',
+  ];
+  const { out, calls } = openSession({ attach: 'claude attach csv-export-flow' }, { psLines, focused: 'Terminal /dev/ttys007' });
+  assert.deepStrictEqual(out.result, { attach: 'claude attach csv-export-flow', app: 'Terminal', action: 'focused' });
+  assert.deepStrictEqual(calls, ['iTerm focus /dev/ttys007', 'Terminal focus /dev/ttys007']);
+});
+
+test('open-session finds claude run under node and skips a process without a terminal', () => {
+  const psLines = ['??       claude attach csv-export-flow', 'ttys002  node /usr/lib/node_modules/@anthropic-ai/claude-code/cli.js attach csv-export-flow'];
+  const { out, calls } = openSession({ attach: 'claude attach csv-export-flow' }, { psLines, focused: 'iTerm /dev/ttys002' });
+  assert.strictEqual(out.result.action, 'focused');
+  assert.deepStrictEqual(calls, ['iTerm focus /dev/ttys002']);
+});
+
+test('open-session opens a new tab where no tab holds it: the TERM_PROGRAM app, else iTerm2 when installed, else Terminal', () => {
+  const attach = 'claude attach csv-export-flow';
+  const notFocused = openSession({ attach }, { psLines: ['ttys003  claude attach csv-export-flow'] });
+  assert.deepStrictEqual(notFocused.out.result, { attach, app: 'iTerm', action: 'opened' });
+  assert.deepStrictEqual(notFocused.calls, ['iTerm focus /dev/ttys003', 'Terminal focus /dev/ttys003', `iTerm open ${attach}`]);
+  assert.deepStrictEqual(openSession({ attach }, { termProgram: 'Apple_Terminal' }).calls, [`Terminal open ${attach}`]);
+  assert.deepStrictEqual(openSession({ attach }, { termProgram: 'tmux' }).calls, [`iTerm open ${attach}`]);
+  // Without iTerm2 installed it is never asked, also not to focus.
+  const noITerm = openSession({ attach }, { apps: [], termProgram: 'iTerm.app', psLines: ['ttys003  claude attach csv-export-flow'] });
+  assert.deepStrictEqual(noITerm.out.result, { attach, app: 'Terminal', action: 'opened' });
+  assert.deepStrictEqual(noITerm.calls, ['Terminal focus /dev/ttys003', `Terminal open ${attach}`]);
+});
+
+test('open-session turns a refused Automation permission and a failed osascript into errors', () => {
+  const attach = 'claude attach csv-export-flow';
+  const denied = openSession({ attach }, { osascriptBody: 'echo "execution error: Not authorized to send Apple events to iTerm. (-1743)" >&2; exit 1' });
+  assert.strictEqual(denied.out.ok, false);
+  assert.match(denied.out.error, /not allowed to control iTerm: allow it in System Settings > Privacy & Security > Automation/);
+  const broken = openSession({ attach }, { osascriptBody: 'echo "syntax error" >&2; exit 1' });
+  assert.match(broken.out.error, /osascript for iTerm failed: syntax error/);
+});
