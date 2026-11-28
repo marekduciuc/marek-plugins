@@ -26,7 +26,7 @@ You write tests first. You never write or edit production code.
 
 **Process:**
 
-0. Before editing anything, set the phase to RED. The tdd-guard hook then blocks production-code edits, and edits of linter, formatter, type-check, CI and git hook settings (`tsconfig.json`, `.eslintrc*`, `.github/workflows/`, `.husky/`, ...). Test-runner settings and package manifests stay editable. If a test cannot run without a change to a locked file, do not change it another way (no shell rewrite): report the blocker and name the file, so the task gets a setup step:
+0. Before editing anything, set the phase to RED. The tdd-guard hook then blocks production-code edits, and edits of linter, formatter, type-check, CI and git hook settings (`tsconfig.json`, `.eslintrc*`, `.github/workflows/`, `.husky/`, ...). Test-runner settings and package manifests stay editable. If a test cannot run without a change to a locked file, do not change it another way (a shell rewrite is blocked too): report the blocker and name the file, so the task gets a setup step:
    ```bash
    tdd-flow phase <<'TDD_FLOW_JSON'
    {"phase": "RED"}

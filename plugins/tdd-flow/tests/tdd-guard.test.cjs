@@ -101,3 +101,55 @@ test('tdd-guard locks linter, formatter, type-check, CI and git hook settings du
     assert.strictEqual(guard(path.join(other, 'tsconfig.json'), other).code, 0, phase);
   }
 });
+
+const shell = require('../hooks/scripts/tdd-guard-bash.cjs');
+
+test('writeTargets finds the files a shell command writes and nothing else', () => {
+  const t = (cmd) => shell.writeTargets(cmd, '/repo');
+  assert.deepStrictEqual(t('echo x > src/app.ts'), ['/repo/src/app.ts']);
+  assert.deepStrictEqual(t('echo x >> "src/my app.ts"'), ['/repo/src/my app.ts']);
+  assert.deepStrictEqual(t('cat > src/a.ts <<EOF\nconst a = b > c;\necho > nested.ts\nEOF'), ['/repo/src/a.ts']);
+  assert.deepStrictEqual(t('cd apps/web && npm run gen | tee -a src/gen.ts out.log'), ['/repo/apps/web/src/gen.ts', '/repo/apps/web/out.log']);
+  assert.deepStrictEqual(t('(cd api; printf x >| Main.java)'), ['/repo/api/Main.java']);
+  assert.deepStrictEqual(t("sed -i 's/a/b/' src/a.ts src/b.ts"), ['/repo/src/a.ts', '/repo/src/b.ts']);
+  assert.deepStrictEqual(t("sed -i '' -e 's/a/b/' src/a.ts"), ['/repo/src/a.ts']);
+  assert.deepStrictEqual(t("sed -Ei.bak 's/a/b/' src/a.ts"), ['/repo/src/a.ts']);
+  assert.deepStrictEqual(t('sed --in-place=.bak -e s/a/b/ tsconfig.json'), ['/repo/tsconfig.json']);
+  assert.deepStrictEqual(t('npm test &> /repo/src/log.ts'), ['/repo/src/log.ts']);
+  assert.deepStrictEqual(t('echo "$(date > stamp.ts)"'), ['/repo/stamp.ts']);
+  for (const none of ['npm test 2>&1', 'npm test > /dev/null 2>&1', 'npm test >&2', 'node -e "if (a > b) c()"', "awk '$1 > 5' data.txt",
+    'git commit -m "a > b"', "sed -n 's/a/b/p' src/a.ts", "sed 's/a/b/' src/a.ts", 'echo x > "$OUT"', 'echo x > src/*.ts', 'cat < src/a.ts',
+    'grep x <<< "a > b.ts"', 'diff <(sort a.ts) <(sort b.ts)', 'npm test | tee /dev/stderr', 'echo done # > src/a.ts', 'ls']) {
+    assert.deepStrictEqual(t(none), [], none);
+  }
+  // Text that only looks like a write: single-quoted backticks, a BSD sed suffix, heredoc delimiters, process substitution.
+  for (const none of ["git commit -m 'cover `count > limit.ts` case'", "node -e 'console.log(`a > b.ts`)'", "grep -n '$(echo x > src/a.ts)' README.md",
+    "sed -n -e 's/a/b/p' x.ts", 'cat <<\\EOF\nconst f = a > b.ts\nEOF', "cat <<'E O F'\na > b.ts\nE O F", 'npm test | tee >(grep -c fail src.ts)']) {
+    assert.deepStrictEqual(t(none), [], none);
+  }
+  assert.deepStrictEqual(t("sed -i '' 's/old.js/new.js/' tests/a.test.js"), ['/repo/tests/a.test.js']);
+  assert.deepStrictEqual(t("sed -i -- 's/old.js/new.js/' tests/a.test.js"), ['/repo/tests/a.test.js']);
+  assert.deepStrictEqual(t('cd -- tests && echo x > helper.ts'), ['/repo/tests/helper.ts']);
+  assert.deepStrictEqual(t('pushd tests && echo x > helper.ts'), ['/repo/tests/helper.ts']);
+  assert.deepStrictEqual(t('(cd /tmp); echo x > src/a.ts'), ['/repo/src/a.ts']);
+  assert.deepStrictEqual(t('cd - && echo x > a.ts'), []);
+  assert.deepStrictEqual(t('cd "$DIR" && echo x > a.ts; echo y > /abs/b.ts'), ['/abs/b.ts']);
+  for (const wrapped of ['sudo tee src/a.ts', 'command sed -i s/a/b/ src/a.ts', 'env A=1 tee src/a.ts', 'time tee src/a.ts', '! sed -i s/a/b/ src/a.ts',
+    'gsed -i s/a/b/ src/a.ts', 'echo x>src/a.ts', 'echo x 1> src/a.ts']) assert.deepStrictEqual(t(wrapped), ['/repo/src/a.ts'], wrapped);
+  assert.deepStrictEqual(t('[[ a > b.ts ]]'), ['/repo/b.ts']); // read as a redirection: the guard then judges the path
+});
+
+test('tdd-guard-bash blocks a shell write of a production or locked file during RED, and lets the rest through', () => {
+  const dir = repo('RED');
+  const run = (command, cwd = dir) => shell.main(JSON.stringify({ tool_name: 'Bash', cwd, tool_input: { command } }), { ...process.env, CLAUDE_PROJECT_DIR: dir });
+  const blocked = run('echo "export const a = 1" > src/app.ts');
+  assert.strictEqual(blocked.code, 2);
+  assert.match(blocked.stderr, /production file 'src\/app\.ts'[\s\S]*through the shell/);
+  assert.strictEqual(run("sed -i 's/strict/loose/' tsconfig.json").code, 2);
+  assert.strictEqual(run('cd src && printf x | tee app.ts').code, 2);
+  for (const ok of ['npm test > out.log 2>&1', 'echo x > tests/app.test.ts', 'echo x > src/app.spec.ts', 'npm test', 'echo x > /tmp/tdd-flow-guard-out.ts',
+    'echo x > .tdd-flow/features/12-csv/tdd-log.md', 'not json']) assert.strictEqual(run(ok).code, 0, ok);
+  const green = repo('GREEN');
+  assert.strictEqual(shell.main(JSON.stringify({ cwd: green, tool_input: { command: 'echo x > src/app.ts' } }), { ...process.env, CLAUDE_PROJECT_DIR: green }).code, 0);
+  assert.strictEqual(shell.main('{broken', process.env).code, 0);
+});
