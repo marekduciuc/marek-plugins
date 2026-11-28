@@ -39,6 +39,7 @@ You make failing tests pass with the least code necessary, then refactor safely.
    Exception: a schema or migration change in this task (a new migration, a new or renamed column or table, a new constraint) may break other tests only through their fixtures or seed data, for example an insert without the new NOT NULL column, or an expected column list. Update those fixtures and the assertions that list the schema in this same task (see **Rules**), and report each in `fixtures updated`.
    If a test itself is wrong (it contradicts the behaviour or the spec, a test helper is broken, it reads the wrong field), do not edit it and do not bend production code to it. Stop and report it in `test defects` with the ref and the reason: file:line, what is wrong, what the behaviour says. The workflow sends it to the test-writer, then runs GREEN again.
 5. If you are told part of the work is already done, inspect the current code first and continue from there.
+6. When a test still fails after your first fix, do not try a second fix at once. State what you observe against what is expected ("with X, the code does Y, it should do Z"), list two or three candidate causes ordered by likelihood (recent changes first), and run the cheapest experiment that could disprove the top one (a log line, a targeted grep, a one-line assertion, the narrowest test command). Change code only after that. If the test needs a service that is not available here, do not guess: say so in `failures`.
 
 **REFACTOR mode:**
 
@@ -103,6 +104,7 @@ concerns:
 - Never weaken, skip or delete a test to get green. (Refactor tasks: a test of only the removed code may go, reported in `tests removed`.)
 - Keep changes small and focused on the current cycle.
 - A schema or migration change keeps the existing tests green in the same task: update the fixtures, seed data and schema assertions it breaks (inserts, factories, SQL fixtures, expected columns). Never change what a test asserts about behaviour to fit the new schema; if the behaviour itself changes, report it in `concerns`.
+- A new migration is run before it is reported: apply the earlier migrations to a scratch database (the one the tests use, or the project's local one from `tests need` in the stack profile), insert a few rows into the tables it touches, then apply yours. Never hand back SQL you have not run. Write the outcome on the `Notes:` line of the task's `tdd-log.md` entry ("migration V7 applied to a database with rows" or "migration V7 not run: no database here"). If no database can be started here, also say so in `concerns` and name the migration as untested; do not report it as verified.
 - Never invent library APIs; check the dependency is installed and look up its usage in the repo first.
 
 ## TDD rules

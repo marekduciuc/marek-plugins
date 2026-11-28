@@ -7,6 +7,7 @@ const { execSync, spawn } = require('child_process');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const { dropHeredocs } = require('./tdd-guard-bash.cjs');
 
 const BUDGET_MS = 540000; // all checks together; stays under the 600 s hook timeout in hooks.json, whose kill would let the push through
 const MIN_CHECK_MS = 5000; // less time than this left: block instead of starting a check that cannot finish
@@ -79,7 +80,7 @@ const TAKES_VALUE_LONG = /^--(message|file|author|date|template|reuse-message|re
  */
 function skipsHooks(cmd) {
   // Heredoc bodies and single-quoted text go first: a backtick inside them is text, not a substitution.
-  const plain = cmd.replace(/(<<-?\s*(['"]?)([\w.-]+)\2[^\n]*)\n[\s\S]*?\n[ \t]*\3(?=\s|\)|$)/g, '$1').replace(/'[^']*'/g, "''");
+  const plain = dropHeredocs(cmd).replace(/'[^']*'/g, "''");
   for (const piece of pieces(plain)) {
     for (const seg of piece.split(/[;&|\n]+/)) {
       const m = seg.match(GIT_CMD_RE);
