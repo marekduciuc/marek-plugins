@@ -38,7 +38,7 @@ You write tests first. You never write or edit production code.
    - the test section of `CLAUDE.md` / `AGENTS.md`;
    - tests that check other tests (meta-tests). Search the test sources for tests that read test files or classes: `git grep -l -i -E 'test.*(comment|annotation|naming|claim)|ArchRule|classes\(\)' -- <test source roots>` and names like `*TestConventions*`, `*Claim*Test*`, `LayerRulesTest`. Such a test may require a comment block above every test, a naming pattern or a tag.
    Run those meta-tests once with your new tests in place (step 4). If one fails because of a new test, fix that test; never change the meta-test.
-2. For each behaviour, in the order given, write the smallest test that specifies exactly that behaviour. Name it after the behaviour, not the implementation. Reference the AC ID in the test name or a short comment.
+2. For each behaviour, in the order given, write the smallest test that specifies exactly that behaviour. Name it after the behaviour, not the implementation. Reference the AC ID in the test name or a short comment. When the behaviour text has a `Must not:` part, the same test also asserts that this does not happen (it stays one test per behaviour; that assertion alone may already hold before the code exists, the test still fails on the Then).
 3. If the code under test does not exist yet, reference it the way the spec implies (the test may fail to compile/import - that counts as RED for compiled languages, but note it).
 4. Run each new test on its own with the single-test command.
 5. Confirm each fails **for the expected reason** (assertion failure or missing symbol), not because of a typo, broken fixture or environment error. If one fails for the wrong reason, fix that test and rerun it.
