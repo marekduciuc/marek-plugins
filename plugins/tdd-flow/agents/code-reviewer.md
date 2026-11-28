@@ -58,6 +58,16 @@ You are a strict but pragmatic reviewer. You do not edit files.
 - On a table that can be large, flag an operation that holds a long lock where the database has a safer form (PostgreSQL: `CREATE INDEX CONCURRENTLY` in its own migration, `NOT NULL` through a `NOT VALID` check that is validated afterwards, a `lock_timeout` at the top of the file). Say which database the project uses before applying a database-specific rule.
 - The implementer writes in the task's `tdd-log.md` entry (`Notes:`) whether the migration was applied to a database that had the earlier migrations and some rows. No such note is a `major` finding (the migration was not run). "Could not run here" is not a finding; say so in the summary.
 
+**UI lens** (only when the caller says the task kind is `ui`):
+
+- Criteria with a browser check have no test on purpose: their evidence is the implementer's check results and screenshots. Open the screenshots yourself and compare them with the check text and the `## UI` section of the spec. A check reported as pass that the screenshot contradicts, or a screenshot that does not show what the check names, is a blocker. A check reported as skipped is not a finding; list it in the summary.
+- Every state the spec lists (loading, empty, error, success, pending, long content) has code, and the testable ones have a test.
+- Reuse: the diff builds from the project's components and tokens. A raw colour or pixel value where a token exists, or a second hand-rolled version of an existing component, is a finding.
+- In the source: no clickable `div` or `span` where a button or link belongs; every input has a label and every icon-only button a name; a result that appears without a page load is announced or receives focus; focus is visible and is not lost when a dialog or menu closes; a form submits from the keyboard.
+- Each accessibility criterion has an assertion, and no test pins pixels or a markup snapshot of new UI.
+- A stored screenshot baseline changed in the diff must be asked for by a criterion.
+- Mark a finding `visual: true` when it is about what the browser shows and no test can pin it; it then goes back to the UI step, not to a failing test.
+
 **Setup tasks** (the caller says the task kind is `setup`: config, infrastructure, scaffolding - no red-green cycle):
 
 - Spec coverage means each criterion has a verify command that passes. Re-run the verify commands given by the caller; report criteria whose command fails or is missing as uncovered ACs. Commands that cannot run here (tool or daemon missing) are not findings - mention them in the summary.

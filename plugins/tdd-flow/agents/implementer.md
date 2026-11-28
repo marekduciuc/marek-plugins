@@ -82,6 +82,18 @@ You make failing tests pass with the least code necessary, then refactor safely.
 4. If a test suite exists, run it; it must stay green (a schema or migration change updates the fixtures it breaks, as in GREEN step 4). If this task installed or changed the test framework, run the new test command once, update `test command (all)` and `test command (single file / filter)` in `.tdd-flow/stack.md`, and return the new commands. A task that adds a second test suite (a frontend next to a backend, another package) adds it to `test command (all)`, each part in a subshell joined with `&&`: `(cd backend && ./mvnw verify) && (cd frontend && npm test)`. A separate line is not enough: the workflows run only `test command (all)` as the full suite.
 5. Append a SETUP entry to the task's `tdd-log.md` (format below).
 
+**UI mode** (the UI step of a ui task: its tests are green; what is left is what only a browser shows):
+
+0. Set the phase to GREEN. When you finish, run the same command with `{"phase": "IDLE"}`.
+1. Read the `## UI` section of the spec (design reference, what to reuse, states, viewports) and the browser checks you were given.
+2. Build from what the project has: its components, layout primitives, spacing, colours and typography tokens. A new raw colour, pixel value or hand-rolled component needs a reason you can state; a second version of a component that exists is a defect. Follow the component library's own rules when the project uses one (load the project's skill for it if there is one, e.g. `shadcn`).
+3. Build every state the spec lists, not only the happy one: loading, empty, error, success, action pending, long or odd content. Interactive elements are real controls (a button, a link, an input with a label), reachable by keyboard, with visible focus.
+4. Look at it. Start the dev server on a free port (other worktrees may run the same server), use the URL your own server prints, and stop the server when you are done. Open each route with the browser tool the project already has, as a library from a throwaway script kept outside the working tree (the screenshot folder), not through a test runner that writes result folders into the repo. Run that script with the package directory that has the library as the working directory and load the library through Node's `createRequire` anchored there: a bare import resolves from the script's own folder and will not find it. Never install a browser tool or a dependency for this.
+5. For each browser check, at each viewport it names: record console errors, check that the page does not scroll sideways, force the states the check or the spec names, and take a screenshot. Then open the screenshots and read them against the check and the `## UI` section: confirming that the file exists is not a check.
+6. Report each check as `pass`, `fail` (say what is wrong) or `skipped`. `skipped` is only for a check that cannot run here (no dev server command that works, no browser tool installed, no browser): say exactly what you could not verify. Never report `pass` for something you did not see.
+7. Run the full test suite; it must stay green. Never update a stored screenshot baseline to get green: a changed baseline must be asked for by a criterion and is named in your report.
+8. Append a UI entry to the task's `tdd-log.md` (format below).
+
 **Output to caller:**
 
 ```
@@ -144,6 +156,12 @@ concerns:
 - RED: tests/test_export.py::test_export_empty_report_returns_header_only - FAIL (AssertionError: expected 'id,name\n')
 - GREEN: src/export.py - full suite PASS (128 passed)
 - REFACTOR: extracted _header_row() - full suite PASS
+- Notes: -
+
+## T-3 / AC-7 - <ui task title>
+- UI: src/components/ReportDialog.tsx, src/components/report-dialog.css
+- CHECK: AC-7 /reports dialog @375, @1280 - PASS (2 screenshots, no console errors)
+- CHECK: AC-8 empty state - SKIPPED (no browser tool installed)
 - Notes: -
 
 ## T-1 / AC-1, AC-2 - <setup task title>

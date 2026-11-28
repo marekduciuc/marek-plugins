@@ -32,13 +32,13 @@ Any workflow can return `agent_limit` (its per-run agent cap was reached). Tell 
 1. **Analyze.** Run step 1. Pass `{input, size: "small"}` or `{input, size: "full"}` only when the user asked for a light or a full analysis; otherwise the workflow estimates the size itself.
    - `needs_clarification` → the requirement was too vague and no spec was written. Print the returned `questions` as a numbered list, ask them one at a time, then run step 1 again with `{input: <the same input>, answers: "<every question with its answer>"}`.
    - Say which analysis ran: `size` with `sizeReason`, and `escalated` when it is set (a small estimate that turned out wrong; the full analysis ran). A `small` one had one draft, three critics and one revision; offer `{input, size: "full"}` if the user wants the full one.
-   **GATE 1 - spec approval.** Show: goal, acceptance criteria (ID + one line each), tasks with their kind (`tdd` or `[setup]`) and, for setup tasks, the verify commands. Point out any setup task that looks like it contains testable logic.
+   **GATE 1 - spec approval.** Show: goal, acceptance criteria (ID + one line each), tasks with their kind (`tdd`, `[setup]` or `[ui]`), for setup tasks the verify commands, and for ui tasks the `## UI` section (design reference, what is reused, states, viewports) and which criteria are browser checks. Design direction is settled here, with the spec: a ui spec without a design reference has an open question about it. Point out any setup task that looks like it contains testable logic.
    - If the result has `stateKept`, show it: `state.json` still names another feature that is not done, so pass `{feature: "<slug>"}` explicitly from here on (this skill always does).
    - If the result has `unresolvedFindings`, show them: review issues the two critique rounds could not fix. Each is also an open question in the spec.
    - Open questions: print them in chat as a numbered list with their assumptions, then go through them one at a time as the `resolve-questions` skill describes (`/tdd-flow:resolve-questions <slug>`): ask one, wait for the answer, update `spec.md` and `tasks.md`, then ask the next one. Never leave a question only in the spec file or in a dialog.
    - Then ask the user to approve or change the spec, in chat as plain text. Apply their edits to `spec.md` directly. When approved, set `Status: approved` in the spec.
 2. **Implement.** Run step 2.
-   - `implemented` → continue (the spec's status is now `implemented`). If `unverified` is not empty, list those verify commands (they could not run here, e.g. no Docker daemon) and suggest the user runs them locally.
+   - `implemented` → continue (the spec's status is now `implemented`). If `unverified` is not empty, list those verify commands and browser checks (they could not run here, e.g. no Docker daemon, no browser) and suggest the user runs or looks at them locally.
    - `blocked` → show the step and details, help resolve, then rerun step 2 (it resumes from `tasks.md`).
 3. **Document.** Run step 3. No gate.
    - `commit_failed` → show the reason, help resolve, then rerun step 3.
@@ -69,4 +69,4 @@ After each workflow, give one status line. At the end: issue, PR URL, tasks and 
 
 ## Cost note
 
-`tdd-implement` uses about 5 agents per task: RED, GREEN, review (mostly Sonnet; Opus only when a step fails twice) and a Haiku `script-runner` for the CLI suite check and for the commit. Tasks with more than 5 behaviours add a RED/GREEN pair per 5 behaviours (`batchSize`). A setup task uses about 4 agents, a refactor task about 6. Pass `maxTasks` to keep runs small, and `models` to override the model policy (see README).
+`tdd-implement` uses about 5 agents per task: RED, GREEN, review (mostly Sonnet; Opus only when a step fails twice) and a Haiku `script-runner` for the CLI suite check and for the commit. Tasks with more than 5 behaviours add a RED/GREEN pair per 5 behaviours (`batchSize`). A setup task uses about 4 agents, a refactor task about 6, a ui task one more than a tdd task (the UI step). Pass `maxTasks` to keep runs small, and `models` to override the model policy (see README).

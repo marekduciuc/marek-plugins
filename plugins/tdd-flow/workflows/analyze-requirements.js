@@ -138,12 +138,12 @@ const DRAFT = {
   required: ['acceptanceCriteria', 'edgeCases', 'openQuestions', 'tasks'],
   properties: {
     codeContext: strs,
-    acceptanceCriteria: { type: 'array', items: { type: 'object', required: ['name', 'given', 'when', 'then'], properties: { name: str, given: str, when: str, then: str, mustNot: str, verify: str } } },
+    acceptanceCriteria: { type: 'array', items: { type: 'object', required: ['name', 'given', 'when', 'then'], properties: { name: str, given: str, when: str, then: str, mustNot: str, verify: str, browserCheck: str } } },
     edgeCases: strs, nonFunctional: strs, outOfScope: strs,
     openQuestions: { type: 'array', items: { type: 'object', required: ['question', 'assumption'], properties: { question: str, assumption: str } } },
     // Questions an earlier decision of another spec answers; from = "<slug> Q-<m>".
     resolved: { type: 'array', items: { type: 'object', required: ['question', 'answer', 'from'], properties: { question: str, answer: str, from: str } } },
-    tasks: { type: 'array', items: { type: 'object', required: ['title', 'covers'], properties: { title: str, covers: strs, kind: { type: 'string', enum: ['tdd', 'setup'] } } } },
+    tasks: { type: 'array', items: { type: 'object', required: ['title', 'covers'], properties: { title: str, covers: strs, kind: { type: 'string', enum: ['tdd', 'setup', 'ui'] } } } },
   },
 }
 const SPEC = {
@@ -304,7 +304,7 @@ try {
     `Stack: ${stack.language}; tests via \`${stack.testAll}\`.\n` +
     precedents +
     'Explore the codebase to ground the draft in real modules, entry points and existing tests. Every acceptance criterion must be verifiable by an automated test. ' +
-    'Exception: config, infrastructure or scaffolding work that no test can describe (docker-compose, Dockerfile, CI, manifests, installing the test framework) goes into tasks with kind "setup" (see "Task kinds" in your instructions); give each of their criteria a verify command. All other tasks are kind "tdd". Do NOT write any files - return the draft only.',
+    'Exception: config, infrastructure or scaffolding work that no test can describe (docker-compose, Dockerfile, CI, manifests, installing the test framework) goes into tasks with kind "setup" (see "Task kinds" in your instructions); give each of their criteria a verify command. A task that changes what the user sees is kind "ui"; a criterion only a browser can show returns its check in `browserCheck`. All other tasks are kind "tdd". Do NOT write any files - return the draft only.',
     { agentType: A('requirements-analyst'), model: M.worker, schema: DRAFT, label: `analyst:${a.key}`, phase: 'Draft' },
   ))).then(ds => ds.filter(Boolean))
   let drafts = await draft(lane === 'small' ? ANGLES.slice(0, 1) : ANGLES)
@@ -329,7 +329,7 @@ try {
     'Do NOT simply take the union. Include an AC only if the requirement asks for it or it is an edge case a careful engineer would consider necessary; move speculative behaviour (unicode, performance, input types, limits not mentioned) to Open questions with an assumption instead of new ACs. ' +
     'Keep scope proportional: a small function needs roughly 3-6 ACs and 1-3 tasks; group closely related ACs into one task. Drop duplicates, keep ACs sharp and testable, number them AC-1.., EC-1.., Q-1.., T-1... Order tasks so each builds on the previous.\n' +
     `Write ${dir}/spec.md using your spec template (title line: # ${req.title}, Status: draft, Source: ${req.source}, Slug: ${req.slug}).\n` +
-    `Write ${dir}/tasks.md as a checklist: "- [ ] T-1 <title> (AC-1, AC-2)"; end the line of a setup task with " [setup]". Every criterion of a setup task needs a "- **Verify:** \`<command>\`" line in spec.md (or "- **Verify (manual):**" only when no automatic check exists). In a repo with no test suite, put the setup task that installs the test framework before the first tdd task.\n` +
+    `Write ${dir}/tasks.md as a checklist: "- [ ] T-1 <title> (AC-1, AC-2)"; end the line of a setup task with " [setup]" and of a ui task (it changes what the user sees) with " [ui]". A spec with ui tasks has a "## UI" section, and a criterion only a browser can show carries one "- **Check (browser):** ..." line (see "Task kinds" in your instructions). Every criterion of a setup task needs a "- **Verify:** \`<command>\`" line in spec.md (or "- **Verify (manual):**" only when no automatic check exists). In a repo with no test suite, put the setup task that installs the test framework before the first tdd task.\n` +
     stateStep +
     'If .tdd-flow/ is not in .gitignore, do not change .gitignore - just mention it in assumptions.\n' +
     (decisions.length
@@ -352,7 +352,7 @@ try {
   // ---------- Critique ----------
   phase('Critique')
   const CRITICS = [
-    { key: 'testability', ask: 'Check every AC: is it unambiguous, observable, and automatable with the repo\'s test framework? Flag vague words ("fast", "user-friendly"), hidden multiple behaviours in one AC, a "Must not" line a test cannot observe, and tasks too big for a few red-green cycles. Setup tasks ([setup] in tasks.md) are checked by verify commands instead of tests: flag a setup criterion without a Verify line or with a command that cannot tell pass from fail, and flag a setup task that contains logic a test could check (it must be a tdd task).' },
+    { key: 'testability', ask: 'Check every AC: is it unambiguous, observable, and automatable with the repo\'s test framework? Flag vague words ("fast", "user-friendly"), hidden multiple behaviours in one AC, a "Must not" line a test cannot observe, and tasks too big for a few red-green cycles. Setup tasks ([setup] in tasks.md) are checked by verify commands instead of tests: flag a setup criterion without a Verify line or with a command that cannot tell pass from fail, and flag a setup task that contains logic a test could check (it must be a tdd task). A ui task ([ui]) may hold criteria with a "Check (browser)" line, which a browser checks instead of a test: flag such a line on a task that is not [ui], a browser check for something a DOM or component test could observe (text, role, name, state, keyboard), a criterion that says only "looks right" without saying what must be seen, a ui task that contains logic (validation, mapping, API calls), and a spec with ui tasks but no "## UI" section or no design reference and no open question about it.' },
     // No requirement text (a recheck of a spec written from prompt text): nothing to compare against.
     ...(req.text ? [{ key: 'completeness', ask: 'Compare the spec against the RAW requirement below. Flag anything required but missing, anything in the spec NOT supported by the requirement (invented scope), and edge cases a careful engineer would expect.' }] : []),
     {

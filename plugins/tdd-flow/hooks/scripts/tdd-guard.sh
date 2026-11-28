@@ -55,9 +55,11 @@ esac
 if [ -z "$locked" ]; then
   case "$lower" in
     */test/*|*/tests/*|*/__tests__/*|*/spec/*|*/specs/*|*/testing/*|*.tests/*|*.test/*|*.unittests/*|*.integrationtests/*) exit 0 ;;
+    # Browser tests and what only tests use: Playwright's default e2e/ folder, fixtures, mocks.
+    */e2e/*|*/__fixtures__/*|*/__mocks__/*|*/cypress/*) exit 0 ;;
   esac
   case "$lbase" in
-    test_*|*_test.*|*.test.*|*.spec.*|*_spec.*|conftest.py) exit 0 ;;
+    test_*|*_test.*|*.test.*|*.spec.*|*_spec.*|*.stories.*|*.cy.*|conftest.py) exit 0 ;;
     jest.config.*|jest.setup.*|vitest.config.*|vitest.setup.*|vitest.workspace.*|playwright.config.*|cypress.config.*|karma.conf.*) exit 0 ;;
   esac
   # JVM and .NET test classes by their case-sensitive suffix (LatestTest.java, not Latest.java).
@@ -80,9 +82,9 @@ if [ -n "$locked" ]; then
   exit 2
 fi
 
-# Only guard source-code files; fixtures, docs and other configs are fine during RED.
+# Only guard source-code files, UI templates and styles; fixtures, docs and other configs are fine during RED.
 case "$lbase" in
-  *.cs|*.vb|*.fs|*.ts|*.tsx|*.js|*.jsx|*.mjs|*.cjs|*.py|*.go|*.rs|*.java|*.kt|*.rb|*.php|*.c|*.cc|*.cpp|*.h|*.hpp|*.swift|*.scala)
+  *.cs|*.vb|*.fs|*.ts|*.tsx|*.js|*.jsx|*.mjs|*.cjs|*.py|*.go|*.rs|*.java|*.kt|*.rb|*.php|*.c|*.cc|*.cpp|*.h|*.hpp|*.swift|*.scala|*.vue|*.svelte|*.astro|*.razor|*.cshtml|*.css|*.scss|*.sass|*.less)
     echo "tdd-guard: RED phase is active ($state). Write a failing test first; production file '$rel' may only change in GREEN or REFACTOR. If this is a test file with an unusual name, rename it to match the repo's test convention, or set phase to GREEN after the test fails for the right reason. If no tdd-flow workflow is running (an earlier run stopped mid-cycle), ask the user before setting \"phase\" to \"IDLE\" in that file." >&2
     exit 2 ;;
 esac
