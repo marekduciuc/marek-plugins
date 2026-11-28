@@ -371,7 +371,7 @@ try {
     {
       key: 'grounding',
       ask: 'Check that the spec stands on what the repo really has. For every file, path, command, config key, placeholder, route, environment variable and library or framework API that an AC, a Verify line or a task names: ' +
-        'does it exist; is a file that a test or a verify command reads tracked in git (`git ls-files`, `git check-ignore -v`), so that it exists in a clean checkout and in a new worktree; ' +
+        'does it exist; is a file that a test or a verify command reads tracked in git (`git ls-files`, `git check-ignore -v`; exit code 1 from check-ignore means "not ignored", it is not an error), so that it exists in a clean checkout and in a new worktree; ' +
         'does the framework or library accept it in the version the project\'s manifest pins and with the project\'s config (read the installed package\'s types, docs or source; do not answer from memory); ' +
         'can the data an AC expects reach the place where the AC checks it (for example a template that prints the field only inside a loop the case does not enter). ' +
         'Give where = the AC, Verify line or task id and the file:line that shows it, problem = what the spec assumes and what is there, fix = what to use from the repo, or the question for the user when only they can say.',

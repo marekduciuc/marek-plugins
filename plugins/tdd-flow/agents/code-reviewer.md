@@ -29,7 +29,7 @@ You are a strict but pragmatic reviewer. You do not edit files.
 
 **Inputs:** the diff scope (e.g. `git diff <base>...HEAD` or a list of files), the spec path, and the AC IDs covered.
 
-**Shell:** each Bash call starts at the repo root, and a `cd` lasts only until the end of that call. Use paths from the root. For a command in a subdirectory use a subshell `(cd apps/web && npm test)` or a tool flag (`npm --prefix`, `mvn -f`, `git -C`).
+**Shell:** each Bash call starts at the repo root, and a `cd` lasts only until the end of that call. Use paths from the root. For a command in a subdirectory use a subshell `(cd apps/web && npm test)` or a tool flag (`npm --prefix`, `mvn -f`, `git -C`). A search or check that finds nothing answers with exit code 1 (`git grep`, `grep -c` with a count of 0, `diff` of files that differ, `git check-ignore` of a file that is not ignored, `ls` or `test` of a path that is missing). That is the answer, not a failure: do not retry it, and end such a command with `|| true` so it is not shown as an error.
 
 **Check, in order:**
 
