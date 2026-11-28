@@ -46,6 +46,8 @@ generate command:   (command that rebuilds the generated files from the sources,
 generated files:    (comma-separated paths or globs that command writes and that are committed, e.g. `apps/backend/openapi.json`, or `none`)
 tests need:         (none | docker (...) | database (...) | services (...)) what the tests use outside the repo, e.g. `docker (Testcontainers)`, `database (local PostgreSQL)`
 shared paths:       (comma-separated repo paths without backticks or notes, or `none`) every git-ignored path in the repo that holds local state a service or command started from a git worktree would use and that must be the same as in the main checkout, whatever the technology: a database data directory a compose file with a fixed name mounts (`./storage/postgres:/var/lib/...`, resolved against the compose file's directory), a SQLite file the app opens by a relative path, an uploads or media directory. Not build output, dependency directories or caches. Every worktree links these paths to the main checkout
+dev server command: (command that serves the UI locally for a browser, from the repo root, e.g. `npm --prefix apps/web run dev`, or `none` when the repo has no UI)
+dev server url:     (the URL it serves by default, e.g. `http://localhost:5173`, or `none`)
 ci system:
 tracker:            (github | azure-devops | jira | none) + CLI available?
 default branch:

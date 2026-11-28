@@ -10,7 +10,7 @@ Personal Claude Code plugin: an end-to-end dev pipeline built on **dynamic workf
 - **Skill** `ship-feature`: chains the workflows and holds the human approval gates. Workflows can't ask questions mid-run, so the gates sit between runs.
 - **Skills** `autopilot` + `implement-spec`: implement every approved spec in parallel, one background session per spec in its own worktree, each ending with a simplification pass, a code review and a PR. See [Autopilot](#autopilot).
 - **Skill** `simplify-codebase`: finds code that does not need to exist across the repo and turns it into refactor specs. See [Simplification](#simplification).
-- **Hook** `tdd-guard`: blocks production-code edits while a cycle is in RED, and locks the settings of the linter, formatter, type check, CI and git hooks for that phase (see [Locked settings](#locked-settings-in-red)). `tdd-guard-bash` applies the same rules to files a shell command writes. The state that counts is the one of the repo (or worktree) the edited file is in, and test folders are matched inside that repo.
+- **Hook** `tdd-guard`: blocks production-code edits (source, UI templates, styles) while a cycle is in RED, and locks the settings of the linter, formatter, type check, CI and git hooks for that phase (see [Locked settings](#locked-settings-in-red)). `tdd-guard-bash` applies the same rules to files a shell command writes. The state that counts is the one of the repo (or worktree) the edited file is in, and test folders are matched inside that repo.
 - **Hook** `push-gate`: before Claude runs `git push` or `gh pr create` in any repo, runs the type check, lint and tests and a gitleaks secret scan; a failure blocks the command. It also blocks a git command that skips the repo's hooks (`--no-verify`). See [push-gate](#push-gate).
 - **Mod** `hooks/register.tsx` (a Claude Code hooks module, listed under `modules` in `hooks/hooks.json`, state contract in `types/index.d.ts`): the status pane beside the chat, `/tdd-status`. See [Status pane](#status-pane).
 
@@ -69,6 +69,19 @@ Some work cannot be test-driven: `docker-compose.yml`, `Dockerfile`, CI pipeline
 ```
 
 A task is `setup` only if it has no logic that a test could check. Logic always goes into a tdd task, and the spec critics and the per-task reviewer flag misclassified tasks. tdd-implement builds a setup task in one SETUP step (implementer). The step runs every verify command and must not break the test suite. The task then gets the normal review, and is committed as `chore(<slug>): ...`. A verify command that cannot run in the environment (for example, the Docker daemon is not running) is reported, not treated as a failure. Such commands are listed in `unverified` in the result, together with the manual checks.
+
+### UI tasks
+
+A task that changes what the user sees is marked `[ui]` in `tasks.md`. A test can say "the button is named Save and Escape closes the dialog"; it cannot say "the dialog fits 375 px" or "it follows the design". So a ui task has two sorts of criteria:
+
+- **Observable by a test** (text, role, accessible name, state, keyboard, an accessibility assertion): ordinary Given/When/Then criteria, written test-first like any tdd task.
+- **Only a browser shows it** (layout, spacing, responsive behaviour, a visual state, fidelity to the design): the criterion carries one line `- **Check (browser):** <route or component, what to look at, viewports>`. `tdd-flow plan` refuses that line on a task that is not `[ui]`, so a criterion cannot leave the red-green cycle unnoticed.
+
+The spec gets a `## UI` section: design reference, what to reuse, the states to cover, the viewports. Without a design reference the analyst asks instead of inventing a look, so design direction is settled at the approval gate.
+
+`tdd-implement` runs a ui task as tdd for its testable criteria (none: no RED/GREEN), then a **UI step**: the implementer builds what the browser checks ask for, starts the dev server (`dev server command` in `stack.md`) on a free port, opens each route with the browser tool the project already has, records console errors and sideways scrolling at each viewport, takes screenshots into `$(git rev-parse --git-path tdd-flow-ui)/<task>/` (never committed) and reads them. Each check is `pass`, `fail` or `skipped`. A failed check is retried like any step; a `skipped` one (no browser tool, no dev server) lands in `unverified` and in the PR body, never among the passed. The reviewer opens the screenshots itself and applies a UI lens; a finding about what the browser shows (`visual`) goes back to the UI step, not to a failing test.
+
+Limits: nothing is installed for the browser check, so a project without a browser tool gets `skipped` until a `[setup]` task adds one. Parallel worktrees each start their own dev server; the step is told to use a free port and its own URL, which a dev server with a fixed port may not allow. Logic (validation, mapping, API calls) stays in tdd tasks. The interactive design skills (`frontend-design`, `design-consultation`, `design-review`, `qa`) are not called by the workflow: they ask questions or commit on their own, so run them before the spec is approved or before the merge.
 
 ### Refactor tasks
 

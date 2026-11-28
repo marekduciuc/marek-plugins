@@ -156,7 +156,7 @@ Nit and Pre-existing findings are not fixed; they go into the PR body.
    - **Decisions reused**: each question answered from an earlier decision (question, answer, source spec and Q id), if any
    - **Decisions made by the session**: each plan question you decided yourself (Q id, question, answer, the options not taken and why), if any, so the reviewer can overrule them before the merge
    - **Code review**: counts per tag; what the fix round fixed; Nit and Pre-existing findings as a list; findings dropped or set aside, with the reason
-   - **Not verified here**: the `unverified` list from step 1 (verify commands that could not run), if any
+   - **Not verified here**: the `unverified` list from step 1 (verify commands and browser checks that could not run), if any
    - **Test plan**: the test command from `.tdd-flow/stack.md`, that the push-gate ran it before the push, and whether `sync-base` merged `<base>` or regenerated files
    - the attribution line your instructions give for PR descriptions
 5. Read the URL that `gh pr create` printed (or `gh pr view --json url`).

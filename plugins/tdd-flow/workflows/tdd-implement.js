@@ -41,13 +41,26 @@ const PLAN = {
   required: ['slug', 'approved', 'testAll', 'testSingle', 'baselinePass', 'tasks'],
   properties: {
     slug: str, status: str, approved: { type: 'boolean' },
-    testAll: str, testSingle: str, lint: str, typeCheck: str,
+    testAll: str, testSingle: str, lint: str, typeCheck: str, devServer: str, devUrl: str,
     baselinePass: { type: 'boolean' }, baselineSummary: str, noTestSuite: { type: 'boolean' },
     taskCount: { type: 'integer' }, openIds: strs,
     tasks: { type: 'array', items: { type: 'object', required: ['id', 'title', 'done', 'behaviours'], properties: {
-      id: str, title: str, done: { type: 'boolean' }, kind: { type: 'string', enum: ['tdd', 'setup', 'refactor'] },
+      id: str, title: str, done: { type: 'boolean' }, kind: { type: 'string', enum: ['tdd', 'setup', 'refactor', 'ui'] },
       behaviours: { type: 'array', items: { type: 'object', required: ['ref', 'text'], properties: { ref: str, text: str } } },
       verify: { type: 'array', items: { type: 'object', required: ['ref', 'command'], properties: { ref: str, command: str, manual: { type: 'boolean' } } } },
+      // ui tasks: criteria only a browser shows, each with its "Check (browser)" line.
+      browserChecks: { type: 'array', items: { type: 'object', required: ['ref', 'text', 'check'], properties: { ref: str, text: str, check: str } } },
+    } } },
+  },
+}
+// The UI step of a ui task: build what only a browser shows, then look at it. `skipped` = no browser or server here.
+const UI = {
+  type: 'object',
+  required: ['suitePass', 'filesChanged', 'summary', 'checkResults'],
+  properties: {
+    suitePass: { type: 'boolean' }, filesChanged: strs, summary: str, failures: str, concerns: str,
+    checkResults: { type: 'array', items: { type: 'object', required: ['ref', 'result'], properties: {
+      ref: str, result: { type: 'string', enum: ['pass', 'fail', 'skipped'] }, note: str, screenshots: strs,
     } } },
   },
 }
@@ -98,6 +111,8 @@ const REVIEW = {
     verdict: { type: 'string', enum: ['APPROVE', 'CHANGES_REQUESTED'] }, testsPass: { type: 'boolean' }, lintPass: { type: 'boolean' },
     findings: { type: 'array', items: { type: 'object', required: ['severity', 'where', 'issue', 'evidence', 'behavioural'], properties: {
       severity: { type: 'string', enum: ['blocker', 'major', 'minor'] }, where: str, issue: str, evidence: str, fix: str, behavioural: { type: 'boolean' },
+      // ui tasks: the finding is about what the browser shows (layout, a state, a token), so no test can pin it.
+      visual: { type: 'boolean' },
     } } },
     uncoveredAcs: strs,
   },
@@ -202,7 +217,8 @@ const plan = planned.ok ? planned.result : await run(
   '2. approved = true only if spec.md has "Status: approved".\n' +
   '3. Run the full test suite once as a baseline; report pass/fail and a short summary. If the repo has no test framework or no tests yet (stack.md says "none", or no test command exists), do not run anything: set noTestSuite = true, baselinePass = true and testAll/testSingle = "none".\n' +
   '4. For every task in tasks.md return id, title, done (checkbox ticked) and its behaviours: one entry per acceptance criterion or edge case mapped to the task, in implementation order (simplest happy path first). ref = AC/EC id, text = the full Given/When/Then or edge-case text.\n' +
-  '   kind = "setup" if the task line ends with "[setup]" (or its Kind in the spec task table is setup), "refactor" for "[refactor]" (or Kind refactor), otherwise "tdd". For setup tasks also return verify: one entry per "Verify:" line of the task\'s criteria in spec.md, with ref = AC id and command = the exact command; for a "Verify (manual):" line set manual = true and command = the check text.\n' +
+  '   kind = "setup" if the task line ends with "[setup]" (or its Kind in the spec task table is setup), "refactor" for "[refactor]" (or Kind refactor), "ui" for "[ui]" (or Kind ui), otherwise "tdd". For a ui task, a criterion with a "Check (browser):" line is not a behaviour: return it in browserChecks with ref, text (its Given/When/Then) and check (the text of that line). ' +
+  'For setup tasks also return verify: one entry per "Verify:" line of the task\'s criteria in spec.md, with ref = AC id and command = the exact command; for a "Verify (manual):" line set manual = true and command = the check text.\n' +
   'Do not modify source or test files. Do not run git commands that change anything.',
   { schema: PLAN, model: M.worker, label: 'plan (agent)', effort: 'low' })
 if (!plan) throw new Error('tdd-flow: planning failed.')
@@ -242,7 +258,7 @@ if (refactors.length) {
 }
 if (opt.maxTasks && tasks.length > opt.maxTasks) { log(`Limiting this run to ${opt.maxTasks} of ${tasks.length} open tasks`); tasks = tasks.slice(0, opt.maxTasks) }
 // A task this run implements must come with its criteria; with none, the cycle would do nothing and tick it.
-const empty = tasks.filter(t => !t.synthetic && !(t.behaviours && t.behaviours.length))
+const empty = tasks.filter(t => !t.synthetic && !(t.behaviours && t.behaviours.length) && !(t.kind === 'ui' && t.browserChecks && t.browserChecks.length))
 if (empty.length) throw new Error(`tdd-flow: the plan has no criteria for ${empty.map(t => t.id).join(', ')}. Rerun; if it repeats, check the AC/EC ids of these tasks in tasks.md and spec.md.`)
 if (!tasks.length) {
   // Every task is ticked but the spec was never marked (e.g. finished before the status existed): mark it now.
@@ -476,6 +492,39 @@ async function setupStep(task, findings = null) {
   return { ok: true, files: changedFiles(r.attempts) }
 }
 
+// UI step of a ui task, after its tests are green: the implementer builds what only a browser shows, then opens it
+// and checks every "Check (browser)" criterion. Modelled on setupStep: success is computed here (suite green, every
+// check reported, none failed), and a check that cannot run here ("skipped": no dev server, no browser) is collected
+// in `unverified`, never counted as passed. Returns {ok:true, files, results} | {ok:false, step, details}
+async function uiStep(task, findings = null) {
+  const checks = task.browserChecks || []
+  const failing = (r) => [
+    ...checks.filter(c => !r.checkResults.some(v => sameRef(v.ref, c.ref))).map(c => `${c.ref} (not checked)`),
+    ...r.checkResults.filter(v => v.result === 'fail').map(v => `${v.ref}${v.note ? ' - ' + v.note : ''}`),
+  ]
+  const name = `${task.id} UI${findings ? ' fix' : ''}`
+  const r = await escalate(name,
+    (model, extra, label) => run(
+      `UI step. ${ctx}\nTask ${task.id} (ui task): ${task.title}\n` +
+      `The tests of this task are green. Now the part no test can observe. Read the "## UI" section of ${dir}/spec.md first.\n` +
+      `Browser checks - build what each one asks for, then check each in a browser and report every one in checkResults with its ref:\n${checks.map(c => `- ${c.ref}: ${c.text}\n  Check: ${c.check}`).join('\n') || '- none'}\n` +
+      (plan.devServer ? `Dev server: \`${plan.devServer}\`${plan.devUrl ? ` (usually ${plan.devUrl})` : ''}. ` : 'stack.md names no dev server command: find it in the project (package scripts, README). ') +
+      'Other worktrees may run the same server: start yours on a free port, use the URL your own server prints (never assume the usual URL is yours), and stop it when you are done.\n' +
+      (findings && findings.length ? `Address these review findings first, then check everything again:\n${JSON.stringify(findings, null, 1)}\n` : findings ? 'The code changed after your last check (review fixes): check everything again.\n' : '') +
+      `Save screenshots under \`$(git rev-parse --git-path tdd-flow-ui)/${task.id}/\` (outside the working tree, never committed) and list them per check. ` +
+      `Run the full test suite; it must stay green. Append a UI entry for ${task.id} to ${dir}/tdd-log.md.` + extra,
+      { agentType: A('implementer'), model, schema: UI, label, phase: findings ? 'Review' : 'Implement' }),
+    r => r.suitePass && !failing(r).length,
+    r => `Not done yet:\n${failing(r).join('\n') || ''}\n${r.failures || r.summary}\nFix the code (never the check), then check every browser check again.`)
+  if (!r.ok) return { ok: false, step: name, details: r.result ? [...failing(r.result), r.result.failures || r.result.summary].join('\n') : 'agent failed' }
+  for (const v of r.result.checkResults) {
+    const key = `${task.id}: browser check ${refKey(v.ref)}`
+    if (v.result === 'skipped') unverified.set(key, `${key}${v.note ? ' - ' + v.note : ''}`)
+    else unverified.delete(key)
+  }
+  return { ok: true, files: changedFiles(r.attempts), results: r.result.checkResults }
+}
+
 // Refactor task (behaviour-preserving change, e.g. a simplify proposal). CHARACTERIZE: the test-writer names or writes
 // tests that pin today's behaviour; they are committed on their own after the CLI ran the full suite on the old code,
 // so any later edit of them shows in the review diff. REFACTOR: the implementer applies the proposal, without
@@ -544,24 +593,28 @@ try {
   for (const task of tasks) {
     const isSetup = task.kind === 'setup'
     const isRefactor = task.kind === 'refactor'
+    const isUi = task.kind === 'ui'
+    // The planning-agent fallback may leave the list out.
+    if (isUi) task.browserChecks = task.browserChecks || []
     current = task // before the first agent call of the task: the agent-limit handler names it
     if (!isSetup && !hasTests) {
       return await blocked(task, 'NO TEST SUITE', `${task.id} is a ${task.kind || 'tdd'} task, but the repo has no test command yet.`, false,
         `Add a [setup] task before ${task.id} that installs the test framework and updates .tdd-flow/stack.md (or set the framework up by hand), then rerun /tdd-flow:tdd-implement.`)
     }
     // Start a task only if its minimum cost fits: tdd = RED + GREEN per batch, review, commit;
-    // setup = setup step, review, commit; refactor = characterize + its commit, refactor, review, commit.
-    const est = (isSetup ? 3 : isRefactor ? 5 : Math.max(1, Math.ceil(task.behaviours.length / BATCH)) * 2 + 2) + (checksSuite() ? 1 : 0)
+    // setup = setup step, review, commit; refactor = characterize + its commit, refactor, review, commit;
+    // ui = as tdd for its behaviours (none: no RED/GREEN) plus the UI step.
+    const est = (isSetup ? 3 : isRefactor ? 5 : Math.ceil(task.behaviours.length / BATCH) * 2 + 2 + (isUi && task.browserChecks.length ? 1 : 0)) + (checksSuite() ? 1 : 0)
     if (spawned + est + 1 > MAX_AGENTS) {
       return { status: 'agent_limit', slug: plan.slug, branch: br.branch, tasksCompleted: done, escalationsToStrongModel: escalations,
         next: done.length
           ? `Agent limit (${MAX_AGENTS}) reached after ${done.length} task(s). Rerun /tdd-flow:tdd-implement to continue with ${task.id}.`
           : `Task ${task.id} needs at least ${est} agents, but only ${MAX_AGENTS - spawned - 1} are left. Rerun with a higher {maxAgents}.` }
     }
-    log(`${task.id}: ${task.title} (${isSetup ? 'setup task' : isRefactor ? 'refactor task' : task.behaviours.length + ' behaviour(s)'})`)
+    log(`${task.id}: ${task.title} (${isSetup ? 'setup task' : isRefactor ? 'refactor task' : task.behaviours.length + ' behaviour(s)' + (isUi ? `, ${task.browserChecks.length} browser check(s)` : '')})`)
     const taskFiles = new Set()
     const testFixes = []
-    let refInfo = null, skipReason = ''
+    let refInfo = null, skipReason = '', uiResults = []
     if (isRefactor) {
       const r = await refactorStep(task)
       if (r.notApplicable) {
@@ -580,8 +633,21 @@ try {
       if (!t.ok) return await blocked(task, t.step, t.details)
       t.files.forEach(f => taskFiles.add(f))
       testFixes.push(...t.testFixes)
+      // A ui task without browser checks is a tdd task whose review uses the UI lens: nothing to look at here.
+      if (isUi && task.browserChecks.length) {
+        const u = await uiStep(task)
+        if (!u.ok) return await blocked(task, u.step, u.details)
+        u.files.forEach(f => taskFiles.add(f))
+        uiResults = u.results
+      }
     }
 
+    // Built for every review round, so a round after a UI fix sees that fix's results and screenshots.
+    // The reviewer looks at the screenshots itself: the implementer built the UI and must not be the only one to grade it.
+    const uiScope = () => `Task kind: ui. The UI lens applies. Criteria checked in a browser, not by tests (never report them as uncovered ACs because they have no test): ${task.browserChecks.map(c => c.ref).join(', ') || 'none'}.\n` +
+      `Browser check results from the implementer:\n${uiResults.map(v => `- ${v.ref}: ${v.result}${v.note ? ' - ' + v.note : ''}${(v.screenshots || []).length ? ' [' + v.screenshots.join(', ') + ']' : ''}`).join('\n') || '- none'}\n` +
+      'Open the screenshot files (Read) and judge them against the "## UI" section of the spec and each check; a check reported as pass that the screenshot contradicts is a blocker. A skipped check is not a finding. ' +
+      'Mark a finding visual=true when it is about what the browser shows (layout, a missing state, a wrong token) and no test can pin it. '
     const scope = isRefactor
       ? `Task kind: refactor (behaviour-preserving). Proposal: ${refInfo ? refInfo.proposal : ''}\n` +
         `Tests that pinned the behaviour, committed before the change (they must be unchanged in the diff):\n${refInfo ? pinnedList(refInfo) : ''}\n` +
@@ -594,7 +660,7 @@ try {
         'The evidence is the verify commands, not tests: re-run them. A criterion whose command fails or is missing is an uncovered AC; a command that cannot run here (tool or daemon missing) is not. ' +
         'Logic that a test could check does not belong in a setup task: report it as a blocker with behavioural=true.' +
         (hasTests ? '' : ' There is no test suite yet: report testsPass = true.')
-      : `ACs in scope: ${task.behaviours.map(b => b.ref).join(', ')}.`
+      : `ACs in scope: ${task.behaviours.map(b => b.ref).join(', ') || 'none'}.`
     let review = null
     for (let round = 1; !skipReason && round <= MAX_REVIEW_ROUNDS + 1; round++) {
       // The CLI runs the full suite itself, so a wrong suitePass from the implementer cannot reach the commit.
@@ -604,7 +670,7 @@ try {
       if (checked && !checked.ok) log(`${task.id}: the CLI suite check did not run (${checked.error}) - relying on the reviewer`)
       const suite = checked && checked.ok && checked.result.ran ? checked.result : null
       review = await run(
-        `Review task ${task.id} (${task.title}). ${ctx}\nScope: uncommitted changes (\`git diff HEAD\` plus untracked files). ${scope}\n` +
+        `Review task ${task.id} (${task.title}). ${ctx}\nScope: uncommitted changes (\`git diff HEAD\` plus untracked files). ${isUi ? uiScope() : ''}${scope}\n` +
         (suite ? `The CLI ran the full suite on these files: ${suite.pass ? 'PASS' : 'FAIL'} (\`${suite.command}\`).${suite.pass ? '' : '\n' + suite.summary}\n` : '') +
         (testFixes.length ? `These tests were changed by the test-writer after the implementer reported them as wrong, so they were never seen failing in that form. Check each still asserts its behaviour fully (no weakened or removed assertion); a weakened one is a blocker with behavioural=true:\n${testFixes.map(f => '- ' + f).join('\n')}\n` : '') +
         `Write your review to ${dir}/review.md (append a "## ${task.id} round ${round}" section). Mark each finding behavioural=true if fixing it changes observable behaviour (needs a test), false for structure/naming/style. ` +
@@ -639,11 +705,15 @@ try {
         s.files.forEach(f => taskFiles.add(f))
         continue
       }
+      // ui task: what only a browser shows cannot become a failing test. Those findings, and browser-check criteria
+      // the reviewer calls uncovered, go to a UI fix after the test-first fixes; it checks every browser check again.
+      const isBrowserRef = (ac) => isUi && task.browserChecks.some(c => sameRef(c.ref, ac))
+      const visual = isUi ? [...must.filter(f => f.visual), ...review.uncoveredAcs.filter(isBrowserRef).map(ac => `${ac} is not done or its browser check does not hold.`)] : []
       const fixes = [
-        ...review.uncoveredAcs.map((ac, i) => ({ ref: `${ac}-gap`, text: `${ac} is not adequately covered by a test. Re-read ${ac} in the spec and specify it.` })),
-        ...must.filter(f => f.behavioural).map((f, i) => ({ ref: `R${round}-${i + 1}`, text: `Review finding at ${f.where}: ${f.issue}. Expected: ${f.fix || 'correct behaviour per spec'}` })),
+        ...review.uncoveredAcs.filter(ac => !isBrowserRef(ac)).map((ac, i) => ({ ref: `${ac}-gap`, text: `${ac} is not adequately covered by a test. Re-read ${ac} in the spec and specify it.` })),
+        ...must.filter(f => f.behavioural && !(isUi && f.visual)).map((f, i) => ({ ref: `R${round}-${i + 1}`, text: `Review finding at ${f.where}: ${f.issue}. Expected: ${f.fix || 'correct behaviour per spec'}` })),
       ]
-      const structural = must.filter(f => !f.behavioural)
+      const structural = must.filter(f => !f.behavioural && !(isUi && f.visual))
       const t = await tddStep(task, fixes, structural)
       if (!t.ok) return await blocked(task, t.step, t.details)
       t.files.forEach(f => taskFiles.add(f))
@@ -659,6 +729,12 @@ try {
           r => `The suite still fails:\n${r.failures || r.summary}`)
         changedFiles(fx.attempts).forEach(f => taskFiles.add(f))
         if (!fx.ok) return await blocked(task, 'REVIEW FIX', fx.result ? (fx.result.failures || fx.result.summary) : 'agent failed')
+      }
+      if (isUi && (task.browserChecks.length || visual.length)) {
+        const u = await uiStep(task, visual)
+        if (!u.ok) return await blocked(task, 'REVIEW FIX', u.details)
+        u.files.forEach(f => taskFiles.add(f))
+        uiResults = u.results
       }
     }
 

@@ -2395,3 +2395,37 @@ test('conflicts predicts clashes between spec branches and with the base, as if 
   assert.deepStrictEqual(after.withBase, []);
   assert.strictEqual(run(dir, 'conflicts', { slugs: ['c'] }).result.text, 'No merge conflicts predicted between the spec branches and main (as last fetched).');
 });
+
+test('plan splits a [ui] task into behaviours and browser checks, and refuses a browser check elsewhere', () => {
+  const { dir, write } = repo();
+  const ui = SPEC.replace('## Edge cases and error handling', `### AC-3 Dialog closes on Escape
+- **Given** the open dialog
+- **When** Escape is pressed
+- **Then** it closes and focus returns to the button
+
+### AC-4 Dialog fits a phone
+- **Given** the open dialog
+- **When** the viewport is 375 px wide
+- **Then** nothing scrolls sideways
+- **Check (browser):** /reports, open the dialog, @375 and @1280
+
+## Edge cases and error handling`);
+  write('.tdd-flow/features/12-csv/spec.md', ui);
+  write('.tdd-flow/features/12-csv/tasks.md', '- [ ] T-1 Dialog (AC-3, AC-4) [ui]\n- [ ] T-2 Restyle the guide (AC-4) [ui]\n- [ ] T-3 Build (AC-1)\n');
+  write('.tdd-flow/stack.md', 'test command (all): `node -e 0`\ntest command (single file / filter): `node --test <file>`\ndefault branch: main\ndev server command: `npm run dev`\ndev server url: http://localhost:5173\n');
+  const p = run(dir, 'plan', { baseline: false }).result;
+  assert.deepStrictEqual(p.tasks.map((t) => [t.id, t.kind, t.behaviours.map((b) => b.ref), (t.browserChecks || []).map((c) => c.ref)]), [
+    ['T-1', 'ui', ['AC-3'], ['AC-4']], ['T-2', 'ui', [], ['AC-4']], ['T-3', 'tdd', ['AC-1'], []], // "Build" and "guide" are not ui
+  ]);
+  assert.strictEqual(p.tasks[0].browserChecks[0].check, '/reports, open the dialog, @375 and @1280');
+  assert.match(p.tasks[0].browserChecks[0].text, /nothing scrolls sideways$/); // the check line is not part of the criterion text
+  assert.deepStrictEqual([p.devServer, p.devUrl], ['npm run dev', 'http://localhost:5173']);
+  write('.tdd-flow/features/12-csv/tasks.md', '- [ ] T-1 Dialog (AC-3, AC-4)\n');
+  const bad = run(dir, 'plan', { baseline: false });
+  assert.match(bad.error, /T-1: AC-4 has a "Check \(browser\)" line, but T-1 is not a \[ui\] task/);
+  // The marker counts at the end of the line only, and a check line must say what to check.
+  write('.tdd-flow/features/12-csv/tasks.md', '- [ ] T-5 Fix the [ui] flag parser (AC-1)\n- [ ] T-6 Dialog (AC-4) [ui]\n');
+  assert.deepStrictEqual(run(dir, 'plan', { baseline: false }).result.tasks.map((t) => [t.title, t.kind]), [['Fix the [ui] flag parser', 'tdd'], ['Dialog', 'ui']]);
+  write('.tdd-flow/features/12-csv/spec.md', ui.replace('- **Check (browser):** /reports, open the dialog, @375 and @1280', '- **Check (browser):**'));
+  assert.match(run(dir, 'plan', { baseline: false }).error, /T-6: AC-4 has a "Check \(browser\)" line that says nothing to check/);
+});

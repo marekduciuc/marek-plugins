@@ -306,6 +306,7 @@ function readStack() {
     language: get('language(s)'), testAll: get('test command (all)', true), testSingle: get('test command (single file / filter)', true),
     lint: get('lint/format command', true), typeCheck: get('type check command', true), tracker: get('tracker'), defaultBranch: get('default branch'), ci: get('ci system'),
     baseline: get('baseline test run'), generate: get('generate command', true), generatedFiles: get('generated files'),
+    devServer: get('dev server command', true), devUrl: get('dev server url'),
   };
 }
 
@@ -657,10 +658,10 @@ function parseSpec(spec) {
       verifyList = null;
     }
     const h = line.match(headingRe);
-    if (h) { cur = crit[h[1]] = { name: h[2].trim(), parts: [], verify: [] }; continue; }
+    if (h) { cur = crit[h[1]] = { name: h[2].trim(), parts: [], verify: [], checks: [] }; continue; }
     if (/^#{1,4}\s/.test(line)) { cur = null; }
     const ec = !cur && line.match(/^\s*[-*]\s+\**(EC-\d+[a-z]*)\**(?![A-Za-z0-9])[\s:.\-–—]*(.*)$/);
-    if (ec) { if (!crit[ec[1]]) crit[ec[1]] = { name: '', parts: [ec[2].trim()], verify: [] }; continue; }
+    if (ec) { if (!crit[ec[1]]) crit[ec[1]] = { name: '', parts: [ec[2].trim()], verify: [], checks: [] }; continue; }
     if (!cur) continue;
     const v = line.match(/^\s*[-*]\s*\*{0,2}Verify(\s*\(manual\))?\s*:?\s*\*{0,2}\s*:?\s*(.*)$/i);
     if (v) {
@@ -672,6 +673,9 @@ function parseSpec(spec) {
       cur.verify.push({ command: (manual ? text : bt ? bt[1] : text).trim(), manual });
       continue;
     }
+    // "- **Check (browser):** <route, what to look at, viewports>": a criterion no test can observe (ui tasks).
+    const b = line.match(/^\s*[-*]\s*\*{0,2}Check\s*\(browser\)(.*)$/i);
+    if (b) { cur.checks.push(b[1].replace(/\*\*/g, '').replace(/^[\s:*]+/, '').trim()); continue; }
     const g = line.match(/^\s*[-*]\s+(.*\S)\s*$/) || line.match(/^\s*(\**(?:Given|When|Then|And|But)\b.*\S)\s*$/i);
     if (g) cur.parts.push(g[1].replace(/\*\*/g, ''));
   }
@@ -679,8 +683,10 @@ function parseSpec(spec) {
   return { status, source, crit, text };
 }
 
-// Task kinds: tdd (red-green-refactor), setup (verify commands), refactor (characterize, then behaviour-preserving change).
-const kindOf = (s) => (/refactor/i.test(s) ? 'refactor' : /setup/i.test(s) ? 'setup' : 'tdd');
+// Task kinds: tdd (red-green-refactor), setup (verify commands), refactor (characterize, then behaviour-preserving change),
+// ui (tdd for what a test can observe, then browser checks for what it cannot).
+// `ui` must lead the marker or the Kind cell: "tdd (no ui)" and "build" are not ui tasks.
+const kindOf = (s) => (/refactor/i.test(s) ? 'refactor' : /setup/i.test(s) ? 'setup' : /^\W*ui\b/i.test(s) ? 'ui' : 'tdd');
 
 /** "| T-1 | title | tdd | AC-1, AC-2 | notes |" rows of the spec's task table: {id: {kind, refs}}. */
 function parseTaskTable(spec) {
@@ -704,8 +710,9 @@ function parseTasks(md) {
     const m = line.match(/^\s*[-*]\s*\[([ xX])\]\s*\**(T-\d+)\**(?![0-9])[\s:.\-–—]*(.*)$/);
     if (!m) continue;
     let rest = m[3].trim();
-    const marker = (rest.match(/\[(setup|refactor)\]/i) || [])[1] || '';
-    rest = rest.replace(/\s*\[(setup|refactor)\]\s*/gi, ' ').trim();
+    // [ui] counts only at the end of the line: a title may mention it ("Fix the [ui] flag parser").
+    const marker = (rest.match(/\[(setup|refactor)\]/i) || rest.match(/\[(ui)\]\s*$/i) || [])[1] || '';
+    rest = rest.replace(/\s*\[(setup|refactor)\]\s*/gi, ' ').replace(/\s*\[ui\]\s*$/i, '').trim();
     const refs = [...new Set(rest.match(CRIT_IDS) || [])];
     const title = rest.replace(new RegExp(String.raw`\s*\([^()]*\b${CRIT_ID}[^()]*\)\s*`, 'g'), ' ').trim();
     out.push({ id: m[2], title, done: m[1] !== ' ', kind: kindOf(marker), refs });
@@ -748,12 +755,19 @@ async function plan(inp) {
     const refs = t.refs.length ? t.refs : row ? row.refs : [];
     const kind = t.kind !== 'tdd' ? t.kind : row ? row.kind : 'tdd';
     if (!refs.length) problems.push(`${t.id}: no AC/EC ids in tasks.md or the spec task table`);
-    const behaviours = refs.map((ref) => {
+    // A ui task's criteria are of two sorts: a test observes them (behaviours), or only a browser shows them (a
+    // "Check (browser)" line). Anywhere else that line would let a criterion leave the red-green cycle unnoticed.
+    const hasCheck = (ref) => !!(s.crit[ref] && s.crit[ref].checks.length);
+    if (kind !== 'ui') refs.filter(hasCheck).forEach((ref) => problems.push(`${t.id}: ${ref} has a "Check (browser)" line, but ${t.id} is not a [ui] task`));
+    const behaviours = refs.filter((ref) => kind !== 'ui' || !hasCheck(ref)).map((ref) => {
       if (!s.crit[ref]) problems.push(`${t.id}: ${ref} not found in spec.md`);
       return { ref, text: s.crit[ref] ? s.text(s.crit[ref]) : '' };
     });
+    if (kind === 'ui') refs.filter((ref) => hasCheck(ref) && s.crit[ref].checks.some((c) => !c)).forEach((ref) => problems.push(`${t.id}: ${ref} has a "Check (browser)" line that says nothing to check`));
+    const browserChecks = kind === 'ui' ? refs.filter(hasCheck).map((ref) => ({ ref, text: s.text(s.crit[ref]), check: s.crit[ref].checks.join('; ') })) : [];
     refs.filter((ref) => s.crit[ref] && !s.crit[ref].parts.length).forEach((ref) => problems.push(`${t.id}: ${ref} has no Given/When/Then lines`));
     const task = { id: t.id, title: t.title, done: t.done, kind, behaviours: detailed.has(t.id) ? behaviours : [] };
+    if (kind === 'ui' && detailed.has(t.id)) task.browserChecks = browserChecks;
     if (kind === 'setup' && detailed.has(t.id)) task.verify = refs.flatMap((ref) => (s.crit[ref] ? s.crit[ref].verify : []).map((v) => ({ ref, ...v })));
     return task;
   });
@@ -771,6 +785,9 @@ async function plan(inp) {
   };
   if (!none(stack.lint)) res.lint = stack.lint;
   if (!none(stack.typeCheck)) res.typeCheck = stack.typeCheck;
+  // For the browser checks of ui tasks.
+  if (!none(stack.devServer)) res.devServer = stack.devServer;
+  if (!none(stack.devUrl)) res.devUrl = stack.devUrl;
   // A run with only synthetic refactor tasks ({refactors}) on a finished spec needs the baseline too.
   if (!noTestSuite && inp.baseline !== false && res.approved && (tasks.some((t) => !t.done) || inp.refactors)) {
     const t = await runTests(stack.testAll);

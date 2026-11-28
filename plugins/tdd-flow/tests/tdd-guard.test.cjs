@@ -40,6 +40,10 @@ test('tdd-guard blocks production code during RED and lets tests, fixtures and .
   for (const ok of ['tests/app.test.ts', 'tests/test_app.py', 'src/__tests__/a.ts', 'src/app.spec.ts', 'pkg/a_test.go',
     'README.md', 'fixtures/data.json', '.tdd-flow/features/12-csv/tdd-log.md', 'conftest.py']) assert.strictEqual(code(ok), 0, ok);
   assert.strictEqual(code('test/a.js'), 0); // a top-level test folder
+  // UI: styles and component templates are production code; browser tests, stories, fixtures and mocks are not.
+  for (const prod of ['src/app.css', 'src/styles/main.scss', 'src/Button.vue', 'src/Card.svelte', 'Pages/Index.cshtml']) assert.strictEqual(code(prod), 2, prod);
+  for (const ok of ['e2e/login.ts', 'e2e/fixtures.ts', 'apps/web/e2e/auth.setup.ts', 'src/Button.stories.tsx', 'src/__fixtures__/Host.vue', 'src/__mocks__/api.ts',
+    'src/Button.spec.vue', 'cypress/support/commands.ts', 'src/login.cy.ts']) assert.strictEqual(code(ok), 0, ok);
 });
 
 test('tdd-guard matches test folders inside the repo, not in the folders the repo lives in', () => {
