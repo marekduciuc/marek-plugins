@@ -138,7 +138,7 @@ test('every 10 s the timer runs tdd-flow status at the repo root; unchanged stat
 })
 
 test('rows render with status, tasks, phase, issue and PR links and the attach command, on terminal and desktop', async ($, on) => {
-  const w = world(on, { rows: [RUNNING, { ...RUNNING, slug: '40-stuck', status: 'stalled', details: 'session is idle without a report\nmore' }] })
+  const w = world(on, { rows: [RUNNING, { ...RUNNING, slug: '40-stuck', status: 'stalled', details: 'session is idle without a report\nmore', conflicts: ['41-other', 'origin/main'] }] })
   const clock = mock.clock(on)
   await $.session.start(SESSION)
   await clock.advance(1)
@@ -152,6 +152,7 @@ test('rows render with status, tasks, phase, issue and PR links and the attach c
     const links = (await ui.findAll({ type: 'Link' })).map(l => [l.props.href, l.text])
     expect(links.slice(0, 2)).toEqual([['https://github.com/o/r/issues/82', 'issue #82'], ['https://github.com/o/r/pull/90', 'PR #90']])
     expect((await ui.find({ type: 'Text', text: /session is idle without a report$/ }))?.text).toBe('  session is idle without a report')
+    expect((await ui.findAll({ type: 'Text', text: /conflicts with/ })).map(t => t.text)).toEqual(['  conflicts with 41-other, origin/main'])
     await ui.press({ key: 'copy:82-ux-fixes-68f-focus' })
     await ui.unmount()
   }
