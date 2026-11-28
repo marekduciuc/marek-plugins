@@ -1,12 +1,13 @@
 export const meta = {
   name: 'analyze-requirements',
   description: 'Turn an issue, spec file or text into a testable spec (Given/When/Then ACs) and ordered task list, cross-checked by critics',
-  whenToUse: 'Start of a feature: pass an issue number/URL (GitHub, Azure DevOps, Jira), a path to a spec file, or the requirement text',
+  whenToUse: 'Start of a feature: pass an issue number/URL (GitHub, Azure DevOps, Jira), a path to a spec file, or the requirement text; or {input, size: "small"|"full", answers}',
   phases: [
     { title: 'Context', detail: 'detect stack, fetch requirement' },
-    { title: 'Draft', detail: '3 analysts from different angles' },
-    { title: 'Synthesize', detail: 'merge drafts into spec.md + tasks.md' },
-    { title: 'Critique', detail: 'testability, completeness, existing-tests, task-order, grounding, consistency and cross-spec critics, revise, then a second round' },
+    { title: 'Triage', detail: 'is the requirement clear enough, and is the change small' },
+    { title: 'Draft', detail: '1 analyst for a small change, 3 from different angles otherwise' },
+    { title: 'Synthesize', detail: 'write spec.md + tasks.md from the drafts' },
+    { title: 'Critique', detail: 'small change: existing-tests, task-order and grounding critics, one revision; otherwise all seven critics, revise, then a second round' },
   ],
 }
 
@@ -18,6 +19,11 @@ const recheck = opt.mode === 'recheck'
 const input = recheck ? '' : typeof args === 'string' ? args : args && args.input
 if (recheck && !opt.feature) throw new Error('tdd-flow: mode "recheck" needs {feature: "<slug>"}.')
 if (!recheck && !input) throw new Error('tdd-flow: pass the requirement as args (issue id/url, file path, or text).')
+// {size: "small" | "full"} overrides the triage's estimate, and a given "small" is not escalated. {answers: "<text>"}: the user's answers to the clarifying
+// questions of an earlier run that returned needs_clarification; with them the workflow does not ask again.
+if (opt.size !== undefined && !['small', 'full'].includes(opt.size)) throw new Error('tdd-flow: size must be "small" or "full".')
+if (opt.answers !== undefined && (typeof opt.answers !== 'string' || !opt.answers.trim())) throw new Error('tdd-flow: answers must be a non-empty text (every question with its answer).')
+const answers = !recheck && opt.answers ? opt.answers.trim() : ''
 
 const A = (type) => 'tdd-flow:' + type
 const str = { type: 'string' }
@@ -26,10 +32,10 @@ const strs = { type: 'array', items: { type: 'string' } }
 const M = Object.assign({ worker: 'sonnet', strong: 'opus', light: 'haiku' }, (typeof args === 'object' && args && args.models) || {})
 // Agent limits. Override per run with args {maxAgents, maxParallel} (positive integers).
 const posInt = (v, d) => (Number.isInteger(v) && v > 0 ? v : d)
-// 26: context, stack-detector, stack-fill, fetch, 3 drafts and synthesis are 8 on a first run with a non-GitHub
-// tracker; 7 critics, the revision, up to 7 critics again and the second revision are 16 more; the two spare slots
-// cover a relay retry without losing the last revision.
-const MAX_AGENTS = posInt(opt.maxAgents, 26)
+// 27: context, stack-detector, stack-fill, fetch, triage, 3 drafts and synthesis are 9 on a first run with a
+// non-GitHub tracker; 7 critics, the revision, up to 7 critics again and the second revision are 16 more; the two
+// spare slots cover a relay retry without losing the last revision. A small change uses about 8.
+const MAX_AGENTS = posInt(opt.maxAgents, 27)
 const MAX_PARALLEL = posInt(opt.maxParallel, 2)
 const LIMIT = `tdd-flow: agent limit (${MAX_AGENTS}) reached`
 let spawned = 0, active = 0, limitHit = false
@@ -132,7 +138,7 @@ const DRAFT = {
   required: ['acceptanceCriteria', 'edgeCases', 'openQuestions', 'tasks'],
   properties: {
     codeContext: strs,
-    acceptanceCriteria: { type: 'array', items: { type: 'object', required: ['name', 'given', 'when', 'then'], properties: { name: str, given: str, when: str, then: str, verify: str } } },
+    acceptanceCriteria: { type: 'array', items: { type: 'object', required: ['name', 'given', 'when', 'then'], properties: { name: str, given: str, when: str, then: str, mustNot: str, verify: str } } },
     edgeCases: strs, nonFunctional: strs, outOfScope: strs,
     openQuestions: { type: 'array', items: { type: 'object', required: ['question', 'assumption'], properties: { question: str, assumption: str } } },
     // Questions an earlier decision of another spec answers; from = "<slug> Q-<m>".
@@ -149,6 +155,11 @@ const SPEC = {
     // The last revision only: review issues it could not fix, one line each.
     deferred: strs,
   },
+}
+const TRIAGE = {
+  type: 'object',
+  required: ['clear', 'questions', 'size', 'reason', 'modules'],
+  properties: { clear: { type: 'boolean' }, questions: strs, size: { type: 'string', enum: ['small', 'full'] }, reason: str, modules: strs },
 }
 const CRIT = {
   type: 'object',
@@ -227,15 +238,67 @@ try {
     : ''
   // A recheck starts from the spec on disk; the revisions return the rest.
   let spec = { specPath: `${dir}/spec.md`, tasksPath: `${dir}/tasks.md`, acCount: 0, tasks: [], openQuestions: [] }
+  // The lane: "small" (one draft, three critics, one revision) or "full". `escalated` says why a small one became full.
+  let lane = 'full', sizeReason = '', escalated = ''
   if (!recheck) {
-  // ---------- Draft (3 independent angles) ----------
+  // ---------- Triage ----------
+  // One agent before any draft: a requirement too vague to specify comes back as questions (one agent instead of
+  // about twenty), and a small change takes the light lane. Not needed when the caller gave both size and answers.
+  if (opt.size && answers) {
+    lane = opt.size
+    sizeReason = 'given as size'
+  } else {
+    phase('Triage')
+    const triage = await run(
+      'Triage this requirement before a spec is written. Do not write or change any file, and read at most 10 files.\n\n' +
+      `Title: ${req.title}\nSource: ${req.source}\nRequirement:\n"""${req.text}"""\n\n` +
+      (answers
+        ? `The user already answered clarifying questions, so set clear = true and questions = []:\n"""${answers}"""\n\n`
+        : '1. Clarity. The requirement is clear when its goal and what must change are stated or follow from the code. A gap with a safe assumption is not a reason to ask: it becomes an open question in the spec. ' +
+          'Set clear = false only when, without an answer, one cannot tell what to build. Then return at most 5 questions, the ones that decide the most, each answerable in a sentence. Do not ask what an earlier decision below answers.\n') +
+      '2. Size. "small" only if ALL of these hold: at most 3 tasks (a task is a few red-green cycles); the change stays in one module; no data migration or schema change; no new external API or service; no change to authentication, permissions or roles. In doubt: "full". ' +
+      'Return in `modules` the top-level modules or directories the change touches, and in `reason` one sentence for the size.\n' +
+      (decisions.length ? `Earlier decisions:\n${JSON.stringify(decisions)}\n` : ''),
+      { schema: TRIAGE, model: M.worker, effort: 'low', label: 'triage', phase: 'Triage' })
+    if (limitHit) throw new Error(LIMIT)
+    if (!triage) log('triage: the agent failed - running the full analysis')
+    if (triage && !triage.clear && !answers && triage.questions.length) {
+      log(`The requirement is too vague to specify: ${triage.questions.length} question(s) for the user, no spec written`)
+      return {
+        status: 'needs_clarification',
+        slug: req.slug,
+        source: req.source,
+        input,
+        questions: triage.questions.slice(0, 5),
+        next: 'No spec was written. Print the questions in chat as a numbered list, then ask them one at a time and wait for each answer. Then run this workflow again with {input: <the same input>, answers: "<every question with its answer>"}; it will not ask again.',
+      }
+    }
+    // The estimate is backed by checks the agent cannot argue with: any of them sends the change to the full lane.
+    const RISKY = /migrat|migrac|schema|schéma|auth(?!ors?\b)|autoriz|autentiz|login|přihl|prihl|permission|oprávn|opravn|\brol(e|es|i|í)\b|token|webhook|password|hesl/i
+    // The answers count too: a clarification can turn a small change into a risky one.
+    const asked = answers ? `${req.text}\n${answers}` : req.text
+    const risky = (asked.match(RISKY) || [])[0]
+    const against = !triage ? 'the triage agent failed'
+      : triage.size !== 'small' ? triage.reason
+      : triage.modules.length > 1 ? `it touches ${triage.modules.length} modules (${triage.modules.join(', ')})`
+      : risky ? `the requirement mentions "${risky}"`
+      : asked.length > 1500 ? 'the requirement is longer than 1500 characters'
+      : ''
+    lane = opt.size || (against ? 'full' : 'small')
+    sizeReason = opt.size ? 'given as size' : against || triage.reason
+    log(`Size: ${lane} (${sizeReason})`)
+  }
+  // The answers belong to the requirement: every draft and critic reads them with it.
+  if (answers) req.text += `\n\nClarifications from the user:\n${answers}`
+
+  // ---------- Draft (3 independent angles; 1 for a small change) ----------
   phase('Draft')
   const ANGLES = [
     { key: 'behaviour', lens: 'BEHAVIOUR-FIRST: focus on user goals and the observable happy-path behaviour that proves each goal.' },
     { key: 'risk', lens: 'RISK-FIRST: focus on edge cases, invalid input, error paths, limits, permissions, backward compatibility and security.' },
     { key: 'scope', lens: 'MINIMAL-SCOPE: find the smallest shippable slice, state what is explicitly out of scope, and order tasks so each builds on a passing previous one.' },
   ]
-  const drafts = (await parallel(ANGLES.map(a => () => run(
+  const draft = (angles) => parallel(angles.map(a => () => run(
     `Analyse this requirement and draft a spec. Angle: ${a.lens}\n\n` +
     `Title: ${req.title}\nSource: ${req.source}\nRequirement:\n"""${req.text}"""\n\n` +
     `Stack: ${stack.language}; tests via \`${stack.testAll}\`.\n` +
@@ -243,7 +306,19 @@ try {
     'Explore the codebase to ground the draft in real modules, entry points and existing tests. Every acceptance criterion must be verifiable by an automated test. ' +
     'Exception: config, infrastructure or scaffolding work that no test can describe (docker-compose, Dockerfile, CI, manifests, installing the test framework) goes into tasks with kind "setup" (see "Task kinds" in your instructions); give each of their criteria a verify command. All other tasks are kind "tdd". Do NOT write any files - return the draft only.',
     { agentType: A('requirements-analyst'), model: M.worker, schema: DRAFT, label: `analyst:${a.key}`, phase: 'Draft' },
-  )))).filter(Boolean)
+  ))).then(ds => ds.filter(Boolean))
+  let drafts = await draft(lane === 'small' ? ANGLES.slice(0, 1) : ANGLES)
+  // A draft bigger than a small change is a wrong estimate: the other two angles are drafted too, and the full lane
+  // goes on with all three. The draft is not told the limit, so it does not merge tasks to stay under it.
+  // A size the caller gave holds: only an estimate is corrected. A failed single draft is replaced by the other two.
+  const big = lane !== 'small' ? '' : !drafts.length ? 'failed'
+    : opt.size ? '' : drafts[0].tasks.length > 3 ? `has ${drafts[0].tasks.length} tasks` : drafts[0].acceptanceCriteria.length > 6 ? `has ${drafts[0].acceptanceCriteria.length} acceptance criteria` : ''
+  if (big && !limitHit) {
+    lane = 'full'
+    escalated = `the first draft ${big}`
+    log(`Not a small change (${escalated}) - running the full analysis`)
+    drafts = [...drafts, ...await draft(ANGLES.slice(1))]
+  }
   if (limitHit) throw new Error(LIMIT)
   if (!drafts.length) throw new Error('tdd-flow: all analyst drafts failed.')
 
@@ -264,6 +339,10 @@ try {
         'A draft\'s `resolved` entry counts only when its `from` names one of the decisions below; drop the others.\n' +
         `Earlier decisions:\n${JSON.stringify(decisions, null, 1)}\n`
       : '') +
+    (answers
+      ? 'The requirement ends with clarifications the user gave before this spec was written. Apply them to the criteria, and record each under ## Resolved questions as ' +
+        '"- Q-<n> <question> - **Answer:** <answer> (<today as dd.MM.yyyy, from `date +%d.%m.%Y`>) → <where it went>", so a later check of the spec still has them.\n'
+      : '') +
     (extra || '') +
     `\nRaw requirement:\n"""${req.text}"""\n\nDrafts:\n${JSON.stringify(drafts, null, 1)}`
   spec = await run(synthPrompt(), { agentType: A('requirements-analyst'), model: M.strong, schema: SPEC, label: 'synthesize' })
@@ -273,7 +352,7 @@ try {
   // ---------- Critique ----------
   phase('Critique')
   const CRITICS = [
-    { key: 'testability', ask: 'Check every AC: is it unambiguous, observable, and automatable with the repo\'s test framework? Flag vague words ("fast", "user-friendly"), hidden multiple behaviours in one AC, and tasks too big for a few red-green cycles. Setup tasks ([setup] in tasks.md) are checked by verify commands instead of tests: flag a setup criterion without a Verify line or with a command that cannot tell pass from fail, and flag a setup task that contains logic a test could check (it must be a tdd task).' },
+    { key: 'testability', ask: 'Check every AC: is it unambiguous, observable, and automatable with the repo\'s test framework? Flag vague words ("fast", "user-friendly"), hidden multiple behaviours in one AC, a "Must not" line a test cannot observe, and tasks too big for a few red-green cycles. Setup tasks ([setup] in tasks.md) are checked by verify commands instead of tests: flag a setup criterion without a Verify line or with a command that cannot tell pass from fail, and flag a setup task that contains logic a test could check (it must be a tdd task).' },
     // No requirement text (a recheck of a spec written from prompt text): nothing to compare against.
     ...(req.text ? [{ key: 'completeness', ask: 'Compare the spec against the RAW requirement below. Flag anything required but missing, anything in the spec NOT supported by the requirement (invented scope), and edge cases a careful engineer would expect.' }] : []),
     {
@@ -365,19 +444,33 @@ try {
     (recheck ? DONE_TASKS + 'If the spec says Status: approved (or later) and you change criteria or tasks, set Status: draft.\n' : '') +
     (last ? 'This is the last revision and no critic checks it. Fix what you safely can. Return in `deferred` every issue you could not fix, one line each ("<where>: <problem>"), and add each of them to Open questions with your assumption.\n' : '') +
     JSON.stringify(issues, null, 1),
-    { agentType: A('requirements-analyst'), model: M.strong, schema: SPEC, label: last ? 'revise (round 2)' : 'revise', phase: 'Critique' })
+    { agentType: A('requirements-analyst'), model: M.strong, schema: SPEC, label: last && lane !== 'small' ? 'revise (round 2)' : 'revise', phase: 'Critique' })
   const isSerious = i => i.severity !== 'minor'
   const line = i => `${i.where}: ${i.problem}`
 
-  const round1 = await critique(CRITICS)
+  // A small change gets the three critics that found the implementation questions in a replay of 8 approved specs.
+  // A blocker from one of them means the spec has a real defect: the other critics run too and the full lane goes on.
+  const LIGHT = ['existing-tests', 'task-order', 'grounding']
+  let round1 = await critique(lane === 'small' ? CRITICS.filter(c => LIGHT.includes(c.key)) : CRITICS)
   if (limitHit) throw new Error(LIMIT)
+  if (lane === 'small' && !opt.size && round1.some(i => i.severity === 'blocker')) {
+    lane = 'full'
+    escalated = 'a critic found a blocker'
+    log(`Not a small change (${escalated}) - running the other critics and the second round`)
+    round1 = [...round1, ...await critique(CRITICS.filter(c => !LIGHT.includes(c.key)))]
+    if (limitHit) throw new Error(LIMIT)
+  }
   const serious1 = round1.filter(isSerious)
   let round2 = [], unresolved = []
   if (serious1.length) {
     log(`Critics raised ${serious1.length} blocker/major issue(s) - revising the spec`)
-    const revised = await revise(serious1, false)
+    // The small lane has one revision and no second round: that revision says itself what it could not fix.
+    const revised = await revise(serious1, lane === 'small')
     if (!revised) {
       unresolved = serious1.map(line)
+    } else if (lane === 'small') {
+      spec = revised
+      unresolved = revised.deferred || []
     } else {
       // Round two: the critics that had a serious issue, consistency (a revision can bring in a contradiction),
       // and task-order when the revision changed the tasks. A rechecked spec's tasks are not known here.
@@ -440,9 +533,13 @@ try {
     tasks: spec.tasks,
     openQuestions: spec.openQuestions,
     assumptions: spec.assumptions || [],
+    // Which analysis ran: "small" (one draft, three critics, one revision) or "full"; escalated = why a small one became full.
+    size: lane,
+    sizeReason,
+    ...(escalated ? { escalated } : {}),
     ...found,
     ...(active ? { stateKept: `.tdd-flow/state.json still names ${active.feature} (spec ${active.specStatus}), so commands without a slug work on that feature. Pass {feature: "${req.slug}"} to tdd-implement, document and deploy, or delete ${active.feature}'s spec folder if it is abandoned.` } : {}),
-    next: 'GATE: show the user the spec summary, including existingTestsChanged (existing tests the spec changes), crossSpecFindings (contradictions with other specs, fixed from an earlier decision or now an open question) and unresolvedFindings (review issues the last revision could not fix, now open questions). Print the open questions in chat as a numbered list, then ask them one at a time and update spec.md after each answer (/tdd-flow:resolve-questions <slug>). After they approve, set "Status: approved" in spec.md, then run /tdd-flow:tdd-implement.',
+    next: 'GATE: say which analysis ran (size with sizeReason, and escalated when set; a small one can be run again with {input, size: "full"}). Show the user the spec summary, including existingTestsChanged (existing tests the spec changes), crossSpecFindings (contradictions with other specs, fixed from an earlier decision or now an open question) and unresolvedFindings (review issues the last revision could not fix, now open questions). Print the open questions in chat as a numbered list, then ask them one at a time and update spec.md after each answer (/tdd-flow:resolve-questions <slug>). After they approve, set "Status: approved" in spec.md, then run /tdd-flow:tdd-implement.',
   }
 } catch (e) {
   if (!limitHit) throw e

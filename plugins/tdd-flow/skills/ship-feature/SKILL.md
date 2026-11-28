@@ -29,7 +29,9 @@ Any workflow can return `agent_limit` (its per-run agent cap was reached). Tell 
 
 ## Sequence
 
-1. **Analyze.** Run step 1.
+1. **Analyze.** Run step 1. Pass `{input, size: "small"}` or `{input, size: "full"}` only when the user asked for a light or a full analysis; otherwise the workflow estimates the size itself.
+   - `needs_clarification` → the requirement was too vague and no spec was written. Print the returned `questions` as a numbered list, ask them one at a time, then run step 1 again with `{input: <the same input>, answers: "<every question with its answer>"}`.
+   - Say which analysis ran: `size` with `sizeReason`, and `escalated` when it is set (a small estimate that turned out wrong; the full analysis ran). A `small` one had one draft, three critics and one revision; offer `{input, size: "full"}` if the user wants the full one.
    **GATE 1 - spec approval.** Show: goal, acceptance criteria (ID + one line each), tasks with their kind (`tdd` or `[setup]`) and, for setup tasks, the verify commands. Point out any setup task that looks like it contains testable logic.
    - If the result has `stateKept`, show it: `state.json` still names another feature that is not done, so pass `{feature: "<slug>"}` explicitly from here on (this skill always does).
    - If the result has `unresolvedFindings`, show them: review issues the two critique rounds could not fix. Each is also an open question in the spec.
