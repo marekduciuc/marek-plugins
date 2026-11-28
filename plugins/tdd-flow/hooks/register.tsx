@@ -329,6 +329,7 @@ export const register: Register = on => {
     const specRow = (row: StatusRow) => {
       const word = kindOf(row)
       const why = isRestartable(row) && row.details ? firstLine(row.details) : ''
+      const clash = row.conflicts?.length ? `conflicts with ${row.conflicts.join(', ')}` : ''
       // The title is the label; the slug follows, dim, only where both fit (and alone when there is no title).
       const room = cols - word.length - 3
       const label = row.title || row.slug
@@ -345,6 +346,7 @@ export const register: Register = on => {
           </Box>
           <Text dimColor wrap="truncate-end">{`  ${progressLine(row)}`}</Text>
           {meta(row)}
+          {clash ? <Text dimColor wrap="truncate-end">{`  ${clash}`}</Text> : null}
           {why ? <Text color={colorOf(row)} wrap="truncate-end">{`  ${why}`}</Text> : null}
           {restartBlock(row)}
           {decisionBlock(row)}

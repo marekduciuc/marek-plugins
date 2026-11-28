@@ -2180,6 +2180,119 @@ function knownRuns(root) {
   return [...new Set([...worktrees, ...runs])].filter((s) => SLUG.test(s)).sort();
 }
 
+const CONFLICTS_FILE = () => path.join(commonDir(), 'tdd-flow', 'conflicts.json');
+const MAX_CONFLICT_BRANCHES = 30; // pairs grow with the square of the branches
+
+/**
+ * A merge of two commits done in memory (git >= 2.38; no ref, index or working tree is touched): {tree, files}, files
+ * being the paths in conflict. null when git could not do it: a missing ref also exits 1, but prints no tree.
+ */
+function mergeTree(a, b) {
+  const r = exec('git', ['merge-tree', '--write-tree', '--name-only', '--no-messages', '-z', a, b], undefined, true);
+  const [tree, ...files] = r.out.split('\0').filter(Boolean);
+  if (![0, 1].includes(r.code) || !/^[0-9a-f]{40,64}$/.test(tree || '')) return null;
+  return { tree, files: r.code === 0 ? [] : files };
+}
+
+/**
+ * Which spec branches would conflict when merged: each feature/<slug> against the base, and each pair of branches as
+ * if both sat on the current base (a branch is first merged with the base in memory, so a change that only the base
+ * made is not counted as a conflict between two branches). Paths of `generated files` (stack.md) do not count:
+ * sync-base regenerates them. The base is origin/<base> as last fetched, else the local branch; nothing is fetched.
+ * Each check is cached under the commits it compared (<git common dir>/tdd-flow/conflicts.json).
+ * Returns {base, withBase: [{slug, files}], pairs: [{a, b, files}], merged: [slug], unknown: [slug],
+ * bySlug: {slug: [names]}}, or {skipped: reason}. `merged`: everything the branch changed is already in the base (its
+ * PR was merged). `unknown`: git could not do a merge of that branch (unrelated history), so nothing is claimed.
+ */
+function predictConflicts(slugs) {
+  const m = gitOut('version').match(/(\d+)\.(\d+)/);
+  if (!m || Number(m[1]) < 2 || (Number(m[1]) === 2 && Number(m[2]) < 38)) return { skipped: 'git older than 2.38 cannot merge in memory' };
+  const base = baseBranch();
+  const baseRef = [`refs/remotes/origin/${base}`, `refs/heads/${base}`].find((r) => git('rev-parse', '--verify', '--quiet', r).code === 0);
+  if (!baseRef) return { skipped: `base branch ${base} not found` };
+  const baseSha = gitOut('rev-parse', baseRef);
+  const baseTree = gitOut('rev-parse', `${baseSha}^{tree}`);
+  const tips = gitOut('for-each-ref', '--format=%(refname) %(objectname)', 'refs/heads/feature/').split('\n').filter(Boolean).map((l) => l.split(' '));
+  const shaOf = new Map(tips.map(([ref, sha]) => [ref.slice('refs/heads/feature/'.length), sha]));
+  // A branch with no commit of its own (just created) has nothing to conflict with.
+  const branches = [...new Set(slugs)].filter((s) => shaOf.has(s) && git('merge-base', '--is-ancestor', shaOf.get(s), baseSha).code !== 0).sort();
+  if (branches.length > MAX_CONFLICT_BRANCHES) return { skipped: `more than ${MAX_CONFLICT_BRANCHES} branches` };
+  const stack = readStack();
+  const isGenerated = generatedMatcher(stack ? stack.generatedFiles : '');
+  const real = (files) => files.filter((f) => !isGenerated(f));
+  // The cache holds the paths as git reported them (the generated-files setting can differ per checkout and over
+  // time) and never a failed check. Entries of another base or of a branch tip that is gone are dropped.
+  const saved = readJSON(CONFLICTS_FILE());
+  const old = saved && typeof saved === 'object' && !Array.isArray(saved) ? saved : {};
+  const live = new Set(shaOf.values());
+  const cache = Object.fromEntries(Object.entries(old).filter(([key, v]) => {
+    const [b, ...tipShas] = key.split(' ');
+    return b === baseSha && tipShas.every((t) => live.has(t)) && v && Array.isArray(v.files);
+  }));
+  const cached = (key, compute) => {
+    if (!(key in cache)) { const v = compute(); if (!v) return null; cache[key] = v; }
+    return cache[key];
+  };
+  const res = { base: baseRef.replace(/^refs\/(remotes|heads)\//, ''), withBase: [], pairs: [], merged: [], unknown: [], bySlug: {} };
+  const note = (slug, name) => { (res.bySlug[slug] = res.bySlug[slug] || []).push(name); };
+  const onBase = []; // [slug, commit, tip]: the branch merged with the base, as a commit no ref points to
+  for (const slug of branches) {
+    const sha = shaOf.get(slug);
+    const key = `${baseSha} ${sha}`;
+    const compute = () => {
+      const mt = mergeTree(baseSha, sha);
+      if (!mt) return null;
+      const commit = exec('git', ['-c', 'user.name=tdd-flow', '-c', 'user.email=tdd-flow@localhost', 'commit-tree', mt.tree, '-p', baseSha, '-m', `tdd-flow: ${slug} on ${res.base}`]);
+      return commit.code === 0 ? { files: mt.files, merged: mt.tree === baseTree, commit: commit.out } : null;
+    };
+    let c = cached(key, compute);
+    // A cached commit can be gone after a `git gc`: build it again.
+    if (c && git('cat-file', '-e', `${c.commit}^{commit}`).code !== 0) { delete cache[key]; c = cached(key, compute); }
+    if (!c) { res.unknown.push(slug); continue; }
+    const files = real(c.files);
+    if (files.length) { res.withBase.push({ slug, files }); note(slug, res.base); continue; }
+    if (c.merged) { res.merged.push(slug); continue; }
+    onBase.push([slug, c.commit, sha]);
+  }
+  for (let i = 0; i < onBase.length; i++) {
+    for (let j = i + 1; j < onBase.length; j++) {
+      const [a, ca, sa] = onBase[i];
+      const [b, cb, sb] = onBase[j];
+      const c = cached(`${baseSha} ${sa} ${sb}`, () => { const mt = mergeTree(ca, cb); return mt ? { files: mt.files } : null; });
+      if (!c) { for (const slug of [a, b]) if (!res.unknown.includes(slug)) res.unknown.push(slug); continue; }
+      const files = real(c.files);
+      if (!files.length) continue;
+      res.pairs.push({ a, b, files });
+      note(a, b);
+      note(b, a);
+    }
+  }
+  if (JSON.stringify(cache) !== JSON.stringify(old)) { try { writeAtomic(CONFLICTS_FILE(), JSON.stringify(cache) + '\n'); } catch { /* the cache is optional */ } }
+  return res;
+}
+
+/**
+ * Predicted merge conflicts of the spec branches, to show, not to act on. Input: {slugs?: [...]} (default: every spec
+ * with a worktree or an autopilot run). Adds `text`, a summary ready to print. Whichever of two conflicting branches
+ * merges first, the other one has to resolve the conflict, so no merge order is suggested.
+ */
+function conflicts(inp) {
+  const slugs = (inp.slugs || []).length ? inp.slugs.map(checkSlug) : knownRuns(mainCheckout());
+  const r = predictConflicts(slugs);
+  if (r.skipped) return { ...r, text: `Merge conflicts not checked: ${r.skipped}.` };
+  const { bySlug, ...out } = r;
+  const some = (files) => `${files.slice(0, 5).join(', ')}${files.length > 5 ? ` and ${files.length - 5} more` : ''}`;
+  const lines = [
+    ...out.withBase.map((c) => `- ${c.slug} conflicts with ${out.base}: ${some(c.files)}`),
+    ...out.pairs.map((c) => `- ${c.a} and ${c.b} conflict with each other: ${some(c.files)}`),
+  ];
+  if (out.unknown.length) lines.push(`- not checked (git could not merge them in memory): ${out.unknown.join(', ')}`);
+  const text = out.withBase.length + out.pairs.length
+    ? `Predicted merge conflicts (against ${out.base} as last fetched):\n${lines.join('\n')}\nAfter one branch of a pair is merged, the other one needs the conflict resolved (\`/steward <PR>\` or \`tdd-flow sync-base\`).`
+    : `No merge conflicts predicted between the spec branches and ${out.base} (as last fetched).${out.unknown.length ? `\n${lines.join('\n')}` : ''}`;
+  return { ...out, text };
+}
+
 /**
  * Status of every spec of an autopilot run, as rows and a ready Markdown table. Input: {slugs?: [...], queued?: [...]}
  * (queued = not started yet; no slugs = every spec with a worktree or a run file). `progress` is the map to pass to
@@ -2198,13 +2311,16 @@ function board(inp) {
 /** One board row per slug, with the run state and task progress it was built from (status adds fields from them). */
 function boardRows(slugs, queued, root, sessions) {
   const base = baseBranch();
+  // A prediction that fails must not take the board down with it.
+  let withWhom = {};
+  try { withWhom = predictConflicts(slugs).bySlug || {}; } catch { /* no conflict column */ }
   return slugs.map((slug) => {
     const st = queued.has(slug) ? { status: 'queued' } : runState(slug, sessions, root);
     const p = taskProgress(slug, root, base);
     // Every task ticked while the session still runs: implement-spec is in its simplify / review / PR steps.
     const current = !p ? '' : p.open || (st.status === 'running' ? 'simplify / review / PR' : '');
     const row = { slug, status: st.status, done: p ? p.done : null, total: p ? p.total : null, current,
-      prUrl: st.prUrl || '', details: st.details || '', attach: st.attach || '', ...(st.decision ? { decision: st.decision } : {}) };
+      prUrl: st.prUrl || '', details: st.details || '', attach: st.attach || '', conflicts: withWhom[slug] || [], ...(st.decision ? { decision: st.decision } : {}) };
     return { row, progress: p, base };
   });
 }
@@ -2270,7 +2386,8 @@ function boardTable(rows) {
     // A decision waits for the user, not for the session: no attach command.
     const why = r.prUrl || (r.decision ? `decision ${r.decision.id}: ${r.decision.question.slice(0, 100)}`
       : [r.details.split('\n')[0].slice(0, 100), ['blocked', 'stalled'].includes(r.status) && r.attach ? `\`${r.attach}\`` : ''].filter(Boolean).join(' · '));
-    lines.push(`| ${cell(r.slug)} | ${r.status} | ${cell(tasks)} | ${cell(why)} |`);
+    const clash = (r.conflicts || []).length ? `conflicts with ${r.conflicts.join(', ')}` : '';
+    lines.push(`| ${cell(r.slug)} | ${r.status} | ${cell(tasks)} | ${cell([why, clash].filter(Boolean).join(' · '))} |`);
   }
   return lines.join('\n');
 }
@@ -2641,7 +2758,7 @@ async function suite(inp) {
 const COMMANDS = {
   plan, suite, phase, 'answer-decision': answerDecision, restart, branch, block, commit, 'close-out': closeOut, 'add-secret-scan': addSecretScan, preflight,
   'ci-watch': ciWatch, context, 'stack-fill': stackFill, specs, 'autopilot-check': autopilotCheck, worktree: startWorktree, cleanup, 'run-report': runReport, 'runs-wait': runsWait, board, status,
-  areas, 'simplify-spec': simplifySpec, 'spec-branch': specBranch, 'set-aside': setAside, 'sync-base': syncBase, decisions,
+  areas, 'simplify-spec': simplifySpec, 'spec-branch': specBranch, 'set-aside': setAside, 'sync-base': syncBase, decisions, conflicts,
 };
 
 async function main(argv) {

@@ -471,7 +471,7 @@ test('status rows carry phase, task, issue URL, title, session and decision, fro
   const row = (from = dir, e = env) => run(from, 'status', {}, e).result.rows[0];
   assert.deepStrictEqual(row(), {
     slug: '12-csv', status: 'running', done: 0, total: 3, current: 'T-1 Docker compose', prUrl: '', details: '',
-    attach: 'claude attach csv-export-flow', task: 'T-2', phase: 'GREEN', issueUrl: 'https://github.com/o/r/issues/12',
+    attach: 'claude attach csv-export-flow', conflicts: [], task: 'T-2', phase: 'GREEN', issueUrl: 'https://github.com/o/r/issues/12',
     title: 'CSV export', session: 'csv-export-flow', sessionState: 'working', at, position: 1, issueNumber: 12, prNumber: null,
   });
   assert.deepStrictEqual(row(wt), row()); // called from the worktree: the same rows
@@ -2330,4 +2330,68 @@ test('restart keeps a working old session, takes a given name, and restarts a st
   assert.strictEqual(n.result.name, 'csv');
   assert.match(n.result.notes.join('\n'), /no session/);
   assert.deepStrictEqual([none.runFileJson().status, none.runFileJson().session], ['running', 'new-7']);
+});
+
+test('conflicts predicts clashes between spec branches and with the base, as if every branch sat on the current base', () => {
+  const { dir, g, write } = trackedRepo();
+  write('.tdd-flow/stack.md', 'test command (all): `node -e 0`\ndefault branch: main\ngenerated files: gen/**\n');
+  write('shared.txt', 'one\n'); write('base.txt', 'one\n'); write('gen/api.txt', 'one\n'); write('done.txt', 'one\n');
+  g('add', '-A'); g('commit', '-qm', 'files');
+  const branch = (slug, files) => {
+    g('switch', '-q', '-c', `feature/${slug}`, 'main');
+    for (const [f, text] of Object.entries(files)) write(f, text);
+    g('add', '-A'); g('commit', '-qm', slug);
+    g('switch', '-q', 'main');
+  };
+  branch('a', { 'shared.txt': 'from a\n', 'gen/api.txt': 'from a\n' });
+  branch('b', { 'shared.txt': 'from b\n', 'gen/api.txt': 'from b\n' });
+  branch('c', { 'other.txt': 'from c\n', 'gen/api.txt': 'from c\n' });
+  branch('d', { 'base.txt': 'from d\n' });
+  branch('e', { 'done.txt': 'from e\n' });
+  g('switch', '-q', '-c', 'feature/empty', 'main'); g('switch', '-q', 'main');
+  // The base moves on after the branches were cut: it changes what d changed, and takes e's change (a squash merge).
+  write('base.txt', 'from main\n'); write('done.txt', 'from e\n');
+  g('add', '-A'); g('commit', '-qm', 'main moves');
+  const all = { slugs: ['a', 'b', 'c', 'd', 'e', 'empty', 'no-branch'] };
+  const r = run(dir, 'conflicts', all).result;
+  assert.strictEqual(r.base, 'main');
+  assert.deepStrictEqual(r.withBase, [{ slug: 'd', files: ['base.txt'] }]);
+  assert.deepStrictEqual(r.pairs, [{ a: 'a', b: 'b', files: ['shared.txt'] }]); // gen/api.txt is generated: not counted
+  assert.deepStrictEqual(r.merged, ['e']);
+  assert.deepStrictEqual(r.unknown, []);
+  assert.match(r.text, /- d conflicts with main: base\.txt\n- a and b conflict with each other: shared\.txt\n/);
+  assert.strictEqual(r.bySlug, undefined);
+  // Nothing was written to the checkout, and no ref was added.
+  assert.strictEqual(execFileSync('git', ['status', '--porcelain'], { cwd: dir, encoding: 'utf8' }), '');
+  assert.strictEqual(execFileSync('git', ['for-each-ref', '--format=%(refname)'], { cwd: dir, encoding: 'utf8' }).trim().split('\n').length, 7);
+  assert.deepStrictEqual(run(dir, 'conflicts', all).result, r); // from the cache
+  const table = run(dir, 'board', { slugs: ['a', 'c', 'd'] }, fakeClaude([])).result;
+  assert.deepStrictEqual(table.rows.map((row) => row.conflicts), [[], [], ['main']]); // b was not asked for: a has no partner
+  assert.match(table.table, /\| d \| [a-z]+ \| – \| .*conflicts with main \|/);
+  assert.deepStrictEqual(run(dir, 'board', { slugs: ['a', 'b'] }, fakeClaude([])).result.rows.map((row) => row.conflicts), [['b'], ['a']]);
+  // A call for other slugs keeps the cached checks; a broken cache file and a pruned in-memory commit are rebuilt at once.
+  const cacheFile = path.join(dir, '.git/tdd-flow/conflicts.json');
+  const entries = () => Object.keys(JSON.parse(fs.readFileSync(cacheFile, 'utf8'))).length;
+  const full = entries();
+  run(dir, 'conflicts', { slugs: ['c'] });
+  assert.strictEqual(entries(), full);
+  fs.writeFileSync(cacheFile, '"broken"');
+  assert.deepStrictEqual(run(dir, 'conflicts', all).result, r);
+  g('gc', '-q', '--prune=now');
+  assert.deepStrictEqual(run(dir, 'conflicts', all).result, r);
+  // The generated-files setting is applied when reading, not cached.
+  write('.tdd-flow/stack.md', 'test command (all): `node -e 0`\ndefault branch: main\n');
+  assert.deepStrictEqual(run(dir, 'conflicts', { slugs: ['a', 'c'] }).result.pairs, [{ a: 'a', b: 'c', files: ['gen/api.txt'] }]);
+  write('.tdd-flow/stack.md', 'test command (all): `node -e 0`\ndefault branch: main\ngenerated files: gen/**\n');
+  // A branch with an unrelated history cannot be merged in memory: it is named, not reported as clean.
+  g('switch', '-q', '--orphan', 'feature/orphan'); write('shared.txt', 'orphan\n'); g('add', 'shared.txt'); g('commit', '-qm', 'orphan'); g('switch', '-q', 'main');
+  const withOrphan = run(dir, 'conflicts', { slugs: ['c', 'orphan'] }).result;
+  assert.deepStrictEqual(withOrphan.unknown, ['orphan']);
+  assert.match(withOrphan.text, /not checked \(git could not merge them in memory\): orphan/);
+  g('branch', '-q', '-D', 'feature/orphan');
+  // Resolving the conflict on a branch clears the prediction.
+  g('switch', '-q', 'feature/d'); g('merge', '-q', '-X', 'ours', 'main', '-m', 'merge main'); g('switch', '-q', 'main');
+  const after = run(dir, 'conflicts', all).result;
+  assert.deepStrictEqual(after.withBase, []);
+  assert.strictEqual(run(dir, 'conflicts', { slugs: ['c'] }).result.text, 'No merge conflicts predicted between the spec branches and main (as last fetched).');
 });

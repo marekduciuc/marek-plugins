@@ -135,6 +135,16 @@ A decision answered through `/tdd-flow:answer-decision` (for example from the st
 
 ## 4. Summary
 
+First predict the merge conflicts between the spec branches:
+
+```bash
+tdd-flow conflicts <<'TDD_FLOW_JSON'
+{"slugs": ["<every slug of this run>"]}
+TDD_FLOW_JSON
+```
+
+Print its `text` below the table when it names a conflict; leave it out when it predicts none or was skipped. It is a prediction against the base as last fetched: do not rebase, merge or change any branch because of it.
+
 The final `board` table (it has the PR URL, or the reason and `claude attach <name>` for blocked and stalled specs, or `decision Q-<n>: ...`), then the open decisions: slug, question, recommendation. To answer one later:
 - run `/tdd-flow:resolve-questions <slug>` in the worktree;
 - set `Status: approved` again (for an implemented spec, add a task for the answer as in **Decisions** step 3);

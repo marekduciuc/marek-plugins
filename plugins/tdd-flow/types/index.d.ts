@@ -14,6 +14,8 @@ export type StatusRow = {
   prUrl: string
   details: string
   attach: string
+  /** Branches this spec's branch is predicted to conflict with: other slugs, or the base (`origin/main`). */
+  conflicts?: string[]
   decision?: Decision
   task: string
   phase: string

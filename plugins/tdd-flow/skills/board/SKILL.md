@@ -22,6 +22,7 @@ On `ok: false`, show the error (it says what is missing, e.g. no worktree and no
 
 Otherwise print `result.table` exactly as returned. Below it, only if there are any:
 - for each `blocked` or `stalled` row: `claude attach <name>` is in the table; add that a blocked spec restarts with `/tdd-flow:autopilot <slug>` after the cause is fixed, and a stalled one needs `claude attach` and an answer;
-- for each `done` row: its PR URL is in the table; nothing else to do here.
+- for each `done` row: its PR URL is in the table; nothing else to do here;
+- for a row that says `conflicts with <slug or base>`: its branch is predicted to conflict with that branch when merged. Say that `tdd-flow conflicts` lists the files, and that nothing was stopped or changed.
 
 Add nothing else: no analysis of the specs, no file reads.
