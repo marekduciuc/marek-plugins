@@ -100,3 +100,26 @@ test('push-gate blocks when a stack profile command is not found, and caches no 
   assert.match(w.stdout, /tests skipped, tool not found \(`go test \.\/\.\.\.`\)/);
   assert.strictEqual(cacheOf(auto), null);
 });
+
+test('skipsHooks finds --no-verify and its short and indirect forms, and ignores message text', () => {
+  for (const bad of ['git commit --no-verify -m "x"', 'git commit -n -m "x"', 'git commit -anm "x"', 'git commit -m "x" --no-verif',
+    'git push --no-verify', 'git push --force --no-verify origin x', 'git -C app commit -qn', 'git add . && git commit -m "x" -n',
+    '(cd app && git commit --no-verify)', 'git merge --no-verify main', 'git -c core.hooksPath=/dev/null commit -m "x"',
+    'HUSKY=0 git commit -m "x"', 'if true; then git commit -n; fi', 'time git push --no-verify', '/usr/bin/git commit -n', 'git am -n x.patch', 'git commit -m "$(cat <<EOF\nmsg\nEOF\n)" --no-verify']) assert.notStrictEqual(gate.skipsHooks(bad), '', bad);
+  for (const ok of ['git commit -m "never use --no-verify"', 'git commit -m "x" -- -n', 'git push -n origin x', 'git commit -uno -m "x"',
+    'git commit -m -n', 'git commit --message -n', 'git commit -F - <<EOF\ngit commit --no-verify is blocked\nEOF', 'git merge -n main',
+    'git commit -m "$(cat <<EOF\ngit commit -n\nEOF\n)"', 'echo git commit --no-verify', 'git log --grep=--no-verify', 'git commit -am "x"',
+    'git commit --amend --no-edit', "git commit -m 'say that `git commit -n` is blocked'", "gh pr create --body 'blocks `git push --no-verify`'",
+    "git commit -F- <<'END-MSG'\ntext\ngit commit -n\nEND-MSG", 'git commit-tree -n', 'npm test -- -n']) assert.strictEqual(gate.skipsHooks(ok), '', ok);
+});
+
+test('push-gate blocks a command that skips the git hooks, unless the gate is off', async () => {
+  const dir = repo(null);
+  const run = (command, e = env) => gate.main(JSON.stringify({ tool_input: { command }, cwd: dir }), e);
+  const r = await run('git commit --no-verify -m "x"');
+  assert.strictEqual(r.code, 2);
+  assert.match(r.stderr, /--no-verify on `git commit` skips the repo's git hooks/);
+  assert.strictEqual((await run('git push --force --no-verify')).code, 2);
+  assert.strictEqual((await run('git commit -m "x"')).code, 0);
+  assert.strictEqual((await run('git commit --no-verify -m "x"', { ...env, TDD_FLOW_PUSH_GATE: 'off' })).code, 0);
+});

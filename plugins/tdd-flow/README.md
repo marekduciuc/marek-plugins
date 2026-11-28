@@ -10,8 +10,8 @@ Personal Claude Code plugin: an end-to-end dev pipeline built on **dynamic workf
 - **Skill** `ship-feature`: chains the workflows and holds the human approval gates. Workflows can't ask questions mid-run, so the gates sit between runs.
 - **Skills** `autopilot` + `implement-spec`: implement every approved spec in parallel, one background session per spec in its own worktree, each ending with a simplification pass, a code review and a PR. See [Autopilot](#autopilot).
 - **Skill** `simplify-codebase`: finds code that does not need to exist across the repo and turns it into refactor specs. See [Simplification](#simplification).
-- **Hook** `tdd-guard`: blocks production-code edits while a cycle is in RED. The state that counts is the one of the repo (or worktree) the edited file is in, and test folders are matched inside that repo.
-- **Hook** `push-gate`: before Claude runs `git push` or `gh pr create` in any repo, runs the type check, lint and tests and a gitleaks secret scan; a failure blocks the command. See [push-gate](#push-gate).
+- **Hook** `tdd-guard`: blocks production-code edits while a cycle is in RED, and locks the settings of the linter, formatter, type check, CI and git hooks for that phase (see [Locked settings](#locked-settings-in-red)). The state that counts is the one of the repo (or worktree) the edited file is in, and test folders are matched inside that repo.
+- **Hook** `push-gate`: before Claude runs `git push` or `gh pr create` in any repo, runs the type check, lint and tests and a gitleaks secret scan; a failure blocks the command. It also blocks a git command that skips the repo's hooks (`--no-verify`). See [push-gate](#push-gate).
 - **Mod** `hooks/register.tsx` (a Claude Code hooks module, listed under `modules` in `hooks/hooks.json`, state contract in `types/index.d.ts`): the status pane beside the chat, `/tdd-status`. See [Status pane](#status-pane).
 
 ## Workflows
@@ -236,6 +236,17 @@ With a `.tdd-flow/stack.md`, its `type check command` runs first (unless `test c
 **Known gaps:** without a stack profile only the repo root is detected (monorepo sub-packages get no checks); no type check or lint for Python and Go.
 
 **CI side.** In GitHub repos with no secret scan in `.github/workflows`, `/tdd-flow:deploy` adds `.github/workflows/secret-scan.yml` as a separate `ci: add gitleaks secret scan` commit in the PR. It scans only the PR's commits, with the gitleaks Docker image, so organisation repos need no `GITLEAKS_LICENSE`. If the `gh` token lacks the `workflow` scope (`gh auth refresh -s workflow`), deploy skips it and lists it under risks in the PR body. The result reports `secretScan`.
+
+**Skipping git hooks is blocked.** In any repo, the gate rejects `git commit`, `push`, `merge`, `rebase`, `am` and `cherry-pick` with `--no-verify` (and git's abbreviations of it), `git commit -n` (also inside a cluster such as `-anm`), `git am -n`, `git -c core.hooksPath=...` and `HUSKY=0 git ...`. `git push -n` is a dry run and passes. Text in a quoted commit message or a heredoc is not a command. Not caught: `export HUSKY=0` on an earlier line, `git config core.hooksPath`, `bash -c "..."`, a quoted flag (`git commit "-n"`).
+
+## Locked settings in RED
+
+While a repo's `.tdd-flow/state.json` says `RED`, tdd-guard also blocks edits of files that decide what the checks accept, so a test cannot pass because a check was loosened:
+
+- linter, formatter and type-check settings: `.eslintrc*`, `eslint.config.*`, `.eslintignore`, `.prettierrc*`, `prettier.config.*`, `.prettierignore`, `biome.json`, `tsconfig.json`, `tsconfig.*.json`, `jsconfig.json`, `pyrightconfig.json`, `.stylelintrc*`, `stylelint.config.*`, `checkstyle*.xml`, `detekt.yml`, `.rubocop.yml`, `phpstan.neon`, `phpcs.xml`, `.swiftlint.yml`, `ruff.toml`, `.flake8`, `mypy.ini`, `.pylintrc`, `.golangci.*`, `clippy.toml`, `rustfmt.toml`, `.clang-tidy`, `.clang-format`
+- CI and git hooks: `.github/workflows/`, `.gitlab-ci.yml`, `azure-pipelines.yml`, `.husky/`, `.pre-commit-config.yaml`, `lefthook.yml`
+
+Test-runner settings (`jest.config.*`, `vitest.config.*`, `playwright.config.*`, `pytest.ini`; the `.js`/`.ts` ones were blocked as production code before 0.33.0) and package manifests (`package.json`, `pyproject.toml`, `setup.cfg`, `pom.xml`) stay editable, and so does a settings file in a test folder or with a test name (`tests/tsconfig.json`, `tsconfig.spec.json`). A test that needs a locked file changed (test types in `tsconfig.json`) belongs in a `[setup]` task. Other phases are not locked, and the hook sees only Write and Edit calls, not a shell command that rewrites the file.
 
 ## Agents and model policy
 
