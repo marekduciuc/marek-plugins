@@ -1,6 +1,6 @@
 // tdd-flow status pane: every spec of the repo beside the chat (`tdd-flow status`, every 10 s), the workflows this
-// session started, a waiting decision answered through the answer-decision skill, and `tdd-flow restart` of a
-// blocked or stalled spec.
+// session started, a waiting decision answered through the answer-decision skill, `tdd-flow restart` of a blocked or
+// stalled spec, and `tdd-flow open-session` to bring a spec's session up in iTerm2 or Terminal.
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, RenderViewport, ThemeKey } from 'claude-code'
 
@@ -12,6 +12,8 @@ const POLL_MS = 10_000
 const CLI_TIMEOUT_MS = 30_000
 /** `tdd-flow restart` waits for `claude --bg` to print the new session. */
 const RESTART_TIMEOUT_MS = 60_000
+/** `tdd-flow open-session` can wait on the macOS Automation consent dialog, once per terminal app. */
+const OPEN_TIMEOUT_MS = 120_000
 /** The fullscreen layout docks a pane beside the transcript from this width; below it an unasked pane lands inline. */
 const DOCK_COLUMNS = 110
 const ANSWER_SKILL = 'tdd-flow:answer-decision'
@@ -193,6 +195,20 @@ async function restart($: EngineInterface, slug: string): Promise<void> {
   }
 }
 
+/**
+ * Runs `tdd-flow open-session`: the tab of iTerm2 or Terminal where the session is attached comes to the front, else a
+ * new one attaches. Success shows as that terminal; only a failure is logged.
+ */
+async function openSession($: EngineInterface, attach: string): Promise<void> {
+  try {
+    const ran = await $.process.run([cli($), 'open-session'], { stdin: JSON.stringify({ attach }), timeoutMs: OPEN_TIMEOUT_MS })
+    const out = JSON.parse(ran.stdout) as { ok: boolean; error?: string }
+    if (!out.ok) $.ui.log(`tdd-flow: open ${attach}: ${firstLine(out.error ?? `exit ${ran.exitCode}`)}`)
+  } catch (err) {
+    $.ui.log(`tdd-flow: open ${attach} failed: ${firstLine(errorText(err))}`)
+  }
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     // Background sessions (the autopilot's) and -p runs have nobody to show a pane to.
@@ -280,6 +296,7 @@ export const register: Register = on => {
             {parts.flatMap((part, i) => (i === 0 ? [part] : [' · ', part]))}
           </Text>
           {row.attach ? <Button key={`copy:${row.slug}`} label="copy" onPress={press => void $.ui.copy({ text: row.attach, surface: press.surface })} /> : null}
+          {row.attach ? <Button key={`open:${row.slug}`} label="open" onPress={() => void openSession($, row.attach)} /> : null}
         </Box>
       )
     }

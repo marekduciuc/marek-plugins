@@ -35,6 +35,8 @@ function world(on: On, opts: { rows?: StatusRow[]; isSkillListed?: boolean; fail
     /** What `tdd-flow restart` prints; it answers only after `release()` while `isRestartHeld`. */
     restartOut: { ok: true, shape: '', result: { slug: '', session: 'new-7', name: 'x', attach: 'claude attach x', notes: [] } } as object,
     isRestartHeld: false,
+    /** What `tdd-flow open-session` prints. */
+    openOut: { ok: true, shape: '', result: { attach: 'claude attach form-error-focus', app: 'iTerm', action: 'opened' } } as object,
     release: () => releaseRestart(),
     rows: opts.rows ?? [RUNNING],
     runs: [] as { argv: readonly string[]; cwd?: string; stdin?: string }[],
@@ -56,6 +58,9 @@ function world(on: On, opts: { rows?: StatusRow[]; isSkillListed?: boolean; fail
   on('fs.exists', ($, e) => ({ value: e.path === `${ROOT}/.tdd-flow` }))
   on('process.run', async ($, e) => {
     w.runs.push({ argv: e.argv, cwd: e.init?.cwd, stdin: e.init?.stdin })
+    if (e.argv[1] === 'open-session') {
+      return { value: { exitCode: 0, stdout: `${JSON.stringify(w.openOut)}\n`, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
     if (e.argv[1] === 'restart') {
       if (w.isRestartHeld) await new Promise<void>(resolve => { releaseRestart = resolve })
       return { value: { exitCode: 0, stdout: `${JSON.stringify(w.restartOut)}\n`, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
@@ -157,6 +162,25 @@ test('rows render with status, tasks, phase, issue and PR links and the attach c
     await ui.unmount()
   }
   expect(w.copied).toEqual(['claude attach form-error-focus', 'claude attach form-error-focus'])
+})
+
+test('the open button runs tdd-flow open-session with the attach command; only a failure is logged', async ($, on) => {
+  const w = world(on, { rows: [RUNNING, { ...DECISION, attach: '' }] })
+  const clock = mock.clock(on)
+  await $.session.start(SESSION)
+  await clock.advance(1)
+  const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...PANE })
+  const keys = (await ui.findAll({ type: 'Button' })).map(b => b.key).filter(k => k?.startsWith('open:'))
+  expect(keys).toEqual(['open:82-ux-fixes-68f-focus']) // a row without an attach command has none
+  await ui.press({ key: 'open:82-ux-fixes-68f-focus' })
+  const call = w.runs.find(r => r.argv[1] === 'open-session')
+  expect(call?.argv[0]?.endsWith('/bin/tdd-flow')).toBe(true)
+  expect(call?.stdin).toBe('{"attach":"claude attach form-error-focus"}')
+  expect(w.logs).toEqual([])
+  w.openOut = { ok: false, shape: '', error: 'not allowed to control iTerm: allow it in System Settings > Privacy & Security > Automation\nmore' }
+  await ui.press({ key: 'open:82-ux-fixes-68f-focus' })
+  expect(w.logs).toEqual(['tdd-flow: open claude attach form-error-focus: not allowed to control iTerm: allow it in System Settings > Privacy & Security > Automation'])
+  await ui.unmount()
 })
 
 test('a decision shows its question and answers through the skill: option, recommendation and free answer', async ($, on) => {
