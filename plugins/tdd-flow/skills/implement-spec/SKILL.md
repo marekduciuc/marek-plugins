@@ -10,7 +10,7 @@ Input: $ARGUMENTS - the feature slug, optionally followed by the base branch (de
 
 This runs without a human watching, usually in a `claude --bg` session started by `/tdd-flow:autopilot`. Do not ask questions and do not stop to wait for input: every way this skill ends goes through `tdd-flow run-report`, so the autopilot sees the result. Never merge, release or force-push.
 
-**Shell:** this session's shell keeps a `cd` for every later command, and the paths below are relative to the worktree root. Never use a bare `cd` into a subdirectory. Use a subshell `(cd apps/web && npm ci)` or a tool flag (`npm --prefix`, `mvn -f`, `git -C`).
+**Shell:** this session's shell keeps a `cd` for every later command, and the paths below are relative to the worktree root. Never use a bare `cd` into a subdirectory. Use a subshell `(cd apps/web && npm ci)` or a tool flag (`npm --prefix`, `mvn -f`, `git -C`). A search or check that finds nothing answers with exit code 1 (`git grep`, `grep -c` with a count of 0, `diff` of files that differ, `git check-ignore` of a file that is not ignored, `ls` or `test` of a path that is missing). That is the answer, not a failure: do not retry it, and end such a command with `|| true` so it is not shown as an error.
 
 `tdd-flow` is the plugin CLI (on the Bash `PATH`); it takes JSON on stdin and prints `{"ok": ..., "result": ...}`:
 
@@ -62,7 +62,13 @@ A task that blocks again after your own decision is reported as a decision for t
 
 ## 0. Check the place
 
-`git branch --show-current` must be `feature/<slug>` and the current directory must be a worktree (`git rev-parse --git-dir` differs from `git rev-parse --git-common-dir`). Otherwise report blocked ("not in the spec's worktree") and stop.
+Look at the place with this one command. Every part answers in words and the command ends with exit code 0, so a missing `node_modules` (normal in a new worktree) is not shown as an error:
+
+```bash
+echo "branch: $(git branch --show-current)"; echo "git dir: $(git rev-parse --git-dir)"; echo "common dir: $(git rev-parse --git-common-dir)"; echo "lockfiles:"; git ls-files '*package-lock.json' '*pnpm-lock.yaml' '*yarn.lock' '*bun.lock' '*bun.lockb'; for d in $(git ls-files '*package-lock.json' '*pnpm-lock.yaml' '*yarn.lock' '*bun.lock' '*bun.lockb' | xargs -n1 dirname | sort -u); do [ -d "$d/node_modules" ] && echo "$d: node_modules present" || echo "$d: node_modules missing"; done; echo "open tasks: $(grep -c '^- \[ \] T-' .tdd-flow/features/<slug>/tasks.md || true)"
+```
+
+The branch must be `feature/<slug>` and the current directory must be a worktree (the git dir differs from the common dir). Otherwise report blocked ("not in the spec's worktree") and stop.
 
 A new worktree has no installed dependencies. For JavaScript, install them for each directory that has a tracked lockfile (`git ls-files '*package-lock.json' '*pnpm-lock.yaml' '*yarn.lock' '*bun.lock' '*bun.lockb'`) and no `node_modules`, using the frozen command for its lockfile, in a subshell so the shell stays at the worktree root: `(cd apps/web && npm ci)`.
 
@@ -81,7 +87,7 @@ In a workspace monorepo, run it once at the root that holds the lockfile. If a f
 
 Tasks run in order, each in its own `tdd-implement` run, so each task gets the full agent budget and a failure stops at that task. Loop:
 
-1. Count the open tasks: lines `- [ ] T-<n>` in `.tdd-flow/features/<slug>/tasks.md`. Then read the notes left for this spec (see **Notes** below):
+1. Count the open tasks: lines `- [ ] T-<n>` in `.tdd-flow/features/<slug>/tasks.md` (`grep -c '^- \[ \] T-' <file> || true`; without `|| true` a count of 0 is shown as an error). Then read the notes left for this spec (see **Notes** below):
    ```bash
    tdd-flow notes <<'TDD_FLOW_JSON'
    {}

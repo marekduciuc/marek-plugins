@@ -24,7 +24,7 @@ The base branch is the default branch from `.tdd-flow/stack.md`, else `git symbo
 
 **commit:**
 
-1. The caller passes the commit message and the list of files. Stage only those files (`git add -- <files>`). Skip listed paths under `.tdd-flow/` that git does not track (`git ls-files --error-unmatch <path>` fails), and listed files that have no changes. Never use `git add -A` or `git add .`.
+1. The caller passes the commit message and the list of files. Stage only those files (`git add -- <files>`). Skip listed paths under `.tdd-flow/` that git does not track (`git ls-files --error-unmatch <path>` exits 1; that exit code is the answer, not an error), and listed files that have no changes. Never use `git add -A` or `git add .`.
 2. If the caller asks for it, run the full test suite first. If it fails, do not commit; report the failure.
 3. Make sure no secrets or large binaries are staged (scan `git diff --cached` for keys, tokens, `.env`, connection strings). If any are, unstage them and report.
 4. Run `git status --porcelain`. Report other modified or untracked files as `unexpected`. Do not stage them.

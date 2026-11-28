@@ -12,7 +12,7 @@ Each spec runs in its own background session (`claude --bg`) in `.claude/worktre
 
 `tdd-flow` is the plugin CLI (on the Bash `PATH`); it takes JSON on stdin and prints `{"ok": ..., "result": ...}`. Run it from the main checkout's root.
 
-**Shell:** this session's shell keeps a `cd` for every later command, and the paths below are relative to the main checkout's root. Never use a bare `cd` into a subdirectory. Use a subshell `(cd apps/web && npm ci)` or a tool flag (`npm --prefix`, `mvn -f`, `git -C`).
+**Shell:** this session's shell keeps a `cd` for every later command, and the paths below are relative to the main checkout's root. Never use a bare `cd` into a subdirectory. Use a subshell `(cd apps/web && npm ci)` or a tool flag (`npm --prefix`, `mvn -f`, `git -C`). A search or check that finds nothing answers with exit code 1 (`git grep`, `grep -c` with a count of 0, `diff` of files that differ, `git check-ignore` of a file that is not ignored, `ls` or `test` of a path that is missing). That is the answer, not a failure: do not retry it, and end such a command with `|| true` so it is not shown as an error.
 
 ## 0. Clean up merged specs
 
