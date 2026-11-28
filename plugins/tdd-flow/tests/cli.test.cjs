@@ -2429,3 +2429,114 @@ test('plan splits a [ui] task into behaviours and browser checks, and refuses a 
   write('.tdd-flow/features/12-csv/spec.md', ui.replace('- **Check (browser):** /reports, open the dialog, @375 and @1280', '- **Check (browser):**'));
   assert.match(run(dir, 'plan', { baseline: false }).error, /T-6: AC-4 has a "Check \(browser\)" line that says nothing to check/);
 });
+
+const runStateHook = require('../hooks/scripts/run-state.cjs');
+/** The run file of 12-csv as an old report (past the start grace), so a missing or idle session counts as stalled. */
+function oldRun(dir, fields) {
+  const file = path.join(dir, '.git/tdd-flow/runs/12-csv.json');
+  fs.writeFileSync(file, JSON.stringify({ slug: '12-csv', status: 'running', at: new Date(Date.now() - 10 * 60000).toISOString(), ...fields }) + '\n');
+}
+
+test('run-state hook notes why a spec session waits, only for a spec the autopilot runs', () => {
+  const w = withWorktree();
+  const event = (fields, cwd = path.join(w.wt, 'src')) => runStateHook.record({ session_id: 's-1-uuid', cwd, ...fields });
+  const file = event({ hook_event_name: 'PermissionRequest', tool_name: 'Bash', tool_input: { command: 'npm ci' } });
+  assert.strictEqual(fs.realpathSync(file), fs.realpathSync(path.join(w.dir, '.git/tdd-flow/waiting/12-csv.json')));
+  const note = () => JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.deepStrictEqual([note().kind, note().detail, note().session], ['permission', 'Bash(npm ci)', 's-1-uuid']);
+  event({ hook_event_name: 'StopFailure', error: 'rate_limit' });
+  assert.deepStrictEqual([note().kind, note().detail], ['limit', 'rate_limit']);
+  event({ hook_event_name: 'StopFailure', error: 'server_error' });
+  assert.strictEqual(note().kind, 'error');
+  event({ hook_event_name: 'Notification', notification_type: 'elicitation_dialog', message: 'Which  port?' });
+  assert.deepStrictEqual([note().kind, note().detail], ['question', 'Which port?']);
+  // Not written: a subagent's own stop or end, an event that says nothing, a folder that is no spec worktree, a spec without a run.
+  assert.strictEqual(event({ hook_event_name: 'SessionEnd', reason: 'other', agent_id: 'a-1' }), '');
+  assert.strictEqual(event({ hook_event_name: 'Notification', notification_type: 'auth_success' }), '');
+  assert.strictEqual(event({ hook_event_name: 'SessionEnd', reason: 'other' }, w.dir), '');
+  assert.strictEqual(event({ hook_event_name: 'SessionEnd', reason: 'other' }, path.join(w.dir, '.claude/worktrees/99-none')), '');
+  assert.strictEqual(note().kind, 'question');
+  // The run file is never touched by the hook.
+  assert.strictEqual(JSON.parse(fs.readFileSync(path.join(w.dir, '.git/tdd-flow/runs/12-csv.json'), 'utf8')).status, 'starting');
+});
+
+test('board shows the reason a stalled session waits, from its own session and newer than the last report', () => {
+  const w = withWorktree();
+  oldRun(w.dir, { session: 's-1abc' });
+  // `blocked`: listed, not working, its turn not over (it waits for something).
+  const idle = [{ id: 's-1abc', sessionId: 's-1abc-uuid', kind: 'background', name: 'csv-export-flow', state: 'blocked', status: 'idle' }];
+  const row = (sessions) => run(w.dir, 'board', { slugs: ['12-csv'] }, fakeClaude(sessions)).result.rows[0];
+  const hook = (fields) => runStateHook.record({ cwd: w.wt, session_id: 's-1abc-uuid', ...fields });
+  assert.deepStrictEqual([row(idle).status, row(idle).details, row(idle).waiting], ['stalled', 'session is blocked without a report', undefined]);
+  hook({ hook_event_name: 'PermissionRequest', tool_name: 'Bash', tool_input: { command: 'npm ci' } });
+  assert.deepStrictEqual([row(idle).status, row(idle).details, row(idle).waiting], ['stalled', 'needs permission: Bash(npm ci)', 'permission']);
+  assert.match(run(w.dir, 'board', { slugs: ['12-csv'] }, fakeClaude(idle)).result.table, /\| 12-csv \| stalled \| 0\/3 · T-1 Docker compose \| needs permission: Bash\(npm ci\) · `claude attach csv-export-flow` \|/);
+  // A working session is running whatever the note says; a gone session is not explained by a permission note.
+  assert.deepStrictEqual([row([{ ...idle[0], state: 'working' }]).status, row([{ ...idle[0], state: 'working' }]).waiting], ['running', undefined]);
+  assert.deepStrictEqual([row([]).details, row([]).waiting], ['no session found', undefined]);
+  // Another session in the same worktree (a person's) does not speak for the run.
+  runStateHook.record({ cwd: w.wt, session_id: 'other-uuid', hook_event_name: 'SessionEnd', reason: 'prompt_input_exit' });
+  assert.strictEqual(row(idle).details, 'session is blocked without a report');
+  // Once the session finished its turn, a permission note is history; the idle prompt after a failure keeps the failure.
+  hook({ hook_event_name: 'PermissionRequest', tool_name: 'Bash', tool_input: { command: 'npm ci' } });
+  assert.strictEqual(row([{ ...idle[0], state: 'done' }]).details, 'session is done without a report');
+  // A note older than the last report is history.
+  hook({ hook_event_name: 'StopFailure', error: 'rate_limit' });
+  assert.strictEqual(hook({ hook_event_name: 'Notification', notification_type: 'idle_prompt', message: 'idle' }), '');
+  assert.strictEqual(hook({ hook_event_name: 'SessionEnd', reason: 'other' }), '');
+  assert.strictEqual(row([]).details, 'usage limit reached: rate_limit');
+  run(w.dir, 'run-report', { slug: '12-csv', status: 'blocked', session: 's-1abc', details: 'tests fail' });
+  assert.deepStrictEqual([row(idle).status, row(idle).details], ['blocked', 'tests fail']);
+});
+
+test('runs-wait restarts a session that is gone, at most twice, and never at the usage limit or without a session list', () => {
+  const w = withWorktree();
+  const claude = loggingClaude([]);
+  const wait = (env = claude.env) => run(w.dir, 'runs-wait', { slugs: ['12-csv'], maxMinutes: 0.003 }, env).result;
+  const starts = () => (claude.log().match(/^--bg /gm) || []).length;
+  // At the usage limit: reported, not restarted.
+  oldRun(w.dir, { session: 's-1abc' });
+  runStateHook.record({ cwd: w.wt, session_id: 's-1abc-uuid', hook_event_name: 'StopFailure', error: 'rate_limit' });
+  let r = wait();
+  assert.deepStrictEqual([r.limited, r.finished.map((f) => [f.status, f.waiting]), starts()], [true, [['stalled', 'limit']], 0]);
+  fs.rmSync(path.join(w.dir, '.git/tdd-flow/waiting/12-csv.json'));
+  // The session list cannot be read: nothing is restarted.
+  const broken = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'tdd-flow-claude-')), 'claude');
+  fs.writeFileSync(broken, '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+  wait({ TDD_FLOW_CLAUDE_BIN: broken });
+  assert.strictEqual(starts(), 0);
+  // Gone: restarted, and the spec counts as running again.
+  r = wait();
+  assert.deepStrictEqual([r.restarted, r.finished, r.timedOut, starts()], [[{ slug: '12-csv', session: 'new-7', name: 'csv', attempt: 1 }], [], true, 1]);
+  oldRun(w.dir, { session: 'new-7' });
+  assert.deepStrictEqual([wait().restarted[0].attempt, starts()], [2, 2]);
+  // The cap: a third time it stays stalled for a person.
+  oldRun(w.dir, { session: 'new-7' });
+  r = wait();
+  assert.deepStrictEqual([r.restarted, r.finished.map((f) => f.status), starts()], [undefined, ['stalled'], 2]);
+  // A slug that was never started is not a lost session, and a restart that fails before a session starts is not counted.
+  assert.deepStrictEqual([run(w.dir, 'runs-wait', { slugs: ['later'], maxMinutes: 0.003 }, claude.env).result.restarted, starts()], [undefined, 2]);
+  // A restart by a person starts the count afresh.
+  assert.strictEqual(run(w.dir, 'restart', { slug: '12-csv' }, claude.env).ok, true);
+  oldRun(w.dir, { session: 'new-7' });
+  assert.strictEqual(wait().restarted[0].attempt, 1);
+});
+
+test('note and notes: a note is delivered once, to the spec it was written for', () => {
+  const w = withWorktree();
+  const note = (inp) => run(w.dir, 'note', inp);
+  assert.deepStrictEqual([note({ slug: '12-csv', text: ' spec 9 was merged:\n run sync-base ' }).result.n, note({ slug: '12-csv', text: 'second' }).result.n], [1, 2]);
+  // A deleted note does not make the next one replace an unread one.
+  fs.rmSync(path.join(w.dir, '.git/tdd-flow/notes/12-csv/1.json'));
+  assert.strictEqual(note({ slug: '12-csv', text: 'first again' }).result.n, 3);
+  fs.renameSync(path.join(w.dir, '.git/tdd-flow/notes/12-csv/3.json'), path.join(w.dir, '.git/tdd-flow/notes/12-csv/1.json'));
+  assert.match(note({ slug: '12-csv', text: '' }).error, /text is required/);
+  assert.match(note({ slug: '12-csv', text: 'x'.repeat(601) }).error, /at most 600 characters/);
+  assert.match(note({ slug: 'later', text: 'x' }).error, /no autopilot run recorded for later/);
+  assert.match(run(w.wt, 'note', { slug: '12-csv', text: 'x' }).error, /main checkout/);
+  // Read from the worktree, where the session runs; the slug comes from the worktree.
+  assert.deepStrictEqual(run(w.wt, 'notes', {}).result.notes.map((n) => [n.n, n.text]), [[3, 'first again'], [2, 'second']]);
+  assert.deepStrictEqual(run(w.wt, 'notes', {}).result.notes, []);
+  note({ slug: '12-csv', text: 'third' });
+  assert.deepStrictEqual(run(w.dir, 'notes', { slug: '12-csv' }).result.notes.map((n) => n.n), [3]);
+});

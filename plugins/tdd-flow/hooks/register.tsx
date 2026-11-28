@@ -42,8 +42,12 @@ const colorOf = (row: StatusRow): ThemeKey => KINDS.find(k => k.kind === kindOf(
 /** Started or working: a session is (about to be) on it. */
 const isRunning = (row: StatusRow): boolean => ['starting', 'running'].includes(row.status)
 const isActive = (row: StatusRow): boolean => isRunning(row) || ['blocked', 'stalled'].includes(row.status)
-/** A blocked row without a decision or a stalled row: what `tdd-flow restart` takes, and whose reason the row shows. */
-const isRestartable = (row: StatusRow): boolean => !row.decision && ['blocked', 'stalled'].includes(row.status)
+/**
+ * A blocked row without a decision or a stalled row: what `tdd-flow restart` takes. Not a session that waits for a
+ * permission or an answer (a restart would throw its work away: attach instead) or stands at the usage limit.
+ */
+const isRestartable = (row: StatusRow): boolean =>
+  !row.decision && ['blocked', 'stalled'].includes(row.status) && !['permission', 'question', 'limit'].includes(row.waiting ?? '')
 
 /** Cuts `text` to `width` cells with an ellipsis. */
 const fit = (text: string, width: number): string =>
@@ -328,7 +332,7 @@ export const register: Register = on => {
 
     const specRow = (row: StatusRow) => {
       const word = kindOf(row)
-      const why = isRestartable(row) && row.details ? firstLine(row.details) : ''
+      const why = !row.decision && ['blocked', 'stalled'].includes(row.status) && row.details ? firstLine(row.details) : ''
       const clash = row.conflicts?.length ? `conflicts with ${row.conflicts.join(', ')}` : ''
       // The title is the label; the slug follows, dim, only where both fit (and alone when there is no title).
       const room = cols - word.length - 3

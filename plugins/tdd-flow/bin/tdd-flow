@@ -1233,6 +1233,33 @@ const runFile = (slug) => path.join(commonDir(), 'tdd-flow', 'runs', `${slug}.js
 /** Ticked tasks runs-wait last reported per slug (outside runs/, which holds one file per run). */
 const PROGRESS_FILE = () => path.join(commonDir(), 'tdd-flow', 'progress.json');
 const readRun = (slug) => readJSON(runFile(slug));
+// Written by hooks/scripts/run-state.cjs: why a session stopped moving. Its own folder, so a report never loses it
+// and it never shows up as a run.
+const waitingFile = (slug) => path.join(commonDir(), 'tdd-flow', 'waiting', `${slug}.json`);
+const autoRestartsFile = (slug) => path.join(commonDir(), 'tdd-flow', 'auto-restarts', `${slug}.json`);
+const MAX_AUTO_RESTARTS = 2;
+const WAITING_TEXT = { permission: 'needs permission', question: 'asks a question', idle: 'waits for input', limit: 'usage limit reached', error: 'API error', ended: 'session ended' };
+// These stop again at once after a restart.
+const NO_RESTART_ERRORS = ['authentication_failed', 'billing_error', 'account_on_hold', 'oauth_org_not_allowed', 'model_not_found', 'cloud_credential_error', 'verification_required'];
+
+/**
+ * Why the run's session waits, from the hook's note: {kind, detail, text}, or null. A note counts only when it is
+ * newer than the run's last report and comes from the run's own session (a person's session in the same worktree
+ * writes notes too; a note that cannot be tied to the run's session is ignored). A permission or question note counts
+ * only while the session is listed and has not finished its turn: nothing tells us when the answer was given, and a
+ * session that is done, stopped or gone no longer waits for it. `ended` explains only a session that is gone.
+ */
+function waitingOf(slug, run, s) {
+  const w = readJSON(waitingFile(slug));
+  if (!w || !WAITING_TEXT[w.kind] || !(Date.parse(w.at) > Date.parse(run.at || 0))) return null;
+  const id = String(w.session || '');
+  const own = [run.session, s && s.id, s && s.sessionId].filter((o) => o && String(o).length >= 6).map(String);
+  if (id.length < 6 || !own.some((o) => id === o || id.startsWith(o) || o.startsWith(id))) return null;
+  const turnOver = !s || ['done', 'stopped'].includes(s.state);
+  if (['permission', 'question'].includes(w.kind) && turnOver) return null;
+  if (w.kind === 'ended' && s) return null;
+  return { kind: w.kind, detail: String(w.detail || ''), text: `${WAITING_TEXT[w.kind]}${w.detail ? `: ${w.detail}` : ''}` };
+}
 /** The status pane's heartbeat: `tdd-flow status {pane: true}` writes it every 10 s while the pane is open. */
 const PANE_FILE = () => path.join(commonDir(), 'tdd-flow', 'pane.json');
 const PANE_FRESH_MS = 60000;
@@ -1933,6 +1960,7 @@ function startWorktree(inp) {
     if (!sessions || isLive(findSession(sessions, run, w.path))) return w;
   }
   writeRun(slug, { slug, status: 'starting', at: new Date().toISOString() });
+  try { fs.rmSync(autoRestartsFile(slug), { force: true }); } catch { /* the cap is only a guard */ }
   return w;
 }
 
@@ -2143,6 +2171,8 @@ function restart(inp) {
   const step = (n, what, fn) => { try { return fn(); } catch (e) { throw new Error(`restart step ${n} (${what}): ${e.message}`); } };
   const oldSession = (run && run.session) || (found && found.id) || '';
   const { session, name } = restartSpec({ slug, oldSession, sessions, name: inp.name, notes, step });
+  // A restart by a person starts the count of automatic ones afresh.
+  if (!inp.auto) { try { fs.rmSync(autoRestartsFile(slug), { force: true }); } catch { /* the cap is only a guard */ } }
   return { slug, session, name, attach: `claude attach ${name}`, notes };
 }
 
@@ -2165,7 +2195,9 @@ function runState(slug, sessions, root) {
   if (young && (run.status === 'starting' || (run.status === 'running' && !(s && s.state === 'done')))) return { slug, status: 'starting', ...attach };
   const details = s ? `session is ${s.state || s.status} without a report`
     : run.status === 'starting' ? `session did not start within ${START_GRACE_MS / 1000} s` : 'no session found';
-  return { slug, status: 'stalled', details, ...attach };
+  const w = waitingOf(slug, run, s);
+  // `gone`: the session is not listed at all (it died or was removed), as opposed to idle.
+  return { slug, status: 'stalled', details: w ? w.text : details, ...(w ? { waiting: w.kind, waitingDetail: w.detail } : {}), ...(s ? {} : { gone: true }), ...attach };
 }
 
 /**
@@ -2337,7 +2369,7 @@ function boardRows(slugs, queued, root, sessions) {
     // Every task ticked while the session still runs: implement-spec is in its simplify / review / PR steps.
     const current = !p ? '' : p.open || (st.status === 'running' ? 'simplify / review / PR' : '');
     const row = { slug, status: st.status, done: p ? p.done : null, total: p ? p.total : null, current,
-      prUrl: st.prUrl || '', details: st.details || '', attach: st.attach || '', conflicts: withWhom[slug] || [], ...(st.decision ? { decision: st.decision } : {}) };
+      prUrl: st.prUrl || '', details: st.details || '', attach: st.attach || '', conflicts: withWhom[slug] || [], ...(st.waiting ? { waiting: st.waiting } : {}), ...(st.decision ? { decision: st.decision } : {}) };
     return { row, progress: p, base };
   });
 }
@@ -2417,6 +2449,81 @@ function boardTable(rows) {
  * `ticks: false` (the status pane shows the ticks): return only when a run finishes, not on a ticked task.
  * Meant for a background Bash call, so it blocks without "again".
  */
+/** A stalled run whose session is gone for a reason a restart can cure: not a decision, the usage limit, or an account error. */
+function isRestartableGone(st) {
+  // Only a run that was started: a slug without a run file is a queued spec, not a lost session.
+  if (st.status !== 'stalled' || !st.gone || st.decision || !readRun(st.slug)) return false;
+  if (st.waiting === 'limit') return false;
+  return !(st.waiting === 'error' && NO_RESTART_ERRORS.includes(st.waitingDetail));
+}
+
+/**
+ * Restarts a run whose session is gone, at most MAX_AUTO_RESTARTS times per run (a new `worktree` start or a restart
+ * by a person resets the count). Returns {slug, session, name, attempt}, {error} when the restart failed, or null
+ * when the cap is reached. An attempt counts once `claude --bg` was run (it worked, or step 6 failed): a refusal
+ * before that (no spec, a rejected shared path) costs no session and is not counted.
+ */
+function autoRestart(slug) {
+  const file = autoRestartsFile(slug);
+  const times = ((readJSON(file) || {}).times || []).filter((t) => typeof t === 'string');
+  if (times.length >= MAX_AUTO_RESTARTS) return null;
+  const count = () => writeAtomic(file, JSON.stringify({ times: [...times, new Date().toISOString()] }) + '\n');
+  try {
+    const r = restart({ slug, auto: true });
+    count();
+    return { slug, session: r.session, name: r.name, attempt: times.length + 1 };
+  } catch (e) {
+    if (/^restart step 6\b/.test(e.message)) count();
+    return { error: e.message };
+  }
+}
+
+const NOTE_MAX = 600;
+const notesDir = (slug) => path.join(commonDir(), 'tdd-flow', 'notes', slug);
+
+/**
+ * Leaves a note for a spec's session, read between its tasks (`notes`). Input: {slug, text}. Text only, at most
+ * NOTE_MAX characters. A note informs: what it may lead to is bounded in skills/implement-spec.
+ */
+function note(inp) {
+  const slug = checkSlug(inp.slug);
+  mainRoot();
+  const text = String(inp.text == null ? '' : inp.text).replace(/\s+/g, ' ').trim();
+  if (!text) throw new Error('text is required');
+  if (text.length > NOTE_MAX) throw new Error(`a note has at most ${NOTE_MAX} characters, this one has ${text.length}`);
+  if (!readRun(slug)) throw new Error(`no autopilot run recorded for ${slug}: nobody would read the note`);
+  const dir = notesDir(slug);
+  fs.mkdirSync(dir, { recursive: true });
+  // The next number after the highest one, written only if no other call took it meanwhile: a note is never replaced.
+  for (let tries = 0; ; tries++) {
+    const n = Math.max(0, ...fs.readdirSync(dir).map((f) => (/^\d+\.json$/.test(f) ? parseInt(f, 10) : 0))) + 1;
+    const entry = { n, text, at: new Date().toISOString() };
+    try { fs.writeFileSync(path.join(dir, `${n}.json`), JSON.stringify(entry) + '\n', { flag: 'wx' }); return entry; } catch (e) {
+      if (e.code !== 'EEXIST' || tries > 50) throw e;
+    }
+  }
+}
+
+/**
+ * The notes of a spec that were not read yet, oldest first, and marks them read. Input: {slug?} (default: the spec of
+ * the worktree this runs in). A note counts as delivered only once this command returned it.
+ */
+function notes(inp) {
+  const here = (gitOut('rev-parse', '--show-toplevel').match(/[\\/]\.claude[\\/]worktrees[\\/]([^\\/]+)$/) || [])[1];
+  const slug = checkSlug(inp.slug || here || '');
+  const dir = notesDir(slug);
+  let files = [];
+  try { files = fs.readdirSync(dir).filter((f) => /^\d+\.json$/.test(f)).sort((a, b) => parseInt(a, 10) - parseInt(b, 10)); } catch { /* no notes */ }
+  const unread = [];
+  for (const f of files) {
+    const entry = readJSON(path.join(dir, f));
+    if (!entry || entry.readAt || typeof entry.text !== 'string') continue;
+    unread.push({ n: entry.n, text: entry.text.slice(0, NOTE_MAX), at: entry.at });
+    writeAtomic(path.join(dir, f), JSON.stringify({ ...entry, readAt: new Date().toISOString() }) + '\n');
+  }
+  return { slug, notes: unread };
+}
+
 async function runsWait(inp) {
   const slugs = (inp.slugs || []).map(checkSlug);
   if (!slugs.length) throw new Error('no slugs to wait for');
@@ -2429,14 +2536,22 @@ async function runsWait(inp) {
   // from the first poll.
   const reported = readJSON(PROGRESS_FILE()) || {};
   const seen = {};
+  const restarted = [];
   for (;;) {
-    const sessions = claudeSessions();
+    // null: the list could not be read. Then nothing is restarted: every session would look gone.
+    const listed = claudeSessions(true);
+    const sessions = listed || [];
     const finished = [];
     const running = [];
     const progressed = [];
     const current = {};
     for (const slug of slugs) {
-      const st = runState(slug, sessions, root);
+      let st = runState(slug, sessions, root);
+      if (listed && inp.restartGone !== false && isRestartableGone(st)) {
+        const again = autoRestart(slug);
+        if (again && again.error) st = { ...st, details: `${st.details}; automatic restart failed: ${again.error.split('\n')[0]}` };
+        else if (again) { restarted.push(again); st = runState(slug, claudeSessions(), root); }
+      }
       if (!['running', 'starting'].includes(st.status)) { finished.push(st); continue; }
       running.push({ slug, ...(st.attach ? { attach: st.attach } : {}) });
       const p = taskProgress(slug, root, base);
@@ -2455,8 +2570,10 @@ async function runsWait(inp) {
       for (const slug of progressed) latest[slug] = current[slug];
       try { writeAtomic(PROGRESS_FILE(), JSON.stringify(latest) + '\n'); } catch { /* only a guard against re-reporting */ }
     }
-    if (finished.length || progressed.length) return { finished, running, ...(progressed.length ? { progressed } : {}), progress: current, ...paneOpen() };
-    if (Date.now() > end) return { finished: [], running, timedOut: true, progress: current, ...paneOpen() };
+    // limited: a session stopped at the usage limit. Starting another spec now would run into the same limit.
+    const more = { ...(restarted.length ? { restarted } : {}), ...(finished.some((f) => f.waiting === 'limit') ? { limited: true } : {}) };
+    if (finished.length || progressed.length) return { finished, running, ...(progressed.length ? { progressed } : {}), ...more, progress: current, ...paneOpen() };
+    if (Date.now() > end) return { finished: [], running, timedOut: true, ...more, progress: current, ...paneOpen() };
     await sleep(Math.min(RUN_POLL_MS, Math.max(0, end - Date.now()) + 50));
   }
 }
@@ -2775,7 +2892,7 @@ async function suite(inp) {
 const COMMANDS = {
   plan, suite, phase, 'answer-decision': answerDecision, restart, branch, block, commit, 'close-out': closeOut, 'add-secret-scan': addSecretScan, preflight,
   'ci-watch': ciWatch, context, 'stack-fill': stackFill, specs, 'autopilot-check': autopilotCheck, worktree: startWorktree, cleanup, 'run-report': runReport, 'runs-wait': runsWait, board, status,
-  areas, 'simplify-spec': simplifySpec, 'spec-branch': specBranch, 'set-aside': setAside, 'sync-base': syncBase, decisions, conflicts,
+  areas, 'simplify-spec': simplifySpec, 'spec-branch': specBranch, 'set-aside': setAside, 'sync-base': syncBase, decisions, conflicts, note, notes,
 };
 
 async function main(argv) {
